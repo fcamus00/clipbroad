@@ -80,6 +80,18 @@ otra en su configuración. Los detalles se cierran en la fase 2.
 Todo detrás de un trait `Clipboard` en el crate `clipboard`, con una implementación falsa en memoria
 para tests. X11 tiene prioridad baja (el objetivo es Hyprland).
 
+Contrato del trait (detalle completo en los doc comments de `crates/clipboard`):
+- `read_text` / `write_text` son síncronos y pueden bloquear un poco; el daemon los llama con
+  `spawn_blocking`. Portapapeles vacío o sin texto es `Ok(None)`, no un error.
+- `watch` devuelve un **canal** (no un callback): el backend empuja eventos desde su propio hilo del SO
+  (Wayland, Windows) o desde un hilo que hace polling (macOS), con un `send` no bloqueante. El canal es
+  sin límite porque los eventos son chicos y a velocidad humana.
+- Un evento no trae el contenido, solo los **formatos ofrecidos** con su nombre nativo (MIME en Linux,
+  UTI en macOS, nombre de formato en Windows), para filtrar sensibles antes de leer.
+- Se reportan **todos** los cambios, incluidos los que causa el propio daemon al escribir; el anti-eco
+  se hace en el daemon por hash, igual en todas las plataformas.
+- `ContentHash` es BLAKE3 de los bytes del contenido (texto: UTF-8 tal cual, sin normalizar).
+
 ### Contenido sensible
 
 Se detectan y respetan estos marcadores en **todas** las plataformas:
