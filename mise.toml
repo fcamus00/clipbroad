@@ -1,0 +1,5 @@
+[tools]
+"aqua:nextest-rs/nextest/cargo-nextest" = "latest"
+cargo-deny = "latest"
+rust = "stable"
+"ubi:bnjbvr/cargo-machete" = "latest"
