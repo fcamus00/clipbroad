@@ -5,6 +5,42 @@ LAN or Tailscale; no server, no third-party services.
 
 > Status: early development. See [docs/DESIGN.md](docs/DESIGN.md) for the design and roadmap.
 
+## Download a CI build
+
+Every push to `main` and every pull request builds `clipbroad` for each OS. The binaries are attached
+to the CI run as artifacts (kept for 90 days by default):
+
+| Artifact | Platform |
+|---|---|
+| `clipbroad-linux-x86_64` | Linux, x86_64 |
+| `clipbroad-macos-aarch64` | macOS, Apple Silicon |
+| `clipbroad-windows-x86_64` | Windows, x86_64 |
+
+Download with the [GitHub CLI](https://cli.github.com/) (or from the run's "Artifacts" section on
+GitHub):
+
+```sh
+gh run list --workflow CI --branch main --limit 1        # find the run id
+gh run download <run-id> --name clipbroad-linux-x86_64   # downloads into the current directory
+```
+
+Artifacts are zipped, which drops the executable bit. On Linux and macOS:
+
+```sh
+chmod +x clipbroad
+./clipbroad --version
+```
+
+On macOS the binary is not signed, so Gatekeeper quarantines it. Remove the quarantine flag before
+running it:
+
+```sh
+xattr -d com.apple.quarantine clipbroad
+```
+
+(`gh run download` usually does not set the flag; it is needed when the file was downloaded with a
+browser. If `xattr` says "No such xattr", there is nothing to do.)
+
 ## Development
 
 ```sh
