@@ -12,10 +12,15 @@ publish = false
 clipbroad-core = { path = "crates/core" }
 clipbroad-clipboard = { path = "crates/clipboard" }
 clipbroad-net = { path = "crates/net" }
+clipbroad-config = { path = "crates/config" }
 blake3 = "1.8"
 clap = { version = "4.6", features = ["derive"] }
+getrandom = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+tempfile = "3.27"
 thiserror = "2.0"
 tokio = "1.54"
+toml = "1.1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

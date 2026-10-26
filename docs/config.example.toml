@@ -1,0 +1,48 @@
+# Ejemplo de configuración de clipbroad (config.toml).
+#
+# Todos los campos son opcionales: si falta uno, se usa el valor por defecto que se muestra aquí.
+# Si el archivo no existe, clipbroad arranca con todos los valores por defecto.
+#
+# Ubicación del archivo:
+#   Linux:   ~/.config/clipbroad/config.toml  (o $XDG_CONFIG_HOME/clipbroad/config.toml)
+#   macOS:   ~/Library/Application Support/clipbroad/config.toml
+#   Windows: %LOCALAPPDATA%\clipbroad\config.toml
+#
+# La identidad del nodo (clave secreta) NO va en este archivo: se guarda aparte en `secret.key`
+# y se genera sola la primera vez que arranca el daemon.
+#   Linux:   ~/.local/share/clipbroad/secret.key  (o $XDG_DATA_HOME/...; permisos 0600)
+#   macOS:   ~/Library/Application Support/clipbroad/secret.key  (permisos 0600)
+#   Windows: %LOCALAPPDATA%\clipbroad\secret.key  (permisos heredados de la carpeta del usuario)
+# En Unix, si alguien cambia los permisos de `secret.key` para que otros usuarios puedan leerlo,
+# clipbroad se niega a arrancar hasta que se corrija con `chmod 600`.
+#
+# Un nombre de campo mal escrito es un error (no se ignora en silencio).
+
+# Puerto UDP en el que escucha este nodo. Es fijo para que otros peers puedan llegar a él por una
+# dirección estática (por ejemplo, por Tailscale). Si se cambia, actualizar las direcciones que los
+# otros peers tienen de esta máquina.
+listen_port = 42420
+
+# Tamaño máximo (en bytes) de un clip que viaja dentro del propio mensaje. Por defecto 8 MiB, que
+# alcanza para texto y capturas de pantalla típicas. Debe ser mayor que 0.
+inline_max_bytes = 8388608
+
+# Cada cuántos milisegundos se revisa el portapapeles en macOS (allí no hay aviso de cambios).
+# Más bajo = sincroniza antes pero gasta más CPU. Se ignora en Linux y Windows. Debe ser mayor que 0.
+macos_poll_interval_ms = 500
+
+# Máquinas emparejadas. Normalmente las escribe `clipbroad pair`; se pueden editar a mano.
+# Cada una lleva:
+#   id     identidad pública del peer (64 caracteres hexadecimales). Obligatorio y sin repetir.
+#   name   etiqueta para logs y `clipbroad status`. Opcional.
+#   addrs  direcciones "ip:puerto" para conectar directo cuando el descubrimiento en la LAN no llega,
+#          por ejemplo la IP de Tailscale (100.x.y.z) o su IPv6 (entre corchetes). Opcional.
+
+[[peers]]
+name = "laptop"
+id = "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6"
+addrs = ["100.101.102.103:42420", "[fd7a:115c:a1e0::1]:42420"]
+
+# Peer que solo se encuentra por la LAN (sin direcciones estáticas).
+[[peers]]
+id = "3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29"

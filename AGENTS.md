@@ -22,6 +22,7 @@ El dueño del proyecto supervisa por resultados y no lee Rust en detalle. Por es
 crates/core       # tipos de contenido, protocolo, anti-eco, filtros. Sin código de SO.
 crates/clipboard  # trait Clipboard + backends por SO + fake en memoria para tests
 crates/net        # transporte iroh, emparejamiento, broadcast
+crates/config     # config TOML, identidad (clave secreta) y rutas por SO
 crates/daemon     # binario `clipbroad` (CLI + orquestación)
 docs/DESIGN.md    # decisiones y plan
 ```

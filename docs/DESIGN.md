@@ -141,7 +141,18 @@ contenido. Sincronizar archivos significa transferir el contenido, guardarlo en 
 - macOS: LaunchAgent.
 - Windows: tarea al iniciar sesión.
 - Configuración en TOML en el directorio de configuración de cada SO; identidad (`SecretKey`) en un
-  archivo aparte con permisos restringidos.
+  archivo aparte con permisos restringidos. Ejemplo comentado con todas las opciones y rutas:
+  [`config.example.toml`](config.example.toml).
+- Crate propio `clipbroad-config`: lo usan el daemon, `net` (peers e identidad) y el emparejamiento,
+  que escribe en esta configuración.
+- Identidad: los 32 bytes crudos de la clave Ed25519 (`iroh::SecretKey::from_bytes` los convierte).
+  Se genera la primera vez. En Unix el archivo se crea con permisos `0600` y se rechaza si otros
+  usuarios pueden leerlo; en Windows hereda los permisos de `%LOCALAPPDATA%` (solo el usuario,
+  administradores y SYSTEM).
+- En Windows se usa `%LOCALAPPDATA%` (no la carpeta *roaming*): la identidad y la lista de peers son de
+  una máquina y no deben copiarse a otra con el perfil itinerante.
+- Las rutas se calculan con la biblioteca estándar en vez del crate `directories`, porque este depende
+  de `option-ext` (MPL-2.0), que la política de licencias de `cargo deny` no permite.
 
 ## Fases
 
