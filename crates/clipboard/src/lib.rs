@@ -4,6 +4,9 @@
 //! The daemon only ever talks to [`Clipboard`]; everything platform-specific lives in a backend
 //! behind `#[cfg(target_os = ...)]`. Sync logic is tested against [`fake::FakeClipboard`].
 
+// Windows only, but plain Rust: compiled for tests everywhere so its tests run on every platform.
+#[cfg(any(windows, test))]
+mod dib;
 mod error;
 pub mod fake;
 #[cfg(target_os = "macos")]

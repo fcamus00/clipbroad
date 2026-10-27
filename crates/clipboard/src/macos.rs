@@ -7,8 +7,8 @@
 //!
 //! # Threads
 //!
-//! - [`read_text`](Clipboard::read_text): runs on a short-lived thread so the caller can give up
-//!   after [`READ_TIMEOUT`]. The app that copied may provide its data lazily, and a frozen app
+//! - [`read_text`](Clipboard::read_text) and [`read_image`](Clipboard::read_image): run on a
+//!   short-lived thread so the caller can give up after [`READ_TIMEOUT`]. The app that copied may provide its data lazily, and a frozen app
 //!   would otherwise block the caller. A read that times out leaves its thread to finish on its
 //!   own.
 //! - [`watch`](Clipboard::watch): macOS has no change notification, so one thread polls
@@ -18,35 +18,56 @@
 //! # Privacy (macOS 15.4+)
 //!
 //! macOS can alert the user when an app reads the pasteboard programmatically. To stay clear of
-//! that, the watcher only reads metadata (`changeCount` and the offered `types`). The text itself
-//! is read only in [`read_text`](Clipboard::read_text), and only after checking that the
-//! pasteboard offers text. [`MacosClipboard::access_behavior`] reports what the user allowed.
+//! that, the watcher only reads metadata (`changeCount` and the offered `types`). The content
+//! itself is read only in [`read_text`](Clipboard::read_text) and
+//! [`read_image`](Clipboard::read_image), and only after checking that the pasteboard offers that
+//! kind of content. [`MacosClipboard::access_behavior`] reports what the user allowed.
 //!
 //! # Sensitive content
 //!
-//! `NSPasteboard` has no way to list the types and read the text in one step. So
-//! [`read_text`](Clipboard::read_text) reads `changeCount`, lists the types, checks them for
-//! sensitive markers, reads the text, and then checks `changeCount` and the types again. If the
+//! `NSPasteboard` has no way to list the types and read the content in one step. So
+//! [`read_text`](Clipboard::read_text) and [`read_image`](Clipboard::read_image) read
+//! `changeCount`, list the types, check them for sensitive markers, read the content, and then
+//! check `changeCount` and the types again. If the
 //! count moved, another copy happened in between: it starts over, up to [`READ_ATTEMPTS`] times,
 //! and then gives up with an error. The second look at the types catches an app that adds its
-//! marker type after the text within the same copy (writing types one by one does not bump
+//! marker type after the content within the same copy (writing types one by one does not bump
 //! `changeCount`). An app that adds the marker even later, after that second look, is not caught;
 //! password managers that follow nspasteboard.org declare all types before writing any data.
+//!
+//! # Images
+//!
+//! [`write_image`](Clipboard::write_image) offers the PNG as `public.png`, byte for byte.
+//! [`read_image`](Clipboard::read_image) prefers `public.png` and returns its bytes as they are,
+//! so our own write reads back with the same hash (anti-echo needs it). If only `public.tiff` is
+//! offered (some apps, e.g. Preview), `AppKit` converts it to PNG.
+//!
+//! [`read_text`](Clipboard::read_text) only reads `public.utf8-plain-text`, so markup such as
+//! `public.html` next to an image never counts as text.
 
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
+use clipbroad_core::Png;
 use clipbroad_core::sensitive::sensitive_marker;
 use objc2::available;
 use objc2::rc::autoreleasepool;
-use objc2_app_kit::{NSPasteboard, NSPasteboardAccessBehavior};
-use objc2_foundation::{NSArray, NSInteger, NSString, ns_string};
+use objc2_app_kit::{
+    NSBitmapImageFileType, NSBitmapImageRep, NSPasteboard, NSPasteboardAccessBehavior,
+};
+use objc2_foundation::{NSArray, NSData, NSDictionary, NSInteger, NSString, ns_string};
 
 use crate::{ChangeSender, Clipboard, ClipboardChange, ClipboardError, ClipboardWatch};
 
-/// The type we read and write: `NSPasteboardTypeString`.
+/// The text type we read and write: `NSPasteboardTypeString`.
 const TEXT_UTF8: &str = "public.utf8-plain-text";
+
+/// The image type we read first and write: `NSPasteboardTypePNG`.
+const IMAGE_PNG: &str = "public.png";
+
+/// The image type read when there is no PNG, converted to PNG: `NSPasteboardTypeTIFF`.
+const IMAGE_TIFF: &str = "public.tiff";
 
 /// Longest wait for the app that owns the pasteboard to hand over its content.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -102,43 +123,23 @@ impl MacosClipboard {
 
 impl Clipboard for MacosClipboard {
     fn read_text(&self) -> Result<Option<String>, ClipboardError> {
-        let (result_tx, result_rx) = mpsc::sync_channel(1);
-        thread::Builder::new()
-            .name("mac-read".to_owned())
-            .spawn(move || {
-                // After a timeout nobody is waiting for the result anymore; dropping it is fine.
-                let _ = result_tx.send(read_string());
-            })
-            .map_err(|error| ClipboardError::backend("spawning the read thread", error))?;
-        match result_rx.recv_timeout(READ_TIMEOUT) {
-            Ok(result) => result,
-            Err(RecvTimeoutError::Timeout) => Err(ClipboardError::Backend {
-                message: format!(
-                    "the app that owns the clipboard did not send its content within {}s",
-                    READ_TIMEOUT.as_secs()
-                ),
-                source: None,
-            }),
-            Err(RecvTimeoutError::Disconnected) => Err(ClipboardError::Backend {
-                message: "the read thread ended without a result".to_owned(),
-                source: None,
-            }),
-        }
+        read_with_timeout(read_string_once)
     }
 
     fn write_text(&self, text: &str) -> Result<(), ClipboardError> {
-        autoreleasepool(|_| {
-            let pasteboard = NSPasteboard::generalPasteboard();
-            // Taking ownership of the pasteboard is required before writing to it.
-            pasteboard.clearContents();
-            if pasteboard.setString_forType(&NSString::from_str(text), ns_string!(TEXT_UTF8)) {
-                Ok(())
-            } else {
-                Err(ClipboardError::Backend {
-                    message: "macOS refused to set the pasteboard text".to_owned(),
-                    source: None,
-                })
-            }
+        replace_contents("text", |pasteboard| {
+            pasteboard.setString_forType(&NSString::from_str(text), ns_string!(TEXT_UTF8))
+        })
+    }
+
+    fn read_image(&self) -> Result<Option<Png>, ClipboardError> {
+        read_with_timeout(read_png_once)
+    }
+
+    fn write_image(&self, png: &Png) -> Result<(), ClipboardError> {
+        replace_contents("image", |pasteboard| {
+            let data = NSData::with_bytes(png.as_bytes());
+            pasteboard.setData_forType(Some(&data), ns_string!(IMAGE_PNG))
         })
     }
 
@@ -155,18 +156,69 @@ impl Clipboard for MacosClipboard {
     }
 }
 
-/// Runs on a read thread. Reads the text of one pasteboard content, checking it for sensitive
+/// Runs `read_checked(read_once)` on a short-lived thread and waits at most [`READ_TIMEOUT`] for
+/// its result.
+fn read_with_timeout<T: Send + 'static>(
+    read_once: fn(&NSPasteboard) -> Result<Option<T>, ClipboardError>,
+) -> Result<Option<T>, ClipboardError> {
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("mac-read".to_owned())
+        .spawn(move || {
+            // After a timeout nobody is waiting for the result anymore; dropping it is fine.
+            let _ = result_tx.send(read_checked(read_once));
+        })
+        .map_err(|error| ClipboardError::backend("spawning the read thread", error))?;
+    match result_rx.recv_timeout(READ_TIMEOUT) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => Err(ClipboardError::Backend {
+            message: format!(
+                "the app that owns the clipboard did not send its content within {}s",
+                READ_TIMEOUT.as_secs()
+            ),
+            source: None,
+        }),
+        Err(RecvTimeoutError::Disconnected) => Err(ClipboardError::Backend {
+            message: "the read thread ended without a result".to_owned(),
+            source: None,
+        }),
+    }
+}
+
+/// Replaces the pasteboard content with what `set` writes (`what` names it in the error).
+fn replace_contents(
+    what: &str,
+    set: impl FnOnce(&NSPasteboard) -> bool,
+) -> Result<(), ClipboardError> {
+    autoreleasepool(|_| {
+        let pasteboard = NSPasteboard::generalPasteboard();
+        // Taking ownership of the pasteboard is required before writing to it.
+        pasteboard.clearContents();
+        if set(&pasteboard) {
+            Ok(())
+        } else {
+            Err(ClipboardError::Backend {
+                message: format!("macOS refused to set the pasteboard {what}"),
+                source: None,
+            })
+        }
+    })
+}
+
+/// Runs on a read thread. Reads one pasteboard content with `read_once`, checking it for sensitive
 /// markers before and after (see module docs).
-fn read_string() -> Result<Option<String>, ClipboardError> {
+fn read_checked<T>(
+    read_once: fn(&NSPasteboard) -> Result<Option<T>, ClipboardError>,
+) -> Result<Option<T>, ClipboardError> {
     autoreleasepool(|_| {
         let pasteboard = NSPasteboard::generalPasteboard();
         for _ in 0..READ_ATTEMPTS {
             let count = pasteboard.changeCount();
             check_not_sensitive(&pasteboard)?;
-            let text = read_string_once(&pasteboard)?;
+            let content = read_once(&pasteboard)?;
             check_not_sensitive(&pasteboard)?;
             if pasteboard.changeCount() == count {
-                return Ok(text);
+                return Ok(content);
             }
         }
         Err(ClipboardError::Backend {
@@ -204,16 +256,63 @@ fn read_string_once(pasteboard: &NSPasteboard) -> Result<Option<String>, Clipboa
     }
     match pasteboard.stringForType(text_type) {
         Some(text) => Ok(Some(text.to_string())),
-        None if MacosClipboard.access_behavior() == Some(AccessBehavior::AlwaysDeny) => {
-            Err(ClipboardError::Unavailable {
-                reason: "macOS denies clipboard access to this app; allow it in System \
-                         Settings > Privacy & Security > Paste from Other Apps"
-                    .to_owned(),
-            })
-        }
-        // The pasteboard changed since the check, or the text could not be converted.
-        None => Ok(None),
+        // The pasteboard changed since the check, the text could not be converted, or access is
+        // denied.
+        None => nothing_read(),
     }
+}
+
+/// Requests an image only if the pasteboard offers PNG or TIFF (see module docs).
+#[allow(unsafe_code)] // `representationUsingType:properties:`; see the SAFETY comment.
+fn read_png_once(pasteboard: &NSPasteboard) -> Result<Option<Png>, ClipboardError> {
+    let png_type = ns_string!(IMAGE_PNG);
+    // The first of these that is offered, in this order.
+    let Some(image_type) = pasteboard
+        .availableTypeFromArray(&NSArray::from_slice(&[png_type, ns_string!(IMAGE_TIFF)]))
+    else {
+        return Ok(None);
+    };
+    let Some(data) = pasteboard.dataForType(&image_type) else {
+        return nothing_read();
+    };
+    let bytes = if image_type.isEqualToString(png_type) {
+        data.to_vec()
+    } else {
+        let Some(bitmap) = NSBitmapImageRep::imageRepWithData(&data) else {
+            tracing::debug!("the pasteboard TIFF could not be decoded; treating it as no image");
+            return Ok(None);
+        };
+        // SAFETY: an empty dictionary holds no value of the wrong type.
+        let png = unsafe {
+            bitmap.representationUsingType_properties(
+                NSBitmapImageFileType::PNG,
+                &NSDictionary::new(),
+            )
+        };
+        let Some(png) = png else {
+            return Err(ClipboardError::Backend {
+                message: "macOS could not convert the pasteboard TIFF to PNG".to_owned(),
+                source: None,
+            });
+        };
+        png.to_vec()
+    };
+    Png::try_from(bytes)
+        .map(Some)
+        .map_err(|error| ClipboardError::backend("reading the pasteboard image", error))
+}
+
+/// The result when the pasteboard offered a type but handed over no data: an error if the user
+/// denied access, otherwise nothing.
+fn nothing_read<T>() -> Result<Option<T>, ClipboardError> {
+    if MacosClipboard.access_behavior() == Some(AccessBehavior::AlwaysDeny) {
+        return Err(ClipboardError::Unavailable {
+            reason: "macOS denies clipboard access to this app; allow it in System Settings > \
+                     Privacy & Security > Paste from Other Apps"
+                .to_owned(),
+        });
+    }
+    Ok(None)
 }
 
 /// Runs on the watcher thread: reports each new `changeCount` until the consumer is gone.
