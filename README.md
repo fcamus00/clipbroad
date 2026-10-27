@@ -24,15 +24,15 @@ gh run list --workflow CI --branch main --limit 1        # find the run id
 gh run download <run-id> --name clipbroad-linux-x86_64   # downloads into the current directory
 ```
 
-Artifacts are zipped, which drops the executable bit. On Linux and macOS:
+On Linux and macOS, if the binary is not executable after the download, run `chmod +x clipbroad`.
+Then check it:
 
 ```sh
-chmod +x clipbroad
 ./clipbroad --version
 ```
 
-On macOS the binary is not signed, so Gatekeeper quarantines it. Remove the quarantine flag before
-running it:
+On macOS the binary is not signed. A browser marks downloaded files as quarantined, and Gatekeeper
+then refuses to run the unsigned binary. Remove the quarantine flag before running it:
 
 ```sh
 xattr -d com.apple.quarantine clipbroad
