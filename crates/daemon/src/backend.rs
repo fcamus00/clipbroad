@@ -23,13 +23,18 @@ pub fn system_clipboard() -> Result<Arc<dyn Clipboard>> {
 }
 
 /// The system clipboard of this machine.
-// TODO(phase 1): a `#[cfg(target_os = "windows")]` function like the Linux one, using
-// `AddClipboardFormatListener`.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+// Never fails on Windows, but keeps the signature every platform shares.
+#[allow(clippy::unnecessary_wraps)]
+pub fn system_clipboard() -> Result<Arc<dyn Clipboard>> {
+    Ok(Arc::new(clipbroad_clipboard::windows::WindowsClipboard))
+}
+
+/// The system clipboard of this machine.
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn system_clipboard() -> Result<Arc<dyn Clipboard>> {
     anyhow::bail!(
-        "the clipboard backend for {} is not implemented yet; \
-         run `clipbroad watch --fake` to try it with a simulated clipboard",
+        "{} is not supported; run `clipbroad watch --fake` to try it with a simulated clipboard",
         std::env::consts::OS
     )
 }

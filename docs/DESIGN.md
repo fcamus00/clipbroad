@@ -148,7 +148,7 @@ en el portapapeles local.
 | Linux Wayland | `wl-clipboard-rs::watch` (`ext-data-control` o `wlr-data-control`; Hyprland soporta ambos) | `wl-clipboard-rs` |
 | Linux X11 | XFixes (vía `clipboard-master` o `x11-clipboard`) | `arboard` |
 | macOS | Polling de `NSPasteboard.changeCount` (no existe API de notificación) | `arboard` / `objc2` |
-| Windows | `AddClipboardFormatListener` + `WM_CLIPBOARDUPDATE` | `arboard` / crate `windows` |
+| Windows | `AddClipboardFormatListener` + `WM_CLIPBOARDUPDATE` en una ventana message-only | `windows-sys` directo (`arboard` no expone la lista de formatos) |
 
 Todo detrás de un trait `Clipboard` en el crate `clipboard`, con una implementación falsa en memoria
 para tests. X11 tiene prioridad baja (el objetivo es Hyprland).
