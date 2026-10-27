@@ -1,15 +1,17 @@
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// BLAKE3 hash of clipboard content.
 ///
 /// Used to recognise the same content across machines and across clipboard events: anti-echo
 /// compares the hash of what was just applied from the network with the hash of what the local
-/// clipboard reports next, and the wire protocol will carry it with every clip.
+/// clipboard reports next, and the wire protocol carries it with every clip.
 ///
 /// The hash covers the content bytes only (see [`ClipContent::hash`](crate::ClipContent::hash)
 /// for what those bytes are per content kind), so it equals the plain BLAKE3 digest of those bytes
 /// and is stable across versions and platforms.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ContentHash([u8; 32]);
 
 impl ContentHash {
