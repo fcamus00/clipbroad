@@ -12,16 +12,30 @@
 //!
 //! # Sensitive content
 //!
-//! [`read_text`](Clipboard::read_text) opens the clipboard once, lists the formats, reads the
-//! DWORD of the `CanUploadToCloudClipboard` / `CanIncludeInClipboardHistory` flags, checks them for
-//! sensitive markers and reads the text, all before closing it. While the clipboard is open no
-//! other app can change it, so the check and the text always belong to the same content. A flag
-//! whose value cannot be read fails the read.
+//! [`read_text`](Clipboard::read_text) and [`read_image`](Clipboard::read_image) open the clipboard
+//! once, list the formats, read the DWORD of the `CanUploadToCloudClipboard` /
+//! `CanIncludeInClipboardHistory` flags, check them for sensitive markers and read the content, all
+//! before closing it. While the clipboard is open no other app can change it, so the check and the
+//! content always belong to the same copy. A flag whose value cannot be read fails the read.
+//!
+//! # Images
+//!
+//! [`read_image`](Clipboard::read_image) prefers the registered `PNG` format (browsers, the
+//! Snipping Tool) and returns its bytes as they are. Otherwise it converts the `CF_DIB` or
+//! `CF_DIBV5` the app put on the clipboard to PNG (`PrintScreen`, Paint, most other apps; Windows
+//! derives each from the other and from `CF_BITMAP`). A bitmap the converter does not read (see
+//! the `dib` module) counts as no image. [`write_image`](Clipboard::write_image) puts the PNG
+//! under `PNG` first and a `CF_DIB` copy after it for apps that cannot paste a PNG. Since reads
+//! prefer `PNG`, our own write reads back byte for byte, which anti-echo needs.
+//!
+//! [`read_text`](Clipboard::read_text) only reads `CF_UNICODETEXT` (Windows derives it from
+//! `CF_TEXT` and `CF_OEMTEXT`), so markup such as `HTML Format` next to an image never counts as
+//! text.
 //!
 //! # Threads
 //!
-//! - [`read_text`](Clipboard::read_text) and [`write_text`](Clipboard::write_text): run on a
-//!   short-lived thread so the caller can give up after [`OPERATION_TIMEOUT`]. Besides the busy
+//! - Reads and writes ([`read_text`](Clipboard::read_text), [`write_text`](Clipboard::write_text)
+//!   and their image versions): run on a short-lived thread so the caller can give up after [`OPERATION_TIMEOUT`]. Besides the busy
 //!   retries, reading text that the source app renders on demand (delayed rendering) waits for that
 //!   app, and a frozen app would otherwise block the caller. An operation that times out leaves its
 //!   thread to finish on its own, so a timed-out write may still land later.
@@ -39,12 +53,13 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use clipbroad_core::Png;
 use clipbroad_core::sensitive::{WINDOWS_FLAG_FORMATS, sensitive_marker};
 use windows_sys::Win32::Foundation::{GlobalFree, HGLOBAL, HWND, SetLastError};
 use windows_sys::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, EnumClipboardFormats,
     GetClipboardData, GetClipboardFormatNameW, IsClipboardFormatAvailable, OpenClipboard,
-    RemoveClipboardFormatListener, SetClipboardData,
+    RegisterClipboardFormatW, RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
@@ -60,6 +75,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 use windows_sys::w;
 
+use crate::dib::{self, DibError};
 use crate::{ChangeSender, Clipboard, ClipboardChange, ClipboardError, ClipboardWatch};
 
 /// Longest a read or write may block its caller.
@@ -86,14 +102,27 @@ pub struct WindowsClipboard;
 
 impl Clipboard for WindowsClipboard {
     fn read_text(&self) -> Result<Option<String>, ClipboardError> {
-        run_with_timeout("win-read", read_unicode_text)
+        run_with_timeout("win-read", || read_unless_sensitive(read_unicode_text))
     }
 
     fn write_text(&self, text: &str) -> Result<(), ClipboardError> {
         // `CF_UNICODETEXT` is UTF-16 ending in a NUL. Windows derives `CF_TEXT`, `CF_OEMTEXT` and
         // `CF_LOCALE` from it for apps that ask for those.
-        let units: Vec<u16> = text.encode_utf16().chain([0]).collect();
-        run_with_timeout("win-write", move || write_unicode_text(&units))
+        let bytes: Vec<u8> = text
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_ne_bytes)
+            .collect();
+        run_with_timeout("win-write", move || write_unicode_text(&bytes))
+    }
+
+    fn read_image(&self) -> Result<Option<Png>, ClipboardError> {
+        run_with_timeout("win-read", read_png)
+    }
+
+    fn write_image(&self, png: &Png) -> Result<(), ClipboardError> {
+        let png = png.clone();
+        run_with_timeout("win-write", move || write_png(png.as_bytes()))
     }
 
     fn watch(&self) -> Result<ClipboardWatch, ClipboardError> {
@@ -134,8 +163,11 @@ fn run_with_timeout<T: Send + 'static>(
     }
 }
 
-#[allow(unsafe_code)] // Win32 FFI.
-fn read_unicode_text() -> Result<Option<String>, ClipboardError> {
+/// Opens the clipboard and runs `read` on it, unless its formats hold a sensitive marker (see
+/// module docs).
+fn read_unless_sensitive<T>(
+    read: impl FnOnce(&OpenedClipboard) -> Result<T, ClipboardError>,
+) -> Result<T, ClipboardError> {
     let open = OpenedClipboard::open()?;
     let formats = format_ids(&open)?
         .into_iter()
@@ -144,8 +176,12 @@ fn read_unicode_text() -> Result<Option<String>, ClipboardError> {
     if let Some(marker) = sensitive_marker(&formats) {
         return Err(ClipboardError::Sensitive { marker });
     }
-    // SAFETY: plain query; the clipboard is open on this thread.
-    if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT.into()) } == 0 {
+    read(&open)
+}
+
+#[allow(unsafe_code)] // Win32 FFI.
+fn read_unicode_text(open: &OpenedClipboard) -> Result<Option<String>, ClipboardError> {
+    if !is_offered(open, CF_UNICODETEXT.into()) {
         return Ok(None);
     }
     // SAFETY: the clipboard is open on this thread. The handle stays owned by the clipboard and
@@ -168,18 +204,95 @@ fn read_unicode_text() -> Result<Option<String>, ClipboardError> {
     Ok(String::from_utf16(text).ok())
 }
 
-#[allow(unsafe_code)] // Win32 FFI.
-fn write_unicode_text(units: &[u16]) -> Result<(), ClipboardError> {
-    let memory = GlobalMemory::with_units(units)?;
-    let _open = OpenedClipboard::open()?;
-    // SAFETY: the clipboard is open on this thread.
-    if unsafe { EmptyClipboard() } == 0 {
-        return Err(ClipboardError::backend(
-            "emptying the clipboard",
-            io::Error::last_os_error(),
-        ));
-    }
+fn write_unicode_text(bytes: &[u8]) -> Result<(), ClipboardError> {
+    let memory = GlobalMemory::with_bytes(bytes)?;
+    let open = OpenedClipboard::open()?;
+    empty_clipboard(&open)?;
     memory.set_as(CF_UNICODETEXT.into())
+}
+
+/// Image data as found on the clipboard.
+enum ClipboardImage {
+    Png(Vec<u8>),
+    Dib(Vec<u8>),
+}
+
+fn read_png() -> Result<Option<Png>, ClipboardError> {
+    let png_format = png_format()?;
+    let image = read_unless_sensitive(|open| {
+        if is_offered(open, png_format) {
+            return Ok(Some(ClipboardImage::Png(read_bytes(open, png_format)?)));
+        }
+        // Windows lists the formats an app put before the ones it derives from them, so the
+        // first bitmap format listed is the original and needs no conversion by Windows.
+        let bitmaps = [CF_DIB, CF_DIBV5].map(u32::from);
+        let Some(bitmap) = format_ids(open)?
+            .into_iter()
+            .find(|format| bitmaps.contains(format))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ClipboardImage::Dib(read_bytes(open, bitmap)?)))
+    })?;
+    // Converted after closing the clipboard, so other apps are not kept waiting.
+    match image {
+        None => Ok(None),
+        Some(ClipboardImage::Png(mut bytes)) => {
+            bytes.truncate(dib::png_len(&bytes).unwrap_or(bytes.len()));
+            Png::try_from(bytes)
+                .map(Some)
+                .map_err(|error| ClipboardError::backend("reading the PNG format", error))
+        }
+        Some(ClipboardImage::Dib(bitmap)) => match dib::dib_to_png(&bitmap) {
+            Ok(bytes) => Ok(Some(
+                Png::try_from(bytes).expect("the PNG encoder writes a valid PNG header"),
+            )),
+            Err(DibError::Unsupported(reason)) => {
+                tracing::debug!(reason, "the clipboard bitmap is not converted to PNG");
+                Ok(None)
+            }
+            Err(error) => Err(ClipboardError::backend(
+                "converting the clipboard bitmap to PNG",
+                error,
+            )),
+        },
+    }
+}
+
+fn write_png(png: &[u8]) -> Result<(), ClipboardError> {
+    let png_format = png_format()?;
+    // For apps that cannot paste a PNG (Paint and many older apps). Windows derives `CF_DIBV5`
+    // and `CF_BITMAP` from it.
+    let bitmap = match dib::png_to_dib(png) {
+        Ok(bitmap) => Some(GlobalMemory::with_bytes(&bitmap)?),
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "cannot convert the image to a bitmap; writing only the PNG"
+            );
+            None
+        }
+    };
+    let png_memory = GlobalMemory::with_bytes(png)?;
+    let open = OpenedClipboard::open()?;
+    empty_clipboard(&open)?;
+    // `PNG` first: apps that take the first format they know get the lossless one.
+    png_memory.set_as(png_format)?;
+    bitmap.map_or(Ok(()), |bitmap| bitmap.set_as(CF_DIB.into()))
+}
+
+/// The id of the registered `PNG` clipboard format.
+#[allow(unsafe_code)] // Win32 FFI.
+fn png_format() -> Result<u32, ClipboardError> {
+    // SAFETY: plain call with a valid NUL-terminated string. Registering an existing name returns
+    // its id.
+    match unsafe { RegisterClipboardFormatW(w!("PNG")) } {
+        0 => Err(ClipboardError::backend(
+            "registering the PNG clipboard format",
+            io::Error::last_os_error(),
+        )),
+        format => Ok(format),
+    }
 }
 
 /// The clipboard, open on the current thread until dropped. Not `Send`: Windows ties the open
@@ -217,11 +330,11 @@ impl Drop for OpenedClipboard {
 struct GlobalMemory(HGLOBAL);
 
 impl GlobalMemory {
-    /// A block holding exactly `units`.
+    /// A block holding exactly `bytes`.
     #[allow(unsafe_code)] // Win32 FFI.
-    fn with_units(units: &[u16]) -> Result<Self, ClipboardError> {
+    fn with_bytes(bytes: &[u8]) -> Result<Self, ClipboardError> {
         // SAFETY: plain allocation; a null result is handled below.
-        let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, size_of_val(units)) };
+        let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) };
         if handle.is_null() {
             return Err(ClipboardError::backend(
                 "allocating clipboard memory",
@@ -230,9 +343,9 @@ impl GlobalMemory {
         }
         let memory = Self(handle);
         let locked = LockedGlobal::lock(memory.0)?;
-        // SAFETY: the block was allocated with room for exactly `units.len()` units, global
-        // memory is aligned for `u16`, and a fresh allocation cannot overlap `units`.
-        unsafe { ptr::copy_nonoverlapping(units.as_ptr(), locked.data.cast(), units.len()) };
+        // SAFETY: the block was allocated with room for exactly `bytes.len()` bytes, and a fresh
+        // allocation cannot overlap `bytes`.
+        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), locked.data.cast(), bytes.len()) };
         drop(locked);
         Ok(memory)
     }
@@ -493,9 +606,43 @@ fn format_name_with_flag(open: &OpenedClipboard, format: u32) -> Result<String, 
     Ok(format!("{name}={value}"))
 }
 
-/// The DWORD held by `format` on the open clipboard.
+/// Whether the open clipboard offers `format`, directly or derived by Windows.
 #[allow(unsafe_code)] // Win32 FFI.
-fn read_dword(_open: &OpenedClipboard, format: u32) -> Result<u32, ClipboardError> {
+fn is_offered(_open: &OpenedClipboard, format: u32) -> bool {
+    // SAFETY: plain query; the clipboard is open on this thread.
+    unsafe { IsClipboardFormatAvailable(format) != 0 }
+}
+
+/// Removes all content from the open clipboard and makes us its owner, as required before
+/// setting any.
+#[allow(unsafe_code)] // Win32 FFI.
+fn empty_clipboard(_open: &OpenedClipboard) -> Result<(), ClipboardError> {
+    // SAFETY: the clipboard is open on this thread.
+    if unsafe { EmptyClipboard() } == 0 {
+        return Err(ClipboardError::backend(
+            "emptying the clipboard",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+/// The DWORD held by `format` on the open clipboard.
+fn read_dword(open: &OpenedClipboard, format: u32) -> Result<u32, ClipboardError> {
+    let bytes = read_bytes(open, format)?;
+    let dword = bytes
+        .first_chunk::<4>()
+        .ok_or_else(|| ClipboardError::Backend {
+            message: "the data is smaller than a DWORD".to_owned(),
+            source: None,
+        })?;
+    Ok(u32::from_le_bytes(*dword))
+}
+
+/// A copy of the data held by `format` on the open clipboard (the whole memory block, which may
+/// be bigger than the data put in it).
+#[allow(unsafe_code)] // Win32 FFI.
+fn read_bytes(_open: &OpenedClipboard, format: u32) -> Result<Vec<u8>, ClipboardError> {
     // SAFETY: the clipboard is open on this thread. The handle stays owned by the clipboard and
     // valid until `_open` closes it, after we are done with it.
     let handle = unsafe { GetClipboardData(format) };
@@ -505,15 +652,7 @@ fn read_dword(_open: &OpenedClipboard, format: u32) -> Result<u32, ClipboardErro
             io::Error::last_os_error(),
         ));
     }
-    let locked = LockedGlobal::lock(handle)?;
-    let dword = locked
-        .bytes()
-        .first_chunk::<4>()
-        .ok_or_else(|| ClipboardError::Backend {
-            message: "the data is smaller than a DWORD".to_owned(),
-            source: None,
-        })?;
-    Ok(u32::from_le_bytes(*dword))
+    Ok(LockedGlobal::lock(handle)?.bytes().to_vec())
 }
 
 /// The name of a clipboard format (see [`ClipboardChange::formats`]).
@@ -564,8 +703,6 @@ fn standard_format_name(format: u16) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use windows_sys::Win32::System::DataExchange::RegisterClipboardFormatW;
-
     use super::*;
 
     #[test]
@@ -576,23 +713,119 @@ mod tests {
         assert_eq!(format_name(0x200), "#512");
     }
 
+    /// The id of the registered format `name`.
+    #[allow(unsafe_code)] // Win32 FFI.
+    fn registered(name: &str) -> u32 {
+        let name: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        // SAFETY: plain call with a valid NUL-terminated string.
+        let format = unsafe { RegisterClipboardFormatW(name.as_ptr()) };
+        assert_ne!(format, 0, "{}", io::Error::last_os_error());
+        format
+    }
+
+    /// `CF_UNICODETEXT` data for `text`.
+    fn utf16(text: &str) -> Vec<u8> {
+        text.encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_ne_bytes)
+            .collect()
+    }
+
+    /// Replaces the clipboard content with these formats, as one copy.
+    fn write_formats(formats: &[(u32, &[u8])]) {
+        let memory: Vec<_> = formats
+            .iter()
+            .map(|&(format, data)| (format, GlobalMemory::with_bytes(data).expect("allocate")))
+            .collect();
+        let open = OpenedClipboard::open().expect("open clipboard");
+        empty_clipboard(&open).expect("empty clipboard");
+        for (format, memory) in memory {
+            memory.set_as(format).expect("set format");
+        }
+    }
+
     /// Writes `text` plus a registered format `marker` holding the DWORD `value`, the way a
     /// password manager adds its markers.
-    #[allow(unsafe_code)] // Win32 FFI.
-    fn write_with_marker(text: &str, marker: &str, value: u16) {
-        let marker_name: Vec<u16> = marker.encode_utf16().chain([0]).collect();
-        // SAFETY: plain call with a valid NUL-terminated string.
-        let marker = unsafe { RegisterClipboardFormatW(marker_name.as_ptr()) };
-        assert_ne!(marker, 0, "{}", io::Error::last_os_error());
-        let units: Vec<u16> = text.encode_utf16().chain([0]).collect();
-        let text_memory = GlobalMemory::with_units(&units).expect("allocate text");
-        // A little-endian DWORD.
-        let flag = GlobalMemory::with_units(&[value, 0]).expect("allocate marker");
-        let _open = OpenedClipboard::open().expect("open clipboard");
-        // SAFETY: the clipboard is open on this thread.
-        assert_ne!(unsafe { EmptyClipboard() }, 0);
-        text_memory.set_as(CF_UNICODETEXT.into()).expect("set text");
-        flag.set_as(marker).expect("set marker");
+    fn write_with_marker(text: &str, marker: &str, value: u32) {
+        write_formats(&[
+            (CF_UNICODETEXT.into(), &utf16(text)),
+            (registered(marker), &value.to_le_bytes()),
+        ]);
+    }
+
+    /// A 2x1 24-bit bottom-up `CF_DIB`: a red and a green pixel.
+    fn small_dib() -> Vec<u8> {
+        let mut dib = Vec::new();
+        // Header size, width, height, planes (1) and bits per pixel (24), then BI_RGB and zeros.
+        for field in [40_u32, 2, 1, (24 << 16) | 1, 0, 0, 0, 0, 0, 0] {
+            dib.extend(field.to_le_bytes());
+        }
+        dib.extend([0, 0, 255, 0, 255, 0, 0, 0]);
+        dib
+    }
+
+    async fn next_change(watch: &mut ClipboardWatch) -> ClipboardChange {
+        tokio::time::timeout(Duration::from_secs(2), watch.recv())
+            .await
+            .expect("no change event in time")
+            .expect("watch ended")
+            .expect("watch failed")
+    }
+    /// Skips the extra notifications Windows may send for one copy, until one with `format`.
+    async fn change_with(watch: &mut ClipboardWatch, format: &str) -> ClipboardChange {
+        loop {
+            let change = next_change(watch).await;
+            if change.has_format(format) {
+                return change;
+            }
+        }
+    }
+
+    /// The image part of the smoke test.
+    async fn check_images(clipboard: &WindowsClipboard, watch: &mut ClipboardWatch) {
+        let exclude = "ExcludeClipboardContentFromMonitorProcessing";
+        // An image we write reads back byte for byte, and is offered as a bitmap too.
+        let png = Png::try_from(dib::dib_to_png(&small_dib()).expect("to PNG")).expect("PNG");
+        clipboard.write_image(&png).expect("write image");
+        let change = change_with(watch, "PNG").await;
+        assert!(change.has_format("CF_DIB"), "{change:?}");
+        assert_eq!(
+            clipboard.read_image().expect("read image"),
+            Some(png.clone())
+        );
+        assert_eq!(clipboard.read_text().expect("read text"), None);
+
+        // A bitmap with no PNG (PrintScreen, Paint) is converted.
+        write_formats(&[(CF_DIB.into(), &small_dib())]);
+        change_with(watch, "CF_DIB").await;
+        assert_eq!(
+            clipboard.read_image().expect("read bitmap"),
+            Some(png.clone())
+        );
+
+        // A browser's "Copy image": the image plus `<img>` markup. The image wins.
+        let html = registered("HTML Format");
+        write_formats(&[
+            (html, b"<img src=\"x.png\">\0"),
+            (png_format().expect("PNG format"), png.as_bytes()),
+        ]);
+        change_with(watch, "HTML Format").await;
+        assert_eq!(clipboard.read_text().expect("read text"), None);
+        assert_eq!(
+            clipboard.read_image().expect("read image"),
+            Some(png.clone())
+        );
+
+        // A sensitive marker hides the image too.
+        write_formats(&[
+            (png_format().expect("PNG format"), png.as_bytes()),
+            (registered(exclude), &0_u32.to_le_bytes()),
+        ]);
+        change_with(watch, exclude).await;
+        assert!(matches!(
+            clipboard.read_image(),
+            Err(ClipboardError::Sensitive { marker }) if marker == exclude
+        ));
     }
 
     /// Smoke test against the real clipboard. GitHub's Windows runners allow clipboard access,
@@ -600,23 +833,6 @@ mod tests {
     /// and nextest runs tests in parallel processes that would see each other's changes.
     #[tokio::test]
     async fn real_clipboard_round_trip_and_watch() {
-        async fn next_change(watch: &mut ClipboardWatch) -> ClipboardChange {
-            tokio::time::timeout(Duration::from_secs(2), watch.recv())
-                .await
-                .expect("no change event in time")
-                .expect("watch ended")
-                .expect("watch failed")
-        }
-        /// Skips the extra notifications Windows may send for one copy, until one with `format`.
-        async fn change_with(watch: &mut ClipboardWatch, format: &str) -> ClipboardChange {
-            loop {
-                let change = next_change(watch).await;
-                if change.has_format(format) {
-                    return change;
-                }
-            }
-        }
-
         let clipboard = WindowsClipboard;
         clipboard
             .write_text("before watching")
@@ -670,6 +886,8 @@ mod tests {
                 Some("shareable")
             );
         }
+
+        check_images(&clipboard, &mut watch).await;
 
         drop(watch);
         let deadline = Instant::now() + STOP_CHECK_INTERVAL * 5;

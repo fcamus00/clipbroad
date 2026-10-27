@@ -348,9 +348,10 @@ el umbral de tamaño. Código en `crates/core/src/content.rs` (`Png`) y `protoco
   `image/png`. El hash es BLAKE3 de los bytes PNG tal como viajan. Un texto y una imagen nunca tienen
   los mismos bytes: un PNG empieza con `0x89`, y ningún texto UTF-8 puede empezar así.
 - **La conversión vive en los backends, no en `core`.** Cada backend convierte su formato nativo a PNG
-  al leer y PNG a su formato nativo al escribir (TIFF en macOS, DIB en Windows; Wayland ya ofrece
-  `image/png`). Así `core` no depende del crate `image`, que es pesado; solo lo trae el backend que lo
-  necesite, con las features mínimas (tarea de backends de imágenes).
+  al leer (TIFF en macOS, DIB en Windows; Wayland ya ofrece `image/png`). Así `core` no depende de
+  ningún códec. macOS convierte con AppKit, sin dependencias. Windows usa el crate `png` (sin features
+  extra; MIT/Apache) y no el crate `image`, que es mucho más pesado: solo hace falta leer y escribir
+  bitmaps sin comprimir.
 - **`core` solo revisa el encabezado.** `Png::try_from` acepta bytes que empiezan con la firma PNG
   seguida del chunk `IHDR`, y rechaza el resto con `NotPng`. No decodifica la imagen: un PNG roto más
   allá del encabezado falla en la app que pega, igual que si se hubiera copiado en la misma máquina.
@@ -384,8 +385,20 @@ el umbral de tamaño. Código en `crates/core/src/content.rs` (`Png`) y `protoco
   revisó (igual que el texto). Una copia que solo ofrece otros tipos (`image/jpeg`, `image/bmp`)
   cuenta como sin imagen: convertirla pediría un códec. Las herramientas de captura (`grim`) y los
   navegadores ofrecen `image/png`.
-- **macOS y Windows todavía no soportan imágenes:** no las leen, y el daemon que recibe una la salta
-  con un warning ("does not support images yet") sin tocar el portapapeles. Llegan en PRs aparte.
+- **macOS:** lee `public.png` byte por byte. Si solo hay `public.tiff` (algunas apps, como Preview),
+  AppKit la convierte a PNG (`NSBitmapImageRep`). Escribe solo `public.png`: las apps de macOS actuales
+  pegan PNG. Mismo control de `changeCount` y de marcadores antes y después de leer que con el texto.
+  `read_text` solo lee `public.utf8-plain-text`, así que el HTML junto a una imagen no cuenta como texto.
+- **Windows:** lee primero el formato registrado `PNG` (navegadores, Recortes), byte por byte. Si no
+  está, convierte a PNG el `CF_DIB` o `CF_DIBV5` que puso la app (Imprimir pantalla, Paint; Windows
+  deriva cada uno del otro y de `CF_BITMAP`, y los lista después de los originales). Solo convierte bitmaps sin comprimir de 24 o 32 bits (`BI_RGB`, o
+  `BI_BITFIELDS` con canales de 8 bits), de arriba abajo o de abajo arriba; cualquier otro cuenta como
+  sin imagen. En 32 bits `BI_RGB` el cuarto byte cuenta como transparencia salvo que valga 0 en todos
+  los píxeles (entonces no se usaba). Al escribir pone `PNG` primero y una copia `CF_DIB` de 32 bits
+  para las apps que no pegan PNG; como la lectura prefiere `PNG`, lo escrito se lee con los mismos
+  bytes. Al leer `PNG` corta los bytes al final del chunk `IEND`, porque un bloque de memoria del
+  portapapeles puede ser más grande que lo que se puso en él. La revisión de marcadores y la lectura
+  pasan en la misma apertura del portapapeles, igual que con el texto.
 - `clipbroad watch` muestra una imagen como `(image/png, 12345 bytes)` y `clipbroad status` muestra el
   tipo del último clip (`text` o `image`) junto al tamaño y el hash.
 

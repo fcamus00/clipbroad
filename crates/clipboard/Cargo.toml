@@ -16,11 +16,19 @@ wl-clipboard-rs.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
-objc2-app-kit = { workspace = true, features = ["std", "NSPasteboard"] }
-objc2-foundation = { workspace = true, features = ["std", "NSArray", "NSEnumerator", "NSString"] }
+objc2-app-kit = { workspace = true, features = ["std", "NSBitmapImageRep", "NSImageRep", "NSPasteboard"] }
+objc2-foundation = { workspace = true, features = [
+    "std",
+    "NSArray",
+    "NSData",
+    "NSDictionary",
+    "NSEnumerator",
+    "NSString",
+] }
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+png.workspace = true
 tracing.workspace = true
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
@@ -31,6 +39,7 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+png.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 
 [lints]
