@@ -295,9 +295,22 @@ contenido. Sincronizar archivos significa transferir el contenido, guardarlo en 
 
 ## Ciclo de vida del daemon
 
-- Linux: servicio de usuario de systemd.
-- macOS: LaunchAgent.
-- Windows: tarea al iniciar sesión.
+- `clipbroad service install|uninstall|status` instala el arranque al iniciar sesión con el mecanismo
+  de cada SO. El servicio corre la ruta absoluta del ejecutable actual con `run` (y `--config` solo
+  si se pasó a `install`), así que mover el binario requiere volver a instalar. `install` es
+  idempotente: reescribe la definición y reinicia el daemon.
+- Linux: unidad de usuario de systemd en `~/.config/systemd/user/clipbroad.service`, ligada a
+  `graphical-session.target` (`WantedBy`, `After`, `PartOf`) y con `Restart=on-failure` cada 5 s. Los
+  logs van a journald. Necesita que la sesión importe `WAYLAND_DISPLAY` al gestor de usuario de
+  systemd y active `graphical-session.target` (uwsm lo hace); `install` avisa si falta alguno.
+- macOS: LaunchAgent en `~/Library/LaunchAgents/` (dominio `gui/<uid>`), con `KeepAlive` solo ante
+  fallos. Los logs van a `~/Library/Logs/clipbroad.log`, que crece sin rotación.
+- Windows: valor `clipbroad` en `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` en vez de una
+  tarea programada: no pide permisos de administrador (`schtasks /sc onlogon` sí) y no hereda los
+  valores por defecto de las tareas (se detienen con batería y a los 3 días). A cambio, nada lo
+  reinicia si se cae. Se lanza con `conhost.exe --headless` para que no abra una ventana de consola;
+  por eso sus logs no quedan en ningún lado. `install` y `uninstall` detienen cualquier otro
+  `clipbroad.exe` que esté corriendo.
 - Configuración en TOML en el directorio de configuración de cada SO; identidad (`SecretKey`) en un
   archivo aparte con permisos restringidos. Ejemplo comentado con todas las opciones y rutas:
   [`config.example.toml`](config.example.toml).
