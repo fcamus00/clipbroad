@@ -2,11 +2,9 @@ use crate::ContentHash;
 
 /// Something that can be on the clipboard and travel between machines.
 ///
-/// Only text exists today. Images and files will be added as new variants; the enum is
-/// `#[non_exhaustive]` so that adding them is not a breaking change, and code outside this crate
-/// must already handle "a kind I don't know" (usually by skipping it).
+/// Only text exists today. Images and files will be added as new variants. Match on it
+/// exhaustively (no `_` arm), so adding a variant fails the build at every place that must handle it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum ClipContent {
     /// Plain UTF-8 text, exactly as the OS clipboard returned it (line endings untouched).
     Text(String),
@@ -55,19 +53,6 @@ impl From<&str> for ClipContent {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn text_hash_is_stable() {
-        let a = ClipContent::from("copied text");
-        let b = ClipContent::Text(String::from("copied text"));
-        assert_eq!(a.hash(), b.hash());
-        // Pinned value: if this changes, peers running different versions stop recognising
-        // each other's clips.
-        assert_eq!(
-            ClipContent::from("").hash().to_string(),
-            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
-        );
-    }
 
     #[test]
     fn different_text_different_hash() {

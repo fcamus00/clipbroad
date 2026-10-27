@@ -10,7 +10,6 @@ use crate::ClipboardError;
 /// To get the content, call [`Clipboard::read_text`](crate::Clipboard::read_text) after deciding
 /// that reading is wanted (for example, after checking `formats` for sensitive-content markers).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct ClipboardChange {
     /// The formats offered by the clipboard right after the change, using each platform's
     /// **native identifiers, verbatim**, in the order the OS reports them:

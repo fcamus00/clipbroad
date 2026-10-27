@@ -5,7 +5,6 @@ use std::error::Error;
 /// "The clipboard is empty" and "the clipboard holds no text" are **not** errors; see
 /// [`Clipboard::read_text`](crate::Clipboard::read_text).
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
 pub enum ClipboardError {
     /// The clipboard cannot be used at all in this session, and retrying will not help until the
     /// environment changes. Examples: no Wayland compositor, compositor without a data-control

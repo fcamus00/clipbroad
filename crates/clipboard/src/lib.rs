@@ -23,7 +23,10 @@ pub use watch::{ChangeSender, ClipboardChange, ClipboardWatch, WatchClosed};
 ///   (e.g. in an `Arc`) and called from any thread. Use interior mutability where needed.
 /// - [`read_text`](Self::read_text) and [`write_text`](Self::write_text) are synchronous and may
 ///   block briefly (talking to the compositor, waiting for another app to hand over data, retrying
-///   a busy Windows clipboard). Aim for well under a second. Async callers should run them with
+///   a busy Windows clipboard). Aim for well under a second, and **never block for more than
+///   2 seconds**: if the source app does not hand over the data in time (a frozen app on Wayland),
+///   give up and return [`ClipboardError::Backend`]. The backend owns this limit because the
+///   daemon cannot cancel a blocked thread. Async callers should run them with
 ///   `tokio::task::spawn_blocking`.
 /// - No method requires a Tokio runtime or a particular calling thread. Backends that need a
 ///   dedicated thread (an event loop, a message window, a polling timer) spawn their own
@@ -88,6 +91,10 @@ pub trait Clipboard: Send + Sync {
     ///   [`write_text`](Self::write_text). Do not try to filter them: anti-echo is done by the
     ///   daemon, by content hash, the same way on every platform.
     /// - A clipboard that becomes empty is reported as a change with no formats.
+    /// - If the formats cannot be listed after brief retries (on Windows another process may hold
+    ///   the clipboard open), send the event with no formats and log a warning. Do not call
+    ///   [`ChangeSender::fail`] for this: it is transient. The daemon treats an event with no
+    ///   formats as "nothing to sync", so this fails closed.
     /// - Several quick changes may be reported as one (polling backends will naturally do this),
     ///   and a change may be reported when the content did not actually change. The formats in
     ///   an event must describe the clipboard at the moment the change was observed.

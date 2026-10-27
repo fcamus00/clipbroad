@@ -83,6 +83,8 @@ para tests. X11 tiene prioridad baja (el objetivo es Hyprland).
 Contrato del trait (detalle completo en los doc comments de `crates/clipboard`):
 - `read_text` / `write_text` son síncronos y pueden bloquear un poco; el daemon los llama con
   `spawn_blocking`. Portapapeles vacío o sin texto es `Ok(None)`, no un error.
+- Ninguna lectura o escritura bloquea más de 2 segundos: si la app dueña del contenido no responde, el
+  backend devuelve error. El límite lo pone el backend porque el daemon no puede cancelar un hilo bloqueado.
 - `watch` devuelve un **canal** (no un callback): el backend empuja eventos desde su propio hilo del SO
   (Wayland, Windows) o desde un hilo que hace polling (macOS), con un `send` no bloqueante. El canal es
   sin límite porque los eventos son chicos y a velocidad humana.

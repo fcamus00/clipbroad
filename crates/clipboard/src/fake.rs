@@ -40,7 +40,6 @@ pub struct FakeClipboard {
 #[derive(Debug, Default)]
 struct State {
     text: Option<String>,
-    formats: Vec<String>,
     watchers: Vec<ChangeSender>,
 }
 
@@ -73,9 +72,8 @@ impl FakeClipboard {
 
     fn set(&self, text: Option<String>, formats: Vec<String>) {
         let mut state = self.lock();
-        let change = ClipboardChange::new(formats.clone());
+        let change = ClipboardChange::new(formats);
         state.text = text;
-        state.formats = formats;
         // Notify every live watcher and forget the ones whose consumer is gone.
         state
             .watchers
