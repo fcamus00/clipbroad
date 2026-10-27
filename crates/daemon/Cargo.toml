@@ -6,7 +6,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 clap.workspace = true
+clipbroad-clipboard.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
