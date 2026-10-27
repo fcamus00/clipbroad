@@ -3,17 +3,24 @@
 
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clipbroad_clipboard::Clipboard;
 
 /// The system clipboard of this machine.
+#[cfg(target_os = "linux")]
 pub fn system_clipboard() -> Result<Arc<dyn Clipboard>> {
-    // TODO(phase 1): one `#[cfg(target_os = ...)]` branch per backend, each returning early:
-    // - Linux: Wayland backend (`wl-clipboard-rs`).
-    // - macOS: polling `NSPasteboard.changeCount`.
-    // - Windows: `AddClipboardFormatListener`.
-    // Platforms without a backend fall through to this error.
-    bail!(
+    Ok(Arc::new(
+        clipbroad_clipboard::wayland::WaylandClipboard::new()?,
+    ))
+}
+
+/// The system clipboard of this machine.
+// TODO(phase 1): a `#[cfg(target_os = ...)]` function per backend, like the Linux one:
+// - macOS: polling `NSPasteboard.changeCount`.
+// - Windows: `AddClipboardFormatListener`.
+#[cfg(not(target_os = "linux"))]
+pub fn system_clipboard() -> Result<Arc<dyn Clipboard>> {
+    anyhow::bail!(
         "the clipboard backend for {} is not implemented yet; \
          run `clipbroad watch --fake` to try it with a simulated clipboard",
         std::env::consts::OS
