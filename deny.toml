@@ -1,8 +1,20 @@
 [graph]
 all-features = true
+# Only the platforms we ship. Without this, wasm-only crates pulled by iroh (Unlicense) count too.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
 
 [advisories]
 yanked = "deny"
+ignore = [
+    # `paste` is archived, not vulnerable: a compile-time macro crate that iroh needs through
+    # netwatch -> netdev -> netlink-packet-core, with no maintained alternative upstream yet.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained, not vulnerable; required by iroh (netwatch)" },
+]
 
 [licenses]
 allow = [
@@ -17,6 +29,12 @@ allow = [
 ]
 confidence-threshold = 0.9
 unused-allowed-license = "allow"
+
+# webpki-roots (pulled by iroh's TLS stack) ships Mozilla's CA list under CDLA-Permissive-2.0, a
+# permissive data license. Allowed for this crate only.
+[[licenses.exceptions]]
+crate = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
 
 [licenses.private]
 ignore = true

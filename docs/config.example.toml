@@ -29,7 +29,8 @@ inline_max_bytes = 8388608
 
 # Máquinas emparejadas. Normalmente las escribe `clipbroad pair`; se pueden editar a mano.
 # Cada una lleva:
-#   id     identidad pública del peer (64 caracteres hexadecimales). Obligatorio y sin repetir.
+#   id     identidad pública del peer (64 caracteres hexadecimales en minúsculas). Obligatorio y
+#          sin repetir.
 #   name   etiqueta para logs y `clipbroad status`. Opcional.
 #   addrs  direcciones "ip:puerto" para conectar directo cuando el descubrimiento en la LAN no llega,
 #          por ejemplo la IP de Tailscale (100.x.y.z) o su IPv6 (entre corchetes). Opcional.
