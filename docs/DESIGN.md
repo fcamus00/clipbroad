@@ -564,9 +564,6 @@ Riesgos y límites:
 - **El motor marca el clip como aplicado antes de tener los archivos.** Si la descarga falla, ese
   clip no se reintenta hasta la próxima copia, como pasa hoy con una imagen que el SO no puede
   escribir.
-- **macOS y Windows todavía no leen ni escriben archivos** (ver "Archivos en el portapapeles"). Un
-  clip de archivos recibido ahí se descarga a la caché y después no se puede poner en el
-  portapapeles: el daemon lo registra con un warning.
 - Se puede volver a evaluar `iroh-blobs` cuando su línea compatible con iroh 1.x se declare lista para
   producción.
 
@@ -607,9 +604,23 @@ Código en `crates/clipboard` (`read_files`, `write_files`) y `crates/daemon/src
   `Offer::read` calcula el mismo hash de lista que el clip recibido: el hash depende solo de nombre,
   tamaño y hash de cada archivo, no de dónde están. El motor responde `Unchanged` y no se reenvía.
   Cuesta leer los archivos otra vez (unos 17 ms por cada 100 MB).
-- **macOS y Windows** (`NSPasteboardTypeFileURL`, `CF_HDROP`) llegan en un PR aparte. Hasta
-  entonces usan los valores por defecto del trait: nunca reportan archivos, y un clip de archivos
-  recibido se descarga pero no se puede escribir (warning en el log).
+- **macOS, lectura.** Finder pone un ítem por archivo en el pasteboard, cada uno con un
+  `public.file-url` (`NSPasteboardTypeFileURL`). Se lee el de cada ítem y `NSURL` lo pasa a ruta;
+  así también se resuelven las URLs de referencia (`file:///.file/id=...`, que nombran el archivo
+  por id) a la ruta actual del archivo. Solo cuentan las URLs `file:` sin host o con `localhost`. Si
+  un ítem no tiene una (un enlace web copiado trae `public.url`, no `public.file-url`), la copia no
+  es de archivos y sigue siendo texto. Mismo control de `changeCount` y de marcadores antes y
+  después de leer que con el texto.
+- **macOS, escritura.** Escribe un `NSURL` de archivo por ruta (`writeObjects`), lo mismo que pega
+  Finder. Las rutas deben ser UTF-8, como las de macOS.
+- **Windows, lectura.** Lee `CF_HDROP`: un encabezado `DROPFILES` y las rutas, cada una terminada
+  en NUL, con un NUL extra al final. Se decodifica a mano (`crates/clipboard/src/hdrop.rs`), sin
+  `DragQueryFileW`, para que el formato se pruebe en los tres SO. Las rutas ANSI (`fWide` = 0, de
+  apps muy viejas) solo se leen si son ASCII, porque el resto depende de la página de códigos del
+  sistema. La revisión de marcadores y la lectura pasan en la misma apertura del portapapeles.
+- **Windows, escritura.** Escribe `CF_HDROP` con rutas UTF-16 (`fWide` = 1) y `Preferred
+  DropEffect` = `DROPEFFECT_COPY`, así el Explorador pega una copia y nunca mueve los archivos fuera
+  de la caché. Las rutas con espacios y no ASCII van tal cual.
 
 ## Ciclo de vida del daemon
 
