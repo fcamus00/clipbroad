@@ -1,6 +1,8 @@
 use std::{
     collections::HashSet,
-    fs, io,
+    fmt::Write as _,
+    fs,
+    io::{self, Write as _},
     net::SocketAddr,
     num::{NonZeroU16, NonZeroU64},
     path::Path,
@@ -103,6 +105,57 @@ impl Config {
             path: path.to_owned(),
             source,
         })
+    }
+
+    /// Adds `peer` to the config file at `path` by appending a `[[peers]]` block, so the rest of
+    /// the file (comments included) stays as it is. Creates the file and its directory if needed.
+    ///
+    /// Returns `false`, without touching the file, if a peer with the same id is already there.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the file cannot be read or written, [`Error::Config`] if the current file
+    /// is invalid (it is left unchanged).
+    pub fn append_peer(path: &Path, peer: &Peer) -> Result<bool, Error> {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(Error::io(path, e)),
+        };
+        let invalid = |source| Error::Config {
+            path: path.to_owned(),
+            source,
+        };
+        let current = Self::from_toml_str(&text).map_err(invalid)?;
+        if current.peers.iter().any(|p| p.id == peer.id) {
+            return Ok(false);
+        }
+
+        let mut block = String::new();
+        if !text.is_empty() {
+            block.push_str(if text.ends_with('\n') { "\n" } else { "\n\n" });
+        }
+        block.push_str("[[peers]]\n");
+        if let Some(name) = &peer.name {
+            // `Value`'s display quotes and escapes the string.
+            let _ = writeln!(block, "name = {}", toml::Value::from(name.as_str()));
+        }
+        let _ = writeln!(block, "id = \"{}\"", peer.id);
+        let addrs: Vec<String> = peer.addrs.iter().map(|a| format!("\"{a}\"")).collect();
+        let _ = writeln!(block, "addrs = [{}]", addrs.join(", "));
+        // Check the result before writing anything.
+        Self::from_toml_str(&(text + &block)).map_err(invalid)?;
+
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+        }
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| file.write_all(block.as_bytes()))
+            .map_err(|e| Error::io(path, e))?;
+        Ok(true)
     }
 
     fn validate(&self) -> Result<(), ParseError> {
@@ -275,6 +328,79 @@ mod tests {
         let text = chain(&err);
         assert!(text.contains("config.toml"), "{text}");
         assert!(text.contains("line 2"), "{text}");
+    }
+
+    fn peer(name: Option<&str>) -> Peer {
+        Peer {
+            id: ID_A.parse().expect("valid id"),
+            name: name.map(str::to_owned),
+            addrs: vec!["192.168.1.20:42420".parse().expect("valid")],
+        }
+    }
+
+    #[test]
+    fn append_peer_creates_file_and_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("clipbroad").join("config.toml");
+
+        assert!(Config::append_peer(&path, &peer(Some("laptop"))).expect("added"));
+
+        let text = fs::read_to_string(&path).expect("file created");
+        assert_eq!(
+            text,
+            format!(
+                "[[peers]]\nname = \"laptop\"\nid = \"{ID_A}\"\naddrs = [\"192.168.1.20:42420\"]\n"
+            )
+        );
+        let config = Config::load_or_default(&path).expect("valid");
+        assert_eq!(config.peers, [peer(Some("laptop"))]);
+    }
+
+    #[test]
+    fn append_peer_keeps_comments_and_skips_duplicates() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        let original = "# my port\nlisten_port = 5000";
+        fs::write(&path, original).expect("write");
+
+        assert!(Config::append_peer(&path, &peer(None)).expect("added"));
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(
+            text.starts_with("# my port\nlisten_port = 5000\n\n[[peers]]\n"),
+            "{text}"
+        );
+        assert!(!text.contains("name"), "{text}");
+
+        assert!(!Config::append_peer(&path, &peer(Some("again"))).expect("no error"));
+        assert_eq!(fs::read_to_string(&path).expect("read"), text);
+        let config = Config::load_or_default(&path).expect("valid");
+        assert_eq!(config.listen_port.get(), 5000);
+        assert_eq!(config.peers, [peer(None)]);
+    }
+
+    #[test]
+    fn append_peer_escapes_the_name() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        let name = "evil\"\n[[peers]]\\";
+
+        assert!(Config::append_peer(&path, &peer(Some(name))).expect("added"));
+        let config = Config::load_or_default(&path).expect("valid");
+        assert_eq!(config.peers, [peer(Some(name))]);
+    }
+
+    #[test]
+    fn append_peer_leaves_an_invalid_file_alone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "listen_prot = 5000\n").expect("write");
+
+        let err = Config::append_peer(&path, &peer(None)).expect_err("invalid file");
+        assert!(matches!(err, Error::Config { .. }), "{err}");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "listen_prot = 5000\n"
+        );
     }
 
     #[test]

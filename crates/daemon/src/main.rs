@@ -1,4 +1,5 @@
 mod backend;
+mod pair;
 mod run;
 mod watch;
 
@@ -22,9 +23,16 @@ struct Cli {
     command: Command,
 }
 
-// Next subcommands: `pair` in phase 2, `status` in phase 3.
+// Next subcommand: `status` in phase 3.
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Pair with another machine, so that `clipbroad run` syncs with it.
+    ///
+    /// Run `clipbroad pair` on one machine: it shows a ticket and waits. Then run
+    /// `clipbroad pair <TICKET>` on the other one. Both add each other to their config file. The
+    /// ticket works once and for 5 minutes. Pairing uses the same port as `clipbroad run`, so stop
+    /// it on both machines first and start it again afterwards.
+    Pair(pair::Args),
     /// Sync the clipboard with the peers in the config file until Ctrl+C or SIGTERM.
     ///
     /// Each text copied here is sent to every connected peer, and text copied on a peer is written
@@ -46,10 +54,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let default_level = match cli.command {
         Command::Run(_) => LevelFilter::INFO,
-        Command::Watch(_) => LevelFilter::WARN,
+        Command::Pair(_) | Command::Watch(_) => LevelFilter::WARN,
     };
     init_logging(default_level, cli.verbose);
     match cli.command {
+        Command::Pair(args) => pair::run(args).await,
         Command::Run(args) => run::run(args).await,
         Command::Watch(args) => watch::run(args).await,
     }

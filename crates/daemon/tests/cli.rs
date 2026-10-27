@@ -42,6 +42,14 @@ fn watch_fake_prints_one_line_per_change() {
 }
 
 #[test]
+fn pair_rejects_a_bad_ticket() {
+    let output = clipbroad(&["pair", "not-a-ticket"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not a clipbroad ticket"), "{stderr}");
+}
+
+#[test]
 fn help_describes_commands_and_hides_fake() {
     let help = stdout(clipbroad(&["--help"]));
     assert!(
@@ -50,6 +58,14 @@ fn help_describes_commands_and_hides_fake() {
     );
 
     assert!(help.contains("run    Sync the clipboard"), "{help}");
+    assert!(help.contains("pair   Pair with another machine"), "{help}");
+
+    let pair_help = stdout(clipbroad(&["pair", "--help"]));
+    assert!(pair_help.contains("[TICKET]"), "{pair_help}");
+    assert!(
+        pair_help.contains("stop it on both machines"),
+        "{pair_help}"
+    );
 
     let run_help = stdout(clipbroad(&["run", "--help"]));
     assert!(run_help.contains("--config <FILE>"), "{run_help}");
