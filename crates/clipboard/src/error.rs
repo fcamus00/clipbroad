@@ -30,6 +30,14 @@ pub enum ClipboardError {
         marker: &'static str,
     },
 
+    /// This backend cannot handle this kind of content (e.g. images on a backend that only
+    /// supports text). Retrying will not help.
+    #[error("this clipboard backend does not support {content} yet")]
+    Unsupported {
+        /// The kind of content, plural, e.g. `images`.
+        content: &'static str,
+    },
+
     /// Any other failure reported by the OS or the backend library.
     #[error("clipboard backend error: {message}")]
     Backend {

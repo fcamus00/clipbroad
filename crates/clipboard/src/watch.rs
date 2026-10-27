@@ -7,8 +7,9 @@ use crate::ClipboardError;
 /// One observed change of the system clipboard.
 ///
 /// It says *that* the clipboard changed and which formats it now offers, but carries no content.
-/// To get the content, call [`Clipboard::read_text`](crate::Clipboard::read_text), which refuses
-/// content marked as sensitive.
+/// To get the content, call [`Clipboard::read_text`](crate::Clipboard::read_text) or
+/// [`Clipboard::read_image`](crate::Clipboard::read_image), which refuse content marked as
+/// sensitive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardChange {
     /// The formats offered by the clipboard right after the change, using each platform's

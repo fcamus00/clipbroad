@@ -7,15 +7,18 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use clipbroad_clipboard::fake::{FakeClipboard, TEXT_FORMAT};
+use clipbroad_clipboard::fake::{self, FakeClipboard, TEXT_FORMAT};
 use clipbroad_clipboard::{Clipboard, ClipboardError};
+use clipbroad_core::ClipContent;
 
 use crate::backend;
+use crate::run::read_content;
 
 /// Text previews are cut to this many characters.
 const PREVIEW_CHARS: usize = 80;
 
-/// What `--fake` copies, as `(text, formats)`: one entry per kind of output line.
+/// What `--fake` copies, as `(text, formats)`: one entry per kind of output line. A PNG image
+/// follows them.
 const FAKE_COPIES: [(Option<&str>, &[&str]); 6] = [
     (Some("hello from clipbroad"), &[TEXT_FORMAT]),
     (Some("two lines\nand a\ttab"), &[TEXT_FORMAT]),
@@ -27,7 +30,8 @@ const FAKE_COPIES: [(Option<&str>, &[&str]); 6] = [
         &[TEXT_FORMAT],
     ),
     (Some("hunter2"), &[TEXT_FORMAT, "x-kde-passwordManagerHint"]),
-    (None, &["image/png"]),
+    // An image type that is not PNG.
+    (None, &["image/jpeg"]),
     (None, &[]),
 ];
 
@@ -85,14 +89,17 @@ async fn watch(
             "(clipboard empty)".to_owned()
         } else {
             let clipboard = Arc::clone(&clipboard);
-            // `read_text` may block (up to 2 s by contract), so keep it off the async thread.
-            match tokio::task::spawn_blocking(move || clipboard.read_text()).await? {
-                Ok(Some(text)) => preview(&text),
-                Ok(None) => "(no text)".to_owned(),
+            // Reads may block (up to 2 s each by contract), so keep them off the async thread.
+            match tokio::task::spawn_blocking(move || read_content(&*clipboard)).await? {
+                Ok(Some(ClipContent::Text(text))) => preview(&text),
+                Ok(Some(ClipContent::Image(png))) => {
+                    format!("(image/png, {} bytes)", png.as_bytes().len())
+                }
+                Ok(None) => "(no text or PNG image)".to_owned(),
                 Err(ClipboardError::Sensitive { marker }) => {
                     format!("(sensitive: {marker}, not read or synced)")
                 }
-                Err(error) => format!("(cannot read text: {error})"),
+                Err(error) => format!("(cannot read: {error})"),
             }
         };
         writeln!(
@@ -104,8 +111,8 @@ async fn watch(
     }
 }
 
-/// Copies each of [`FAKE_COPIES`], handing control back to [`watch`] after each one so it gets
-/// printed before the next.
+/// Copies each of [`FAKE_COPIES`] and then an image, handing control back to [`watch`] after
+/// each one so it gets printed before the next.
 async fn simulate_copies(fake: FakeClipboard) {
     for (text, formats) in FAKE_COPIES {
         fake.simulate_copy(
@@ -114,6 +121,8 @@ async fn simulate_copies(fake: FakeClipboard) {
         );
         tokio::task::yield_now().await;
     }
+    fake.simulate_copy_image(fake::tiny_png());
+    tokio::task::yield_now().await;
 }
 
 /// The text quoted and escaped (so one change stays on one line), cut to [`PREVIEW_CHARS`]

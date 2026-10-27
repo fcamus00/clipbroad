@@ -6,12 +6,12 @@
 //!
 //! # Threads
 //!
-//! - [`write_text`](Clipboard::write_text): on Wayland the app that copied must keep serving the
-//!   content to whoever pastes. `wl_clipboard_rs` does this on a background thread that lives
-//!   until another copy replaces ours (the compositor then cancels our offer and the thread ends)
-//!   or the process exits. So there is at most one such thread per process in steady state, and
-//!   the clipboard empties when the process exits (unlike `wl-copy`, which forks a process that
-//!   outlives the shell command).
+//! - [`write_text`](Clipboard::write_text) and [`write_image`](Clipboard::write_image): on
+//!   Wayland the app that copied must keep serving the content to whoever pastes.
+//!   `wl_clipboard_rs` does this on a background thread that lives until another copy replaces
+//!   ours (the compositor then cancels our offer and the thread ends) or the process exits. So
+//!   there is at most one such thread per process in steady state, and the clipboard empties when
+//!   the process exits (unlike `wl-copy`, which forks a process that outlives the shell command).
 //! - [`watch`](Clipboard::watch): one thread blocked on the compositor connection, plus one that
 //!   checks every [`STOP_CHECK_INTERVAL`] whether the [`ClipboardWatch`] was dropped and, if so,
 //!   wakes the first one up. Both end shortly after the watch is dropped, even if the clipboard
@@ -19,10 +19,22 @@
 //!
 //! # Sensitive content
 //!
-//! [`read_text`](Clipboard::read_text) asks the compositor for the current selection and gets one
-//! data offer with its fixed list of MIME types. It checks that list for sensitive markers and, if
-//! there are none, reads the text from **that same offer**. A newer copy brings a new offer, so the
-//! checked list and the text always belong to the same content.
+//! [`read_text`](Clipboard::read_text) and [`read_image`](Clipboard::read_image) ask the compositor
+//! for the current selection and get one data offer with its fixed list of MIME types. They check
+//! that list for sensitive markers and, if there are none, read the content from **that same
+//! offer**. A newer copy brings a new offer, so the checked list and the content always belong to
+//! the same copy.
+//!
+//! # Images
+//!
+//! Only `image/png` is read and written, byte for byte, so an image we wrote reads back with the
+//! same hash. A copy that offers only other image types (`image/jpeg`, `image/bmp`, ...) counts as
+//! no image: converting would need an image codec. Screenshot tools and browsers offer
+//! `image/png`.
+//!
+//! When an image comes with `text/html` but no plain text (a browser's "Copy image"),
+//! [`read_text`](Clipboard::read_text) returns `None`, so the image is what gets synced and not
+//! the `<img>` markup.
 //!
 //! # Known compositor gaps
 //!
@@ -37,15 +49,22 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use clipbroad_core::Png;
 use clipbroad_core::sensitive::sensitive_marker;
 use rustix::event::{PollFd, PollFlags, Timespec};
-use wl_clipboard_rs::watch::{ClipboardEvent, Watcher};
+use wl_clipboard_rs::watch::{ClipboardEvent, Offer, Watcher};
 use wl_clipboard_rs::{copy, paste, watch};
 
 use crate::{ChangeSender, Clipboard, ClipboardChange, ClipboardError, ClipboardWatch};
 
 /// The MIME type we read first and write as the main offer.
 const TEXT_UTF8: &str = "text/plain;charset=utf-8";
+
+/// Plain-text MIME types, in the order `read_text` prefers them when an image is also offered.
+const PLAIN_TEXT: [&str; 5] = [TEXT_UTF8, "UTF8_STRING", "text/plain", "STRING", "TEXT"];
+
+/// The only image type read and written.
+const IMAGE_PNG: &str = "image/png";
 
 /// Longest wait for the app that owns the clipboard to hand over its content.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -82,40 +101,25 @@ impl WaylandClipboard {
 
 impl Clipboard for WaylandClipboard {
     fn read_text(&self) -> Result<Option<String>, ClipboardError> {
-        // A watcher, unlike `paste::get_contents`, hands out the offer together with its MIME
-        // types, so both come from the same content (see module docs). It reports the current
-        // selection first; cancelling up front makes `next_event` return that queued event right
-        // away, or `None` instead of blocking if the compositor sent none.
-        let mut watcher = Watcher::new(watch::ClipboardType::Regular, paste::Seat::Unspecified)
-            .map_err(|error| paste_error("requesting the clipboard", error))?;
-        watcher.cancel_handle().cancel();
-        let (mime_types, mut offer) = match watcher.next_event() {
-            Ok(Some(ClipboardEvent::Changed {
-                mime_types, offer, ..
-            })) => (mime_types, offer),
-            Ok(Some(ClipboardEvent::Cleared { .. })) => return Ok(None),
-            Ok(None) => {
-                return Err(ClipboardError::Backend {
-                    message: "the compositor did not report the current clipboard".to_owned(),
-                    source: None,
-                });
-            }
-            Err(error) => return Err(paste_error("requesting the clipboard", error)),
-        };
-        if let Some(marker) = sensitive_marker(&mime_types) {
-            return Err(ClipboardError::Sensitive { marker });
-        }
-        // `MimeType::Text` prefers `text/plain;charset=utf-8`, then `UTF8_STRING`, then any other
-        // text type.
-        let Some(mime_type) = paste::select_mime_type(mime_types, paste::MimeType::Text) else {
-            return Ok(None);
-        };
-        let pipe = offer
-            .receive(&mime_type)
-            .map_err(|error| paste_error("requesting clipboard text", error))?;
-        // `watcher` keeps the compositor connection open until the transfer ends.
-        let bytes = read_to_end_within(pipe, READ_TIMEOUT)?;
-        Ok(String::from_utf8(bytes).ok())
+        read_current(|mime_types, offer| {
+            let mime_type = if mime_types.iter().any(|offered| offered == IMAGE_PNG) {
+                // Markup next to an image describes the image (a browser's "Copy image" offers
+                // `text/html` with an `<img>` tag), so only plain text counts as text then.
+                PLAIN_TEXT
+                    .into_iter()
+                    .find(|plain| mime_types.iter().any(|offered| offered == plain))
+                    .map(str::to_owned)
+            } else {
+                // `MimeType::Text` prefers `text/plain;charset=utf-8`, then `UTF8_STRING`, then
+                // any other text type.
+                paste::select_mime_type(mime_types, paste::MimeType::Text)
+            };
+            let Some(mime_type) = mime_type else {
+                return Ok(None);
+            };
+            let bytes = receive(offer, &mime_type)?;
+            Ok(String::from_utf8(bytes).ok())
+        })
     }
 
     fn write_text(&self, text: &str) -> Result<(), ClipboardError> {
@@ -125,6 +129,31 @@ impl Clipboard for WaylandClipboard {
             .copy(
                 copy::Source::Bytes(text.as_bytes().into()),
                 copy::MimeType::Specific(TEXT_UTF8.to_owned()),
+            )
+            .map_err(copy_error)
+    }
+
+    fn read_image(&self) -> Result<Option<Png>, ClipboardError> {
+        read_current(|mime_types, offer| {
+            // Other image types (`image/jpeg`, `image/bmp`, ...) would need transcoding; see
+            // module docs.
+            if !mime_types.iter().any(|offered| offered == IMAGE_PNG) {
+                return Ok(None);
+            }
+            let bytes = receive(offer, IMAGE_PNG)?;
+            Png::try_from(bytes)
+                .map(Some)
+                .map_err(|error| ClipboardError::backend("reading the image/png offer", error))
+        })
+    }
+
+    fn write_image(&self, png: &Png) -> Result<(), ClipboardError> {
+        // Served as is, so a read-back returns the same bytes (anti-echo depends on it). Only
+        // `image/png` is offered: unlike text, the library adds no other types.
+        copy::Options::new()
+            .copy(
+                copy::Source::Bytes(png.as_bytes().into()),
+                copy::MimeType::Specific(IMAGE_PNG.to_owned()),
             )
             .map_err(copy_error)
     }
@@ -192,6 +221,45 @@ fn forward_events(mut watcher: Watcher, changes: ChangeSender) {
             return;
         }
     }
+}
+
+/// Gets the current selection and hands its MIME types and offer to `read`, unless the selection
+/// is empty or marked as sensitive. Both come from the same offer (see module docs).
+fn read_current<T>(
+    read: impl FnOnce(Vec<String>, &mut Offer<'_>) -> Result<Option<T>, ClipboardError>,
+) -> Result<Option<T>, ClipboardError> {
+    // A watcher, unlike `paste::get_contents`, hands out the offer together with its MIME types.
+    // It reports the current selection first; cancelling up front makes `next_event` return that
+    // queued event right away, or `None` instead of blocking if the compositor sent none.
+    let mut watcher = Watcher::new(watch::ClipboardType::Regular, paste::Seat::Unspecified)
+        .map_err(|error| paste_error("requesting the clipboard", error))?;
+    watcher.cancel_handle().cancel();
+    let (mime_types, mut offer) = match watcher.next_event() {
+        Ok(Some(ClipboardEvent::Changed {
+            mime_types, offer, ..
+        })) => (mime_types, offer),
+        Ok(Some(ClipboardEvent::Cleared { .. })) => return Ok(None),
+        Ok(None) => {
+            return Err(ClipboardError::Backend {
+                message: "the compositor did not report the current clipboard".to_owned(),
+                source: None,
+            });
+        }
+        Err(error) => return Err(paste_error("requesting the clipboard", error)),
+    };
+    if let Some(marker) = sensitive_marker(&mime_types) {
+        return Err(ClipboardError::Sensitive { marker });
+    }
+    // `offer` borrows `watcher`, which keeps the compositor connection open until `read` ends.
+    read(mime_types, &mut offer)
+}
+
+/// Receives the content of `offer` as `mime_type`, within [`READ_TIMEOUT`].
+fn receive(offer: &mut Offer<'_>, mime_type: &str) -> Result<Vec<u8>, ClipboardError> {
+    let pipe = offer
+        .receive(mime_type)
+        .map_err(|error| paste_error(&format!("requesting the {mime_type} offer"), error))?;
+    read_to_end_within(pipe, READ_TIMEOUT)
 }
 
 /// Reads `pipe` to the end, giving up once `timeout` has passed. A frozen source app would
