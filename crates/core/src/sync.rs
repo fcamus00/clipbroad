@@ -173,6 +173,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
+    use crate::content::tiny_image;
     use crate::protocol::Payload;
 
     fn node(n: u8) -> NodeId {
@@ -373,6 +374,23 @@ mod tests {
         mesh.copy(1, "from b");
         mesh.run();
         assert_eq!(mesh.clipboards(), [Some("from a"); 3]);
+    }
+
+    #[test]
+    fn images_sync_like_text() {
+        let mut a = SyncEngine::new(node(1));
+        let mut b = SyncEngine::new(node(2));
+        let clip = sent(a.local_changed(tiny_image(), 1_000));
+        let RemoteAction::Apply(content) = b.remote_clip(clip).expect("intact") else {
+            panic!("expected Apply");
+        };
+        assert_eq!(content, tiny_image());
+        // The write on B comes back as a change event: the echo is not sent.
+        assert_eq!(b.local_changed(content, 1_005), LocalAction::Unchanged);
+
+        // A later text copy on B replaces the image on A.
+        let clip = sent(b.local_changed(text("after"), 2_000));
+        assert_eq!(a.remote_clip(clip), Ok(RemoteAction::Apply(text("after"))));
     }
 
     #[test]
