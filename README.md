@@ -5,6 +5,19 @@ LAN or Tailscale; no server, no third-party services.
 
 > Status: early development. See [docs/DESIGN.md](docs/DESIGN.md) for the design and roadmap.
 
+## Download a release
+
+Each [GitHub Release](https://github.com/fcamus00/clipbroad/releases) has an archive per platform
+(`.tar.gz` for Linux and macOS, `.zip` for Windows) and a `SHA256SUMS` file:
+
+```sh
+gh release download --repo fcamus00/clipbroad --pattern '*linux-x86_64*' --pattern SHA256SUMS
+grep linux-x86_64 SHA256SUMS | sha256sum -c      # macOS: shasum -a 256 -c
+```
+
+The macOS binary is not signed; see the quarantine note below. Maintainers: the release process is in
+[docs/RELEASE.md](docs/RELEASE.md).
+
 ## Download a CI build
 
 Every push to `main` and every pull request builds `clipbroad` for each OS. The binaries are attached

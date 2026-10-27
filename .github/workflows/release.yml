@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  TAG: ${{ github.ref_name }}
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+            exe: clipbroad
+          # macos-latest runners are Apple Silicon.
+          - os: macos-latest
+            target: macos-aarch64
+            exe: clipbroad
+          - os: windows-latest
+            target: windows-x86_64
+            exe: clipbroad.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # No rust-cache: release builds start clean, and releases are rare.
+      - run: cargo build --release --locked -p clipbroad
+      # The binary must report the tag's version (v0.2.0 and v0.2.0-rc.1 both expect 0.2.0).
+      - name: Check version
+        shell: bash
+        run: |
+          version="${TAG#v}"
+          version="${version%%-*}"
+          actual="$(target/release/${{ matrix.exe }} --version)"
+          if [ "$actual" != "clipbroad $version" ]; then
+            echo "::error::tag $TAG expects 'clipbroad $version', binary reports '$actual'. Bump the version in Cargo.toml."
+            exit 1
+          fi
+      - name: Package
+        shell: bash
+        run: |
+          name="clipbroad-$TAG-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/release/${{ matrix.exe }}" README.md LICENSE-APACHE LICENSE-MIT "$name/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z a "$name.zip" "$name"
+          else
+            tar -czf "$name.tar.gz" "$name"
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            clipbroad-*.tar.gz
+            clipbroad-*.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Tags with a suffix (v0.2.0-rc.1) are pre-releases.
+          prerelease=()
+          if [[ "$TAG" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$TAG" dist/* --verify-tag --generate-notes "${prerelease[@]}"
