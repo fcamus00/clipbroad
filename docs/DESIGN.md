@@ -73,7 +73,8 @@ Detalles (código en `crates/core/src/protocol.rs`):
   primer campo; solo se le pueden agregar campos al final. `decode` ignora los bytes sobrantes dentro de un
   frame, así un nodo viejo puede leer la versión de un `Hello` nuevo y rechazarlo con un error claro.
 - **`Clip`:** `id` (número que elige el origen), `origin` (los 32 bytes del `EndpointId`, opacos para
-  `core`), `timestamp_ms` (milisegundos Unix según el reloj del origen), `kind`, `mime`, `size`, `hash` y
+  `core`), `timestamp_ms` (milisegundos Unix según el reloj del origen, adelantado si hace falta para quedar
+  después de lo último que vio; ver "Semántica de sincronización"), `kind`, `mime`, `size`, `hash` y
   `payload`. El payload hoy solo puede ser inline; el anuncio de archivos grandes se agrega en la fase 4.
 - **Verificación al recibir:** el contenido solo se obtiene con `Clip::into_content`, que comprueba que el
   tamaño y el hash BLAKE3 declarados coinciden con el payload (y que el texto sea UTF-8 válido).
@@ -81,10 +82,38 @@ Detalles (código en `crates/core/src/protocol.rs`):
 
 ### Semántica de sincronización
 
+La lógica vive en `crates/core/src/sync.rs` (`SyncEngine`), sin IO ni reloj: el daemon le pasa la hora.
+Ante un evento local, el daemon lee el texto y llama a `local_changed`; si responde `Send(clip)`, lo envía
+a todos los peers. Ante un clip remoto, llama a `remote_clip`; si responde `Apply(contenido)`, lo escribe
+en el portapapeles local.
+
 - **Último en escribir gana.** Cada copia local nueva se envía a todos los peers; al recibir, se escribe
-  en el portapapeles local.
+  en el portapapeles local si es más nueva que lo último visto. Los clips se ordenan por
+  `(timestamp_ms, origen)`: el `NodeId` de origen desempata, así todas las máquinas eligen el mismo.
+- **Reloj:** los relojes de las máquinas difieren. Con el timestamp del reloj tal cual, una máquina
+  atrasada 10 s perdería contra una copia hecha 3 s antes en otra máquina, incluso en ella misma. Por eso
+  una copia local lleva `max(ahora, lo más nuevo visto + 1 ms)`: siempre le gana a todo lo que su máquina
+  ya vio, sin importar los relojes. Para una persona que copia en una máquina a la vez, siempre gana su
+  última copia.
 - **Anti-eco:** al escribir contenido remoto en el portapapeles local, el SO dispara un evento de cambio.
-  Se guarda el hash del último contenido aplicado desde la red y se ignora el evento local que coincide.
+  Se guarda el hash del último contenido enviado o aplicado y se ignora el evento local que coincide.
+  Sin esto, dos máquinas se reenvían el mismo contenido para siempre. Se necesita desde la primera
+  sincronización (fase 2).
+- **Mismo texto copiado dos veces seguidas:** no se reenvía, porque el hash coincide con lo último enviado.
+  Los peers ya lo tienen: si alguno hubiera copiado algo después, ese clip habría llegado y cambiado el
+  hash guardado. Por eso, si A copia X, B copia Y y A vuelve a copiar X, X se envía de nuevo y gana en
+  todas.
+- **Estado acotado:** solo el último hash y la última marca `(timestamp_ms, origen)`, sin historial ni
+  persistencia.
+- **Límites conocidos:**
+  - Dos copias en máquinas distintas, tan seguidas que ninguna vio la otra, son concurrentes: gana la de
+    marca mayor (la máquina con el reloj adelantado). Todas terminan con el mismo contenido.
+  - Un reloj adelantado arrastra las marcas de todos hacia adelante; el orden sigue funcionando, pero
+    `timestamp_ms` deja de ser la hora exacta.
+  - Un daemon recién arrancado no vio nada. Si el reloj de un peer va adelantado, su primera copia puede
+    perder contra el último clip de ese peer, como mucho durante la diferencia de relojes.
+  - No hay puesta al día al reconectar: un peer que se perdió un clip queda con el contenido anterior
+    hasta la próxima copia, y copiar de nuevo el mismo texto no lo reenvía.
 - **Contenido sensible: nunca se sincroniza** (ver la sección siguiente).
 
 ## Portapapeles por plataforma
@@ -179,8 +208,8 @@ contenido. Sincronizar archivos significa transferir el contenido, guardarlo en 
 |---|---|---|
 | 0 | Workspace, CI en 3 SO, AGENTS.md, este documento | El CI está verde en los 3 SO |
 | 1 | Backends de portapapeles (texto) + `clipbroad watch` que imprime los cambios + spike de privacidad en macOS | Imprime lo copiado en cada SO; el comportamiento en macOS está documentado aquí |
-| 2 | Red P2P, emparejamiento, sincronización de texto | Copiar en una máquina y pegar en las otras dos |
-| 3 | Anti-eco, filtro de sensibles, servicio de arranque, `clipbroad status` | Un día de uso real sin problemas |
+| 2 | Red P2P, emparejamiento, sincronización de texto con anti-eco | Copiar en una máquina y pegar en las otras dos |
+| 3 | Filtro de sensibles, servicio de arranque, `clipbroad status` | Un día de uso real sin problemas |
 | 4 | Imágenes, luego archivos | Captura de pantalla en una máquina, pegar en otra; archivo de 100 MB |
 | 5 | Icono en bandeja, historial (opcional) | — |
 
