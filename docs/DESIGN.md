@@ -57,8 +57,8 @@ Las direcciones estáticas siguen sirviendo para lo que mDNS no alcanza, como Ta
   por defecto, que traen relays y `portmapper`. El elegido usa la misma versión de iroh que el resto
   (no hay dos iroh en el `Cargo.lock`), es MIT o Apache-2.0 y no agrega avisos ni licencias nuevas.
 - **Integración:** se registra como *address lookup* del endpoint (el preset `Minimal` no trae
-  ninguno). Al marcar a un peer, iroh le pide sus direcciones actuales y las prueba junto con las
-  estáticas. Por eso, con mDNS activo, el nodo marca también a los peers sin `addrs`.
+  ninguno). Al marcar a un peer, iroh le pide a mDNS las direcciones actuales del peer y las
+  prueba con las estáticas. Por eso, con mDNS activo, el nodo marca también a los peers sin `addrs`.
 - **Nombre de servicio propio:** `clipbroad` (registros `<id>._clipbroad._udp.local`) en vez del
   `irohv1` por defecto, para no mezclarse con otras apps de iroh en la misma red. Todos los nodos
   deben usar el mismo.
