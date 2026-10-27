@@ -19,10 +19,19 @@ use crate::Error;
 ///
 /// The running daemon's status file is `status.toml` beside the secret key file (see
 /// [`Paths::status_file`]).
+///
+/// Files received from peers are kept in `file_cache_dir`:
+///
+/// | OS | File cache |
+/// |---|---|
+/// | Linux | `$XDG_CACHE_HOME/clipbroad/files` (`~/.cache/...`) |
+/// | macOS | `~/Library/Caches/clipbroad/files` |
+/// | Windows | `%LOCALAPPDATA%\clipbroad\files` |
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
     pub config_file: PathBuf,
     pub secret_key_file: PathBuf,
+    pub file_cache_dir: PathBuf,
 }
 
 impl Paths {
@@ -36,12 +45,14 @@ impl Paths {
         Ok(Self::resolve(&home, |var| env::var_os(var)))
     }
 
-    /// Paths for a config file given by the user: the identity is `secret.key` in the same
-    /// directory, so each config file has its own identity.
+    /// Paths for a config file given by the user: the identity is `secret.key` and the file
+    /// cache is `files/`, both in the same directory, so each config file has its own identity
+    /// and two instances on one machine never share a cache.
     #[must_use]
     pub fn beside_config(config_file: PathBuf) -> Self {
         Self {
             secret_key_file: config_file.with_file_name("secret.key"),
+            file_cache_dir: config_file.with_file_name("files"),
             config_file,
         }
     }
@@ -65,22 +76,24 @@ impl Paths {
                 .join("clipbroad")
         };
 
-        let (config_dir, key_dir) = if cfg!(windows) {
+        let (config_dir, key_dir, cache_dir) = if cfg!(windows) {
             let dir = dir_var("LOCALAPPDATA", &["AppData", "Local"]);
-            (dir.clone(), dir)
+            (dir.clone(), dir.clone(), dir)
         } else if cfg!(target_os = "macos") {
             let dir = home.join("Library/Application Support/clipbroad");
-            (dir.clone(), dir)
+            (dir.clone(), dir, home.join("Library/Caches/clipbroad"))
         } else {
             (
                 dir_var("XDG_CONFIG_HOME", &[".config"]),
                 dir_var("XDG_DATA_HOME", &[".local", "share"]),
+                dir_var("XDG_CACHE_HOME", &[".cache"]),
             )
         };
 
         Self {
             config_file: config_dir.join("config.toml"),
             secret_key_file: key_dir.join("secret.key"),
+            file_cache_dir: cache_dir.join("files"),
         }
     }
 }
@@ -103,30 +116,35 @@ mod tests {
         let paths = Paths::discover().expect("home directory is known");
         assert!(paths.config_file.ends_with("clipbroad/config.toml"));
         assert!(paths.secret_key_file.ends_with("clipbroad/secret.key"));
+        assert!(paths.file_cache_dir.ends_with("clipbroad/files"));
         assert!(paths.config_file.is_absolute());
     }
 
     #[test]
     fn defaults_without_environment() {
         let paths = Paths::resolve(&home(), |_| None);
-        let (config, key) = if cfg!(windows) {
+        let (config, key, cache) = if cfg!(windows) {
             (
                 r"C:\Users\me\AppData\Local\clipbroad\config.toml",
                 r"C:\Users\me\AppData\Local\clipbroad\secret.key",
+                r"C:\Users\me\AppData\Local\clipbroad\files",
             )
         } else if cfg!(target_os = "macos") {
             (
                 "/home/me/Library/Application Support/clipbroad/config.toml",
                 "/home/me/Library/Application Support/clipbroad/secret.key",
+                "/home/me/Library/Caches/clipbroad/files",
             )
         } else {
             (
                 "/home/me/.config/clipbroad/config.toml",
                 "/home/me/.local/share/clipbroad/secret.key",
+                "/home/me/.cache/clipbroad/files",
             )
         };
         assert_eq!(paths.config_file, PathBuf::from(config));
         assert_eq!(paths.secret_key_file, PathBuf::from(key));
+        assert_eq!(paths.file_cache_dir, PathBuf::from(cache));
     }
 
     #[test]
@@ -134,7 +152,10 @@ mod tests {
         let (vars, root): (&[&str], &str) = if cfg!(windows) {
             (&["LOCALAPPDATA"], r"D:\local")
         } else {
-            (&["XDG_CONFIG_HOME", "XDG_DATA_HOME"], "/custom")
+            (
+                &["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"],
+                "/custom",
+            )
         };
         let paths = Paths::resolve(&home(), |var| {
             vars.contains(&var).then(|| OsString::from(root))
@@ -145,7 +166,17 @@ mod tests {
         } else {
             assert!(paths.config_file.starts_with(root));
             assert!(paths.secret_key_file.starts_with(root));
+            assert!(paths.file_cache_dir.starts_with(root));
         }
+    }
+
+    #[test]
+    fn file_cache_follows_the_config_file() {
+        let paths = Paths::beside_config(PathBuf::from("instance").join("config.toml"));
+        assert_eq!(
+            paths.file_cache_dir,
+            PathBuf::from("instance").join("files")
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::{
     fs,
     io::{self, Write as _},
     net::SocketAddr,
-    num::{NonZeroU16, NonZeroU64},
+    num::{NonZeroU16, NonZeroU32, NonZeroU64},
     path::Path,
 };
 
@@ -29,6 +29,14 @@ pub struct Config {
     /// Find paired machines on the local network with mDNS. When off, this node sends no multicast
     /// traffic and only dials peers at their static `addrs`.
     pub mdns: bool,
+    /// Largest file, in bytes, that is sent or received. A copied file above it is not synced.
+    /// At most `file_cache_max_bytes`.
+    pub file_max_bytes: NonZeroU64,
+    /// Most bytes the cache of received files keeps; the oldest files go first. Also the limit
+    /// of all the files of one copy together.
+    pub file_cache_max_bytes: NonZeroU64,
+    /// Received files older than this many days are deleted from the cache.
+    pub file_cache_max_days: NonZeroU32,
     /// Paired machines.
     pub peers: Vec<Peer>,
 }
@@ -55,7 +63,7 @@ pub enum ParseError {
     #[error(transparent)]
     Toml(#[from] toml::de::Error),
 
-    /// Valid TOML, but a value is not acceptable (repeated peer id, `inline_max_bytes` too large).
+    /// Valid TOML, but a value is not acceptable (repeated peer id, a size limit out of range).
     #[error("{0}")]
     Invalid(String),
 }
@@ -66,6 +74,9 @@ impl Default for Config {
             listen_port: Self::DEFAULT_LISTEN_PORT,
             inline_max_bytes: Self::DEFAULT_INLINE_MAX_BYTES,
             mdns: true,
+            file_max_bytes: Self::DEFAULT_FILE_MAX_BYTES,
+            file_cache_max_bytes: Self::DEFAULT_FILE_CACHE_MAX_BYTES,
+            file_cache_max_days: Self::DEFAULT_FILE_CACHE_MAX_DAYS,
             peers: Vec::new(),
         }
     }
@@ -79,6 +90,13 @@ impl Config {
     /// Largest accepted `inline_max_bytes`: a clip must fit in one protocol frame, so this is the
     /// frame limit minus 64 KiB for the clip's metadata (which takes a few hundred bytes).
     pub const MAX_INLINE_MAX_BYTES: u64 = (MAX_FRAME_LEN - 64 * 1024) as u64;
+    /// 512 MiB.
+    pub const DEFAULT_FILE_MAX_BYTES: NonZeroU64 =
+        NonZeroU64::new(512 * 1024 * 1024).expect("non-zero");
+    /// 2 GiB.
+    pub const DEFAULT_FILE_CACHE_MAX_BYTES: NonZeroU64 =
+        NonZeroU64::new(2 * 1024 * 1024 * 1024).expect("non-zero");
+    pub const DEFAULT_FILE_CACHE_MAX_DAYS: NonZeroU32 = NonZeroU32::new(7).expect("non-zero");
 
     /// Parses and validates a config from TOML text.
     ///
@@ -86,8 +104,8 @@ impl Config {
     ///
     /// [`ParseError::Toml`] for syntax errors, unknown fields, wrong types or out-of-range values
     /// (including zero where a non-zero number is required) and malformed peer ids, and
-    /// [`ParseError::Invalid`] for a repeated peer id or an `inline_max_bytes` above
-    /// [`Config::MAX_INLINE_MAX_BYTES`].
+    /// [`ParseError::Invalid`] for a repeated peer id, an `inline_max_bytes` above
+    /// [`Config::MAX_INLINE_MAX_BYTES`] or a `file_max_bytes` above `file_cache_max_bytes`.
     pub fn from_toml_str(text: &str) -> Result<Self, ParseError> {
         let config: Self = toml::from_str(text)?;
         config.validate()?;
@@ -170,6 +188,13 @@ impl Config {
                 Self::MAX_INLINE_MAX_BYTES
             )));
         }
+        if self.file_max_bytes > self.file_cache_max_bytes {
+            return Err(ParseError::Invalid(format!(
+                "file_max_bytes ({}) is larger than file_cache_max_bytes ({}): such a file could \
+                 never be kept in the cache",
+                self.file_max_bytes, self.file_cache_max_bytes
+            )));
+        }
         let mut seen = HashSet::new();
         for peer in &self.peers {
             if !seen.insert(peer.id) {
@@ -211,6 +236,9 @@ mod tests {
         assert_eq!(config.listen_port.get(), 42_420);
         assert_eq!(config.inline_max_bytes.get(), 8 * 1024 * 1024);
         assert!(config.mdns);
+        assert_eq!(config.file_max_bytes.get(), 512 * 1024 * 1024);
+        assert_eq!(config.file_cache_max_bytes.get(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(config.file_cache_max_days.get(), 7);
         assert_eq!(config.peers, []);
     }
 
@@ -220,6 +248,15 @@ mod tests {
         assert_eq!(config.listen_port.get(), 42_420);
         assert_eq!(config.inline_max_bytes.get(), 8_388_608);
         assert!(config.mdns);
+        assert_eq!(config.file_max_bytes, Config::DEFAULT_FILE_MAX_BYTES);
+        assert_eq!(
+            config.file_cache_max_bytes,
+            Config::DEFAULT_FILE_CACHE_MAX_BYTES
+        );
+        assert_eq!(
+            config.file_cache_max_days,
+            Config::DEFAULT_FILE_CACHE_MAX_DAYS
+        );
         assert_eq!(config.peers.len(), 2);
 
         let laptop = &config.peers[0];
@@ -303,7 +340,13 @@ mod tests {
 
     #[test]
     fn zero_values_are_rejected() {
-        for text in ["inline_max_bytes = 0", "listen_port = 0"] {
+        for text in [
+            "inline_max_bytes = 0",
+            "listen_port = 0",
+            "file_max_bytes = 0",
+            "file_cache_max_bytes = 0",
+            "file_cache_max_days = 0",
+        ] {
             let err = Config::from_toml_str(text).expect_err("zero");
             assert!(err.to_string().contains("nonzero"), "{err}");
         }
@@ -319,6 +362,18 @@ mod tests {
             .expect_err("too large");
         assert!(matches!(err, ParseError::Invalid(_)), "{err}");
         assert!(err.to_string().contains("inline_max_bytes"), "{err}");
+    }
+
+    #[test]
+    fn file_limit_must_fit_in_the_cache() {
+        let config = Config::from_toml_str("file_max_bytes = 100\nfile_cache_max_bytes = 100")
+            .expect("equal is fine");
+        assert_eq!(config.file_max_bytes.get(), 100);
+
+        let err = Config::from_toml_str("file_max_bytes = 101\nfile_cache_max_bytes = 100")
+            .expect_err("larger than the cache");
+        assert!(matches!(err, ParseError::Invalid(_)), "{err}");
+        assert!(err.to_string().contains("file_max_bytes"), "{err}");
     }
 
     #[test]
