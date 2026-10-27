@@ -11,6 +11,10 @@
 //!   the connection should then be closed.
 //! - A received [`Clip`] comes from another machine and is not trusted. Get its content with
 //!   [`Clip::into_content`], which checks the payload against the declared size and hash.
+//! - `Hello` and `Clip` travel on one unidirectional stream per side. Each bidirectional stream
+//!   is one file transfer: the receiver of a files clip sends a [`FileRequest`], and the sender
+//!   answers with a [`FileResponse`] followed, if it is [`FileResponse::Ok`], by exactly `size`
+//!   raw file bytes and the end of the stream.
 //!
 //! # Compatibility
 //!
@@ -24,14 +28,16 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ClipContent, ContentHash, Png};
+use crate::{ClipContent, ContentHash, FileEntry, FileList, FileListError, Png};
 
 /// Wire protocol version. Bump on any incompatible message change.
 ///
 /// History:
 /// - 1: text clips.
 /// - 2: image clips ([`ContentKind::Image`]). A version 1 peer cannot decode them.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// - 3: files clips ([`ContentKind::Files`], [`Payload::Files`]) and file transfers
+///   ([`FileRequest`], [`FileResponse`]).
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Largest frame body accepted or sent, in bytes.
 ///
@@ -45,6 +51,7 @@ const HEADER_LEN: usize = 4;
 
 const TEXT_MIME: &str = "text/plain;charset=utf-8";
 const PNG_MIME: &str = "image/png";
+const FILES_MIME: &str = "text/uri-list";
 
 /// Everything that travels between peers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +60,25 @@ pub enum Message {
     Hello(Hello),
     /// New clipboard content.
     Clip(Clip),
+    /// Asks for the bytes of an announced file. First frame of a bidirectional stream.
+    FileRequest(FileRequest),
+    /// Answer to a [`FileRequest`], on the same stream.
+    FileResponse(FileResponse),
+}
+
+/// Asks the peer for the file with this hash from its latest files clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRequest {
+    pub hash: ContentHash,
+}
+
+/// Answer to a [`FileRequest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileResponse {
+    /// `size` raw bytes of the file follow this frame, then the stream ends.
+    Ok { size: u64 },
+    /// The hash is not a file of the peer's latest files clip (or the file cannot be read).
+    NotOffered,
 }
 
 /// Opening message of a connection.
@@ -110,13 +136,15 @@ impl fmt::Debug for NodeId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClipId(pub u64);
 
-/// What kind of content a clip carries. Files will be added as a new variant.
+/// What kind of content a clip carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ContentKind {
     /// UTF-8 text.
     Text,
     /// A PNG image.
     Image,
+    /// A list of files ([`Payload::Files`]).
+    Files,
 }
 
 /// Clipboard content copied on one machine, sent to the others.
@@ -130,10 +158,10 @@ pub struct Clip {
     /// (see [`crate::sync`]).
     pub timestamp_ms: u64,
     pub kind: ContentKind,
-    /// MIME type of the content: `text/plain;charset=utf-8` for text, `image/png` for images.
-    /// Informative only: the receiver decodes the payload by `kind`.
+    /// MIME type of the content: `text/plain;charset=utf-8` for text, `image/png` for images,
+    /// `text/uri-list` for files. Informative only: the receiver decodes the payload by `kind`.
     pub mime: String,
-    /// Content size in bytes.
+    /// Content size in bytes. For files, the sum of their sizes.
     pub size: u64,
     /// Hash of the content bytes, the same as [`ClipContent::hash`].
     pub hash: ContentHash,
@@ -141,13 +169,29 @@ pub struct Clip {
 }
 
 impl Clip {
-    /// Builds a clip that carries `content` inline.
+    /// Builds a clip that carries `content`: text and images inline, files as an announcement.
     #[must_use]
     pub fn new(id: ClipId, origin: NodeId, timestamp_ms: u64, content: ClipContent) -> Self {
         let hash = content.hash();
-        let (kind, mime, bytes) = match content {
-            ClipContent::Text(text) => (ContentKind::Text, TEXT_MIME, text.into_bytes()),
-            ClipContent::Image(png) => (ContentKind::Image, PNG_MIME, png.into_bytes()),
+        let (kind, mime, size, payload) = match content {
+            ClipContent::Text(text) => (
+                ContentKind::Text,
+                TEXT_MIME,
+                text.len() as u64,
+                Payload::Inline(text.into_bytes()),
+            ),
+            ClipContent::Image(png) => (
+                ContentKind::Image,
+                PNG_MIME,
+                png.as_bytes().len() as u64,
+                Payload::Inline(png.into_bytes()),
+            ),
+            ClipContent::Files(files) => (
+                ContentKind::Files,
+                FILES_MIME,
+                files.total_size(),
+                Payload::Files(files.into_entries()),
+            ),
         };
         Self {
             id,
@@ -155,23 +199,41 @@ impl Clip {
             timestamp_ms,
             kind,
             mime: mime.to_owned(),
-            size: bytes.len() as u64,
+            size,
             hash,
-            payload: Payload::Inline(bytes),
+            payload,
         }
     }
 
     /// The content, once the payload is checked against the declared size and hash.
     ///
     /// This check is the receiver's duty and this is the place it happens: the fields come from
-    /// another machine and are not trusted until it passes.
+    /// another machine and are not trusted until it passes. For files it checks the list, not the
+    /// file bytes, which arrive later; size limits are up to whoever fetches them.
     ///
     /// # Errors
     ///
     /// [`ClipError`] if the size or hash does not match the payload, if a text payload is not
-    /// valid UTF-8, or if an image payload does not start like a PNG.
+    /// valid UTF-8, if an image payload does not start like a PNG, if a file list is not valid
+    /// (see [`FileList::new`]), or if the payload does not fit the kind.
     pub fn into_content(self) -> Result<ClipContent, ClipError> {
-        let Payload::Inline(bytes) = self.payload;
+        let bytes = match (self.kind, self.payload) {
+            (ContentKind::Text | ContentKind::Image, Payload::Inline(bytes)) => bytes,
+            (ContentKind::Files, Payload::Files(entries)) => {
+                let files = FileList::new(entries).map_err(ClipError::Files)?;
+                if files.total_size() != self.size {
+                    return Err(ClipError::SizeMismatch {
+                        declared: self.size,
+                        actual: files.total_size(),
+                    });
+                }
+                if files.hash() != self.hash {
+                    return Err(ClipError::HashMismatch);
+                }
+                return Ok(ClipContent::Files(files));
+            }
+            _ => return Err(ClipError::WrongPayload),
+        };
         let actual = bytes.len() as u64;
         if actual != self.size {
             return Err(ClipError::SizeMismatch {
@@ -189,26 +251,32 @@ impl Clip {
             ContentKind::Image => Png::try_from(bytes)
                 .map(ClipContent::Image)
                 .map_err(|_| ClipError::NotPng),
+            ContentKind::Files => Err(ClipError::WrongPayload),
         }
     }
 }
 
 /// Where a clip's content bytes are.
 ///
-/// Only inline exists today. Large files will add a variant that announces the content and sends
-/// the bytes separately (phase 4).
-///
-/// `Debug` prints the length, never the bytes, so logging a clip cannot leak what was copied.
+/// `Debug` prints lengths, never the bytes or file names, so logging a clip cannot leak what was
+/// copied.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Payload {
-    /// The content bytes travel inside the message.
+    /// The content bytes travel inside the message (text and images).
     Inline(Vec<u8>),
+    /// Files announced by name, size and hash. Their bytes are fetched on bidirectional streams
+    /// (see the module docs).
+    Files(Vec<FileEntry>),
 }
 
 impl fmt::Debug for Payload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Inline(bytes) => f.debug_struct("Inline").field("len", &bytes.len()).finish(),
+            Self::Files(entries) => f
+                .debug_struct("Files")
+                .field("count", &entries.len())
+                .finish(),
         }
     }
 }
@@ -246,6 +314,12 @@ pub enum ClipError {
 
     #[error("image clip is not a PNG")]
     NotPng,
+
+    #[error("invalid files clip: {0}")]
+    Files(FileListError),
+
+    #[error("clip payload does not match its kind")]
+    WrongPayload,
 }
 
 /// Encodes `message` as a frame, ready to write to a stream.
@@ -361,9 +435,9 @@ mod tests {
 
     #[test]
     fn hello_wire_format_never_changes() {
-        // Length 2, variant 0 (Hello), version 2. Older and newer peers depend on these bytes.
+        // Length 2, variant 0 (Hello), version 3. Older and newer peers depend on these bytes.
         let frame = encode(&Message::Hello(Hello::CURRENT)).expect("encode");
-        assert_eq!(frame, [0, 0, 0, 2, 0, 2]);
+        assert_eq!(frame, [0, 0, 0, 2, 0, 3]);
     }
 
     #[test]
@@ -528,6 +602,116 @@ mod tests {
         clip.hash = ContentHash::of(&bytes);
         clip.payload = Payload::Inline(bytes);
         assert_eq!(clip.into_content(), Err(ClipError::NotPng));
+    }
+
+    fn files_clip() -> Clip {
+        let entries = ["b.txt", "a.txt"].map(|name| FileEntry {
+            name: name.to_owned(),
+            size: 10,
+            hash: ContentHash::of(name.as_bytes()),
+        });
+        let files = FileList::new(entries.to_vec()).expect("valid list");
+        Clip::new(
+            ClipId(9),
+            NodeId::from_bytes([3; 32]),
+            1_700_000_000_000,
+            ClipContent::Files(files),
+        )
+    }
+
+    #[test]
+    fn files_clip_round_trips_and_gives_back_the_list() {
+        let clip = files_clip();
+        assert_eq!(clip.kind, ContentKind::Files);
+        assert_eq!(clip.mime, "text/uri-list");
+        assert_eq!(clip.size, 20);
+        let Payload::Files(entries) = &clip.payload else {
+            panic!("files travel as a list");
+        };
+        assert_eq!(entries[0].name, "a.txt", "sorted by name");
+
+        let Message::Clip(received) = round_trip(&Message::Clip(clip.clone())) else {
+            panic!("a clip decodes as a clip");
+        };
+        let Ok(ClipContent::Files(files)) = received.into_content() else {
+            panic!("intact files clip");
+        };
+        assert_eq!(files.hash(), clip.hash);
+    }
+
+    #[test]
+    fn file_transfer_messages_round_trip() {
+        let request = Message::FileRequest(FileRequest {
+            hash: ContentHash::of(b"x"),
+        });
+        assert_eq!(round_trip(&request), request);
+        for response in [FileResponse::Ok { size: 1 << 40 }, FileResponse::NotOffered] {
+            let message = Message::FileResponse(response);
+            assert_eq!(round_trip(&message), message);
+        }
+    }
+
+    #[test]
+    fn hostile_file_name_is_rejected() {
+        for name in ["../../.bashrc", "/etc/passwd", "C:\\x", "CON", ".."] {
+            let mut clip = files_clip();
+            let Payload::Files(entries) = &mut clip.payload else {
+                panic!("files clip");
+            };
+            entries[0].name = name.to_owned();
+            assert!(
+                matches!(
+                    clip.into_content(),
+                    Err(ClipError::Files(FileListError::InvalidName(_)))
+                ),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tampered_file_list_is_rejected() {
+        let mut clip = files_clip();
+        let Payload::Files(entries) = &mut clip.payload else {
+            panic!("files clip");
+        };
+        entries[0].hash = ContentHash::of(b"other bytes");
+        assert_eq!(clip.into_content(), Err(ClipError::HashMismatch));
+
+        let mut clip = files_clip();
+        clip.size = 19;
+        assert_eq!(
+            clip.into_content(),
+            Err(ClipError::SizeMismatch {
+                declared: 19,
+                actual: 20
+            })
+        );
+
+        let mut clip = files_clip();
+        clip.payload = Payload::Files(Vec::new());
+        assert_eq!(
+            clip.into_content(),
+            Err(ClipError::Files(FileListError::Empty))
+        );
+    }
+
+    #[test]
+    fn payload_that_does_not_fit_the_kind_is_rejected() {
+        let mut clip = files_clip();
+        clip.payload = Payload::Inline(b"hello".to_vec());
+        assert_eq!(clip.into_content(), Err(ClipError::WrongPayload));
+
+        let mut clip = text_clip("hello");
+        clip.payload = files_clip().payload;
+        assert_eq!(clip.into_content(), Err(ClipError::WrongPayload));
+    }
+
+    #[test]
+    fn debug_does_not_show_file_names() {
+        let text = format!("{:?}", files_clip());
+        assert!(!text.contains("a.txt"), "{text}");
+        assert!(text.contains("payload: Files { count: 2 }"), "{text}");
     }
 
     #[test]

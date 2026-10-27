@@ -1,10 +1,10 @@
 use std::fmt;
 
-use crate::ContentHash;
+use crate::{ContentHash, FileList};
 
 /// Something that can be on the clipboard and travel between machines.
 ///
-/// Text and images exist today; files will be added as a new variant. Match on it exhaustively
+/// Match on it exhaustively
 /// (no `_` arm), so adding a variant fails the build at every place that must handle it.
 ///
 /// `Debug` prints the size and hash, never the content, so logging a clip cannot leak what was copied.
@@ -15,6 +15,9 @@ pub enum ClipContent {
     /// An image, always as PNG. Backends convert the OS's native format (TIFF on macOS, DIB on
     /// Windows) to and from PNG.
     Image(Png),
+    /// Files, announced by name, size and hash. The bytes travel separately: the receiver fetches
+    /// them into its file cache.
+    Files(FileList),
 }
 
 impl ClipContent {
@@ -23,7 +26,7 @@ impl ClipContent {
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text(text) => Some(text),
-            Self::Image(_) => None,
+            Self::Image(_) | Self::Files(_) => None,
         }
     }
 
@@ -32,9 +35,11 @@ impl ClipContent {
     /// What gets hashed, per kind (this is part of the protocol; do not change it):
     /// - `Text`: the UTF-8 bytes of the string, with no prefix or normalisation.
     /// - `Image`: the PNG bytes, as they travel on the wire.
+    /// - `Files`: [`FileList::hash`], which covers each file's name, size and hash.
     ///
     /// Text and an image never hash the same bytes: a PNG starts with `0x89`, which no UTF-8 string
-    /// can start with.
+    /// can start with. A file list uses BLAKE3's key-derivation mode, so it never collides with
+    /// either.
     ///
     /// ```
     /// use clipbroad_core::{ClipContent, ContentHash};
@@ -47,6 +52,7 @@ impl ClipContent {
         match self {
             Self::Text(text) => ContentHash::of(text.as_bytes()),
             Self::Image(png) => ContentHash::of(png.as_bytes()),
+            Self::Files(files) => files.hash(),
         }
     }
 }
@@ -64,6 +70,7 @@ impl fmt::Debug for ClipContent {
                 .field("len", &png.as_bytes().len())
                 .field("hash", &self.hash())
                 .finish(),
+            Self::Files(files) => f.debug_tuple("Files").field(files).finish(),
         }
     }
 }
