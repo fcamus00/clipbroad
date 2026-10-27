@@ -94,7 +94,8 @@ Las direcciones estáticas siguen sirviendo para lo que mDNS no alcanza, como Ta
   `Clip.origin` no es el peer que lo manda, se descarta.
 - **API:** `Node::spawn(identidad, config)` devuelve el nodo y un canal de clips recibidos (con el id
   del peer). `Node::broadcast(clip)` lo manda a los peers conectados; los que no lo están se lo
-  pierden.
+  pierden. `Node::links()` es un canal `watch` con el estado de cada peer (conectado o no, y la
+  dirección del camino que usa la conexión más nueva al conectarse), para `clipbroad status`.
 
 ### Emparejamiento
 
@@ -214,6 +215,30 @@ portapapeles lo detiene. Se apaga con Ctrl+C o SIGTERM.
 - El contenido marcado como sensible no se envía: el daemon lo salta con un log en nivel debug que
   muestra el marcador, nunca el contenido.
 
+### Estado del daemon (`clipbroad status`)
+
+El daemon escribe su estado en un archivo TOML, `status.toml`, en la misma carpeta que `secret.key`
+(código en `crates/daemon/src/status.rs`). `clipbroad status` lo lee y lo muestra.
+
+- **Archivo y no socket o named pipe:** el mismo código sirve en los tres SO, el daemon no tiene que
+  atender a nadie y un daemon caído se nota porque el archivo deja de actualizarse. Un socket daría
+  el estado al instante, pero pide un servidor dentro del daemon y código distinto en Windows.
+- **Cuándo se escribe:** después de cada evento (un peer conecta o se va, un clip enviado o
+  recibido) y cada 5 s. Se escribe a un archivo temporal y se renombra, así quien lee nunca ve un
+  archivo a medias. Al detenerse, el daemon lo borra. Recién se escribe con el nodo ya levantado:
+  un segundo daemon con la misma config falla antes (el puerto está ocupado) y no pisa el archivo.
+- **Vivo o no:** sin archivo, el daemon no corre. Si el archivo tiene más de 15 s, el daemon se
+  cortó sin borrarlo (`kill -9`, un crash, un corte de luz) y `status` lo muestra como detenido. No
+  se revisa el PID: haría falta código por SO y la antigüedad ya alcanza.
+- **Ubicación:** junto a la identidad, así dos instancias con su propio `--config` (y por lo tanto
+  su propia `secret.key`) nunca comparten el archivo. `status --config <archivo>` lee el de esa
+  instancia.
+- **Qué muestra:** si el daemon corre (y su PID), su `EndpointId`, el puerto, si mDNS está activo,
+  cada peer con su nombre, id corto y si está conectado (y por qué dirección), y el último clip
+  enviado y recibido con hora, tamaño y hash corto. Nunca el contenido. En macOS 15.4 o más nuevo,
+  también el `accessBehavior` del pasteboard tal como lo ve el daemon, con instrucciones si no está
+  en "Allow".
+
 ## Portapapeles por plataforma
 
 | Plataforma | Detectar cambios | Leer/escribir |
@@ -300,7 +325,8 @@ Riesgos que quedan:
 Desde macOS 15.4, Apple tiene preparado un aviso cuando una app **lee** el pasteboard de forma
 programática. A la fecha no está activo por defecto, pero un daemon que lee en cada cambio es justo el caso
 que dispara el aviso cuando se active. Mitigaciones previstas:
-- Consultar `NSPasteboard.accessBehavior` al arrancar y reportar el estado en `clipbroad status`.
+- Consultar `NSPasteboard.accessBehavior` y reportar el estado en `clipbroad status`. Lo consulta el
+  daemon cada vez que actualiza su estado, porque el permiso es del proceso que lee.
 - Usar los métodos `detect` para saber qué tipos hay **sin leer** antes de decidir leer.
 - Documentar el permiso en Ajustes del Sistema → Privacidad y seguridad → "Pegar desde otras apps"
   (Allow). No existe un entitlement que lo evite.

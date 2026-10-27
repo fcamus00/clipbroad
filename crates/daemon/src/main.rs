@@ -2,6 +2,7 @@ mod backend;
 mod pair;
 mod run;
 mod service;
+mod status;
 mod watch;
 
 use std::io::IsTerminal;
@@ -24,7 +25,6 @@ struct Cli {
     command: Command,
 }
 
-// Next subcommand: `status` in phase 3.
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Pair with another machine, so that `clipbroad run` syncs with it.
@@ -54,6 +54,12 @@ enum Command {
     /// a `Run` registry value on Windows. The service runs this executable from its current path,
     /// so after moving the binary, run `service install` again.
     Service(service::Args),
+    /// Show what the running daemon is doing: its peers and the last clips sent and received.
+    ///
+    /// It reads the status file that `clipbroad run` keeps up to date (`status.toml` beside the
+    /// identity file), so it shows the daemon started with the same `--config`. Clips appear as
+    /// time, size and short hash, never their content.
+    Status(status::Args),
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -61,7 +67,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let default_level = match cli.command {
         Command::Run(_) => LevelFilter::INFO,
-        Command::Pair(_) | Command::Watch(_) | Command::Service(_) => LevelFilter::WARN,
+        Command::Pair(_) | Command::Watch(_) | Command::Service(_) | Command::Status(_) => {
+            LevelFilter::WARN
+        }
     };
     init_logging(default_level, cli.verbose);
     match cli.command {
@@ -69,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Run(args) => run::run(args).await,
         Command::Watch(args) => watch::run(args).await,
         Command::Service(args) => service::run(args),
+        Command::Status(args) => status::run(args),
     }
 }
 

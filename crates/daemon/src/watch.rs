@@ -127,7 +127,7 @@ fn preview(text: &str) -> String {
 }
 
 /// `HH:MM:SS UTC`. Local time would need a time zone database, a new dependency just for this.
-fn utc_time(now: SystemTime) -> String {
+pub fn utc_time(now: SystemTime) -> String {
     let secs = now
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());

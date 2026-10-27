@@ -16,6 +16,9 @@
 # En Unix, si alguien cambia los permisos de `secret.key` para que otros usuarios puedan leerlo,
 # clipbroad se niega a arrancar hasta que se corrija con `chmod 600`.
 #
+# Mientras corre, `clipbroad run` escribe su estado en `status.toml`, en la misma carpeta que
+# `secret.key`, y lo borra al detenerse. Lo lee `clipbroad status`.
+#
 # Un nombre de campo mal escrito es un error (no se ignora en silencio).
 
 # Puerto UDP en el que escucha este nodo. Es fijo para que otros peers puedan llegar a él por una

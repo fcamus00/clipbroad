@@ -16,6 +16,9 @@ use crate::Error;
 ///
 /// On Windows the *local* (non-roaming) directory is used on purpose: the peer list and, above all,
 /// the identity belong to one machine and must not follow a roaming profile to another one.
+///
+/// The running daemon's status file is `status.toml` beside the secret key file (see
+/// [`Paths::status_file`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
     pub config_file: PathBuf,
@@ -41,6 +44,14 @@ impl Paths {
             secret_key_file: config_file.with_file_name("secret.key"),
             config_file,
         }
+    }
+
+    /// Where `clipbroad run` writes its status for `clipbroad status`: `status.toml` beside the
+    /// secret key file. It follows the identity, so two instances with their own `--config`
+    /// directories never share it.
+    #[must_use]
+    pub fn status_file(&self) -> PathBuf {
+        self.secret_key_file.with_file_name("status.toml")
     }
 
     /// Builds the paths from a home directory and an environment lookup, so tests can fake both.
@@ -135,6 +146,15 @@ mod tests {
             assert!(paths.config_file.starts_with(root));
             assert!(paths.secret_key_file.starts_with(root));
         }
+    }
+
+    #[test]
+    fn status_file_follows_the_identity() {
+        let paths = Paths::beside_config(PathBuf::from("instance").join("config.toml"));
+        assert_eq!(
+            paths.status_file(),
+            PathBuf::from("instance").join("status.toml")
+        );
     }
 
     #[test]
