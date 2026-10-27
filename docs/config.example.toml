@@ -24,7 +24,9 @@
 listen_port = 42420
 
 # Tamaño máximo (en bytes) de un clip que viaja dentro del propio mensaje. Por defecto 8 MiB, que
-# alcanza para texto y capturas de pantalla típicas. Debe ser mayor que 0.
+# alcanza para texto y capturas de pantalla típicas. Debe ser mayor que 0 y como mucho 16711680
+# (16 MiB menos 64 KiB), porque un clip tiene que caber en un mensaje del protocolo. Un texto copiado
+# más grande que este valor no se sincroniza (queda un warning en el log).
 inline_max_bytes = 8388608
 
 # Máquinas emparejadas. Normalmente las escribe `clipbroad pair`; se pueden editar a mano.
