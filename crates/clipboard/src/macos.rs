@@ -42,6 +42,9 @@ const READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often a watch checks `changeCount` and whether its consumer is gone.
 const POLL_INTERVAL: Duration = Duration::from_millis(300);
 
+/// Wait before listing the types again when a change shows none (see [`poll_changes`]).
+const EMPTY_RETRY_DELAY: Duration = Duration::from_millis(50);
+
 /// The general macOS pasteboard (the one Cmd+C and Cmd+V use).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MacosClipboard;
@@ -174,11 +177,18 @@ fn poll_changes(mut last_count: NSInteger, changes: &ChangeSender) {
         let change = autoreleasepool(|_| {
             let pasteboard = NSPasteboard::generalPasteboard();
             let count = pasteboard.changeCount();
-            (count != last_count).then(|| (count, formats(&pasteboard)))
+            (count != last_count).then(|| (count, formats_of(&pasteboard)))
         });
-        let Some((count, formats)) = change else {
+        let Some((count, mut formats)) = change else {
             continue;
         };
+        // An app copies in two steps: `clearContents` bumps `changeCount`, then it writes the
+        // data, which does not bump it again. A tick between the two sees no types, and reporting
+        // that would lose the copy, so look once more before calling it empty.
+        if formats.is_empty() {
+            thread::sleep(EMPTY_RETRY_DELAY);
+            formats = autoreleasepool(|_| formats_of(&NSPasteboard::generalPasteboard()));
+        }
         last_count = count;
         if changes.send(ClipboardChange::new(formats)).is_err() {
             return;
@@ -188,7 +198,7 @@ fn poll_changes(mut last_count: NSInteger, changes: &ChangeSender) {
 
 /// The types offered by all pasteboard items, without reading any data. If macOS cannot list
 /// them, no formats: the daemon never syncs such a change, so this fails closed.
-fn formats(pasteboard: &NSPasteboard) -> Vec<String> {
+fn formats_of(pasteboard: &NSPasteboard) -> Vec<String> {
     let Some(types) = pasteboard.types() else {
         tracing::warn!("could not list the pasteboard types; reporting the change with no formats");
         return Vec::new();
