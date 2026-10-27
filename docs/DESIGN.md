@@ -157,7 +157,8 @@ Detalles (código en `crates/core/src/protocol.rs`):
 - **`Clip`:** `id` (número que elige el origen), `origin` (los 32 bytes del `EndpointId`, opacos para
   `core`), `timestamp_ms` (milisegundos Unix según el reloj del origen, adelantado si hace falta para quedar
   después de lo último que vio; ver "Semántica de sincronización"), `kind`, `mime`, `size`, `hash` y
-  `payload`. El payload hoy solo puede ser inline; el anuncio de archivos grandes se agrega en la fase 4.
+  `payload`. El payload hoy solo puede ser inline; el anuncio de archivos está bosquejado en
+  "Transporte de archivos" y se agrega en la fase 4.
 - **Verificación al recibir:** el contenido solo se obtiene con `Clip::into_content`, que comprueba que el
   tamaño y el hash BLAKE3 declarados coinciden con el payload, que el texto sea UTF-8 válido y que una
   imagen empiece como PNG.
@@ -375,9 +376,122 @@ contenido. Sincronizar archivos significa transferir el contenido, guardarlo en 
   encima del límite, el archivo no se sincroniza.
 - La transferencia perezosa (traer el archivo solo al pegar) existe en cada SO (Wayland es perezoso por
   diseño; macOS tiene `NSFilePromise`; Windows tiene delayed rendering), pero es compleja. Se pospone.
-- Transporte: `iroh-blobs` (BLAKE3, streaming verificado, reanudable) encaja muy bien, **pero** su línea
-  compatible con iroh 1.x se declara "not yet production quality". Se decide en la fase 4 entre
-  iroh-blobs y un ALPN propio de transferencia simple.
+### Transporte de archivos
+
+**Decisión: transferencia propia, sin `iroh-blobs`.** Cada archivo viaja en un stream bidireccional de
+QUIC dentro de la conexión `clipbroad/1` que ya existe con el peer. El que recibe lo pide por hash y lo
+escribe en un archivo temporal mientras calcula el BLAKE3. Solo lo mueve a la caché si el tamaño y el
+hash coinciden.
+
+**Medición** (spike 4.3, prototipo descartable). Dos procesos en la misma máquina por localhost, build
+release, disco btrfs, 3 corridas. La memoria es el RSS máximo del proceso entero, iroh incluido.
+
+| | 100 MB | 1 GB | RSS emisor | RSS receptor | Disco del receptor |
+|---|---|---|---|---|---|
+| Propio | 140–155 ms (650–715 MB/s) | 1,37 s | 17 MiB | 18 MiB (20 con 1 GB) | el archivo |
+| `iroh-blobs` con `fs-store` | 147–155 ms con la exportación (645–680 MB/s) | 1,33 s | 20 MiB | 21–22 MiB (23 con 1 GB) | el archivo en su store y la copia exportada |
+
+Las dos opciones tienen la misma velocidad y su memoria no crece con el archivo. Los datos no
+favorecen a ninguna, así que deciden la complejidad y el riesgo. Preparar el envío tarda 17 ms por
+100 MB con la propia (solo BLAKE3) y 54 ms con iroh-blobs (importar al store calcula además el árbol
+de verificación). Localhost no mide la red: en una LAN real el límite es el enlace (unos 110 MB/s en
+gigabit, menos en Wi-Fi). No se midió en macOS ni en Windows.
+
+Por qué no `iroh-blobs` (0.103.1, la única línea compatible con iroh 1.x):
+- **No está lista para producción, según su README.** Recomienda la 0.35 para producción, pero esa
+  versión exige iroh 0.35 y no convive con nuestro iroh 1.4.
+- **Bug de seguridad recién corregido.** Hasta la 0.103.0, con la configuración por defecto cualquier
+  peer conectado podía escribir blobs en el store del otro (pedidos *push* sin permiso,
+  n0-computer/iroh-blobs#270). Se corrigió en la 0.103.1 (octubre de 2026) y se retiraron de crates.io
+  las versiones 0.97 a 0.103.0.
+- **Bugs abiertos en el store en disco** que nos afectarían: el GC borra blobs que siguen en uso (#247,
+  #256, #314), una falla del GC lo detiene para siempre (#291), corrupción de la base `redb` con I/O
+  pesado (#261), RSS que crece al reimportar (#266). Un SIGKILL a mitad de descarga pierde el progreso
+  (#254), así que la reanudación no sobrevive a un crash.
+- **API inestable.** Publicó 9 versiones menores entre octubre de 2025 y junio de 2026, y en 0.x cada
+  una puede romper la API. No promete estabilidad del formato del store.
+- **Peso.** Con las features mínimas agrega 29 crates, pero así solo trae el store en memoria, que
+  carga el archivo entero en RAM. Con `fs-store` agrega 31 (suma `redb` y `reflink-copy`). Las licencias
+  pasan, pero `cargo deny` falla por RUSTSEC-2024-0370 (`proc-macro-error` sin mantenimiento, vía
+  `genawaiter`) y habría que ignorar otro aviso. También suma `syn` 1.x y otra versión de `spin`.
+- **Encaje.** El store es una base de datos aparte, con tags y GC que administrar además de la caché
+  `<cache>/clipbroad/files/<hash>/<nombre>`. El receptor guarda en el store y después exporta a la
+  caché: en btrfs o APFS es un clon, pero en ext4 o NTFS escribe el archivo dos veces. El proveedor le
+  entrega cualquier blob del store a cualquier peer conectado, y hay que configurar `EventMask` para
+  rechazar los *push*.
+- **Lo que aporta no hace falta aquí:** verificación por rangos, reanudación, descarga desde varios
+  peers y colecciones. En la LAN un archivo de 100 MB tarda alrededor de un segundo, y reintentar desde
+  cero es aceptable.
+
+Por qué la conexión existente y no un ALPN aparte (`clipbroad-file/1`):
+- La conexión ya está autenticada y pasó la allowlist. Con un ALPN aparte, el receptor tendría que
+  marcar al emisor, y sin mDNS un peer sin direcciones solo se conecta si el otro lo marca (ver
+  "Conexiones"). En ese caso el receptor no podría pedir el archivo.
+- QUIC multiplexa los streams, así que un archivo grande no frena los frames de clips. El stream de
+  clips tiene más prioridad (`SendStream::set_priority`) para que un texto copiado no espere detrás de
+  un archivo.
+- Los streams se distinguen por tipo. Cada lado sigue abriendo un solo stream unidireccional para los
+  clips, y cada stream bidireccional es un pedido de archivo.
+- Costo: si la conexión se cae o se reemplaza (ver "Conexiones duplicadas"), la transferencia en curso
+  se corta y se reintenta en la conexión nueva.
+
+Transferencia (borrador para la tarea de archivos):
+- **Pedido.** El receptor abre un stream bidireccional y manda un frame `FileRequest { hash }`, con el
+  mismo enmarcado que los demás mensajes. El emisor responde con un frame `FileResponse::Ok { size }`
+  seguido de los bytes crudos del archivo hasta cerrar el stream, o con `FileResponse::NotOffered`.
+- **El emisor solo sirve los archivos de su último clip anunciado** (una tabla hash → ruta). Los lee de
+  su ruta original, sin copiarlos. Un hash que no está en la tabla recibe `NotOffered`.
+- **El receptor verifica antes de exponer.** Revisa que `size` sea el anunciado y no pase el límite.
+  Escribe en un temporal dentro de `<cache>/clipbroad/files/<hash>/`, actualiza el BLAKE3 con cada
+  bloque y corta si llegan más bytes que `size`. Al terminar compara tamaño y hash: si coinciden,
+  renombra el temporal al nombre final, y si no, lo borra. El portapapeles solo recibe rutas de
+  archivos verificados.
+- Si el archivo cambió en el emisor después de copiarlo, el hash no coincide y el clip no se aplica.
+- Un archivo que ya está en la caché con ese hash no se pide.
+- Un clip más nuevo cancela las transferencias del anterior (cierra sus streams).
+- Sin reanudación: si algo falla, se borra el temporal y se pide de nuevo desde cero.
+
+Anuncio en `Clip` (borrador, sin implementar):
+
+```rust
+pub enum ContentKind { Text, Image, Files }
+
+pub enum Payload {
+    Inline(Vec<u8>),
+    Files(Vec<FileEntry>),
+}
+
+pub struct FileEntry {
+    pub name: String,       // solo el nombre del archivo, nunca una ruta
+    pub size: u64,
+    pub hash: ContentHash,  // BLAKE3 del contenido
+}
+```
+
+- `kind` es `Files`, `mime` es `text/uri-list`, `size` es la suma de los tamaños y `hash` es el BLAKE3
+  de la lista codificada (nombre, tamaño y hash de cada archivo, en orden). Ese hash no depende de la
+  ruta del archivo en cada máquina, así que el anti-eco funciona como con el texto. Al escribir las
+  rutas de la caché en el portapapeles, el evento local calcula el mismo hash desde los archivos, lo
+  que cuesta unos 17 ms por cada 100 MB.
+- `Clip::into_content` revisa que la lista no esté vacía, que cada nombre sea un solo componente
+  válido (sin `/`, `\`, `..`, NUL ni nombres reservados de Windows), que no se repitan nombres, que la
+  suma de tamaños sea `size`, que el hash de la lista sea `hash` y que el total no pase el límite.
+- Varios archivos por copia entran en la misma lista. Cada backend la traduce a su formato:
+  `text/uri-list` en Wayland, `CF_HDROP` en Windows, URLs de archivo en macOS.
+- Las carpetas quedan fuera de la primera versión: se saltan con un warning.
+- El límite es un total por clip en la config. El emisor no anuncia un clip que lo pasa, y el receptor
+  aplica su propio límite antes de pedir y mientras recibe.
+- `PROTOCOL_VERSION` pasa a 3.
+
+Riesgos:
+- **Código propio que mantener.** El prototipo tiene unas 70 líneas entre los dos lados. Con tests y el
+  manejo de errores, se estiman unas 300 en `net`.
+- **Sin reanudación.** En una red lenta, un archivo grande que se corta empieza de cero. Si pasa en el
+  uso real, se puede pedir desde un offset (el temporal ya tiene el comienzo) sin cambiar el anuncio.
+- **La verificación es al final.** Un peer emparejado que manda basura nos hace escribir hasta `size`
+  bytes antes de detectarla. Es un peer de confianza y el límite acota el daño.
+- Se puede volver a evaluar `iroh-blobs` cuando su línea compatible con iroh 1.x se declare lista para
+  producción.
 
 ## Ciclo de vida del daemon
 
