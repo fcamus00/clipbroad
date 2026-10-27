@@ -9,15 +9,15 @@ use std::{
     time::Duration,
 };
 
-use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::Connection};
+use iroh::{Endpoint, EndpointAddr, EndpointId, TransportAddr, endpoint::Connection};
 use tokio::{
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, watch},
     task::JoinSet,
     time::{self, Instant},
 };
 use tracing::{debug, info};
 
-use crate::{ALPN, Frame, Received, close, session};
+use crate::{ALPN, Frame, Link, Links, Received, close, session};
 
 /// Delay before the first redial, and after a session that was up ends.
 const MIN_BACKOFF: Duration = Duration::from_millis(500);
@@ -46,6 +46,7 @@ impl PeerTask {
         discovery: bool,
         outbox: broadcast::Sender<Frame>,
         inbox: mpsc::Sender<Received>,
+        links: watch::Sender<Links>,
     ) -> Self {
         let addr = (discovery || !addrs.is_empty()).then(|| {
             addrs
@@ -53,6 +54,8 @@ impl PeerTask {
                 .fold(EndpointAddr::new(id), |addr, ip| addr.with_ip_addr(*ip))
         });
         let state = PeerState {
+            id,
+            links,
             // Only the node with the smaller id closes duplicate connections (see the crate docs).
             closes_duplicates: endpoint.id() < id,
             live_sessions: AtomicUsize::new(0),
@@ -137,8 +140,12 @@ impl PeerTask {
 /// What the sessions with one peer share.
 #[derive(Debug)]
 pub(crate) struct PeerState {
+    id: EndpointId,
+    /// Where this peer's [`Link`] is published (see [`Node::links`](crate::Node::links)).
+    links: watch::Sender<Links>,
     closes_duplicates: bool,
-    /// Sessions that finished the `Hello` exchange and are still up.
+    /// Sessions that finished the `Hello` exchange and are still up. Only changed while holding
+    /// the `links` lock, so the published link always matches it.
     live_sessions: AtomicUsize,
     /// The connection that most recently finished the `Hello` exchange, kept only when this node
     /// closes duplicates.
@@ -162,8 +169,12 @@ impl PeerState {
                 old.close(close::REPLACED, b"replaced by a newer connection");
             }
         }
-        self.live_sessions.fetch_add(1, Ordering::Relaxed);
-        LiveSession(&self.live_sessions)
+        let addr = selected_ip(conn);
+        self.links.send_modify(|links| {
+            self.live_sessions.fetch_add(1, Ordering::Relaxed);
+            links.insert(self.id, Link::Connected { addr });
+        });
+        LiveSession(self)
     }
 
     #[cfg(test)]
@@ -172,11 +183,29 @@ impl PeerState {
     }
 }
 
-/// Keeps a session counted as live while it exists.
-pub(crate) struct LiveSession<'a>(&'a AtomicUsize);
+/// Keeps a session counted as live while it exists. The last one to go marks the peer
+/// disconnected.
+pub(crate) struct LiveSession<'a>(&'a PeerState);
 
 impl Drop for LiveSession<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        let peer = self.0;
+        peer.links.send_if_modified(|links| {
+            let was_last = peer.live_sessions.fetch_sub(1, Ordering::Relaxed) == 1;
+            if was_last {
+                links.insert(peer.id, Link::Disconnected);
+            }
+            was_last
+        });
+    }
+}
+
+/// The peer's address on the path `conn` sends on, if it is a direct IP path.
+fn selected_ip(conn: &Connection) -> Option<SocketAddr> {
+    let paths = conn.paths();
+    let selected = paths.iter().find(iroh::endpoint::Path::is_selected)?;
+    match selected.remote_addr() {
+        TransportAddr::Ip(addr) => Some(*addr),
+        _ => None,
     }
 }

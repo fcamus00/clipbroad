@@ -20,7 +20,7 @@
 //! one that most recently finished the `Hello` exchange and closes the older one. The other node
 //! keeps whatever is still open. "Newest wins" also handles a peer that restarted while its old
 //! connection still looks alive. A lost connection is dialed again
-//! with exponential backoff (0.5 s up to 30 s).
+//! with exponential backoff (0.5 s up to 30 s). [`Node::links`] tells which peers are connected.
 //!
 //! Inside a connection each side opens one unidirectional stream and writes frames on it: first
 //! a [`Hello`](clipbroad_core::protocol::Hello), then one frame per clip. It reads the other
@@ -58,7 +58,7 @@ use iroh::{
 };
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use tokio::{
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, watch},
     task::JoinSet,
 };
 use tracing::{debug, info, warn};
@@ -97,6 +97,20 @@ pub struct Received {
     pub clip: Clip,
 }
 
+/// Whether a configured peer is connected right now. See [`Node::links`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Link {
+    Disconnected,
+    /// At least one connection finished the `Hello` exchange. `addr` is the peer's address on the
+    /// path the newest connection used when it connected, or `None` if that was not an IP path.
+    Connected {
+        addr: Option<SocketAddr>,
+    },
+}
+
+/// The [`Link`] of every configured peer.
+pub type Links = HashMap<EndpointId, Link>;
+
 /// Why the node could not start.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -116,6 +130,8 @@ pub enum Error {
 pub struct Node {
     endpoint: Endpoint,
     outbox: broadcast::Sender<Frame>,
+    links: watch::Sender<Links>,
+    lan_discovery: bool,
     tasks: JoinSet<()>,
     #[cfg(test)]
     peers: HashMap<EndpointId, Arc<peer::PeerState>>,
@@ -159,6 +175,8 @@ impl Node {
 
         let (inbox_tx, inbox) = mpsc::channel(INBOX_CAPACITY);
         let (outbox, _) = broadcast::channel(OUTBOX_CAPACITY);
+        let links = config.peers.iter().map(|p| (p.id, Link::Disconnected));
+        let links = watch::Sender::new(links.collect());
         let mut tasks = JoinSet::new();
         let mut routes = HashMap::new();
         #[cfg(test)]
@@ -173,6 +191,7 @@ impl Node {
                 discovery,
                 outbox.clone(),
                 inbox_tx.clone(),
+                links.clone(),
             );
             #[cfg(test)]
             peer_states.insert(peer.id, peer_task.state());
@@ -183,6 +202,8 @@ impl Node {
         let node = Self {
             endpoint,
             outbox,
+            links,
+            lan_discovery: discovery,
             tasks,
             #[cfg(test)]
             peers: peer_states,
@@ -194,6 +215,19 @@ impl Node {
     #[must_use]
     pub fn id(&self) -> EndpointId {
         self.endpoint.id()
+    }
+
+    /// Whether LAN discovery (mDNS) is running: `config.mdns` is on and mDNS could start.
+    #[must_use]
+    pub fn lan_discovery(&self) -> bool {
+        self.lan_discovery
+    }
+
+    /// Follows the [`Link`] of every configured peer. It changes when a peer connects or its last
+    /// connection ends.
+    #[must_use]
+    pub fn links(&self) -> watch::Receiver<Links> {
+        self.links.subscribe()
     }
 
     /// Sends `clip` to every connected peer. Peers that are not connected right now miss it.

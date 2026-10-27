@@ -2,7 +2,7 @@
 
 use std::future::Future;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,9 +15,11 @@ use clipbroad_core::protocol::NodeId;
 use clipbroad_core::sync::{LocalAction, RemoteAction, SyncEngine};
 use clipbroad_core::{ClipContent, ContentHash};
 use clipbroad_net::{Node, Received};
+use tokio::time::{self, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 use crate::backend;
+use crate::status::{self, ClipEvent, DaemonStatus};
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -44,7 +46,15 @@ pub async fn run(args: Args) -> Result<()> {
         backend::system_clipboard()?
     };
     info!(config = %paths.config_file.display(), peers = config.peers.len(), "starting");
-    sync(clipboard, &config, &identity, shutdown_signal()).await
+    let status_file = paths.status_file();
+    sync(
+        clipboard,
+        &config,
+        &identity,
+        &status_file,
+        shutdown_signal(),
+    )
+    .await
 }
 
 /// Ctrl+C, or SIGTERM on Unix (what systemd and `kill` send).
@@ -62,7 +72,8 @@ async fn shutdown_signal() -> io::Result<()> {
     tokio::signal::ctrl_c().await
 }
 
-/// Syncs `clipboard` with the peers in `config` until `shutdown` completes.
+/// Syncs `clipboard` with the peers in `config` until `shutdown` completes, keeping
+/// `status_file` up to date for `clipbroad status` (see [`status`]).
 ///
 /// Errors from a single read, write or clip are logged and the loop keeps going; only a failed
 /// setup or a failed clipboard watcher end it.
@@ -70,6 +81,7 @@ pub async fn sync(
     clipboard: Arc<dyn Clipboard>,
     config: &Config,
     identity: &IdentityKey,
+    status_file: &Path,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<()> {
     let mut changes = clipboard.watch().context("cannot watch the clipboard")?;
@@ -83,6 +95,12 @@ pub async fn sync(
     );
     let mut engine = SyncEngine::new(NodeId::from_bytes(*node.id().as_bytes()));
     let inline_max_bytes = config.inline_max_bytes.get();
+    // Written only once the node is up: a second daemon on the same config fails before this,
+    // and must not take over the first one's file.
+    let mut status = DaemonStatus::new(&node, config);
+    let mut links = node.links();
+    let mut heartbeat = time::interval(status::HEARTBEAT);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     let mut shutdown = pin!(shutdown);
     let result = loop {
@@ -97,25 +115,37 @@ pub async fn sync(
                 if change.formats.is_empty() {
                     continue;
                 }
+                let sent = &mut status.last_sent;
                 if let Err(error) =
-                    local_change(&clipboard, &mut engine, &node, inline_max_bytes).await
+                    local_change(&clipboard, &mut engine, &node, inline_max_bytes, sent).await
                 {
                     warn!("{error:#}");
                 }
             }
             // `None` once no peer task is left to send clips, as with no peers configured.
             Some(received) = inbox.recv() => {
+                status.last_received = Some(ClipEvent {
+                    at_ms: now_ms(),
+                    size: received.clip.size,
+                    hash: short_hash(received.clip.hash),
+                    from: Some(received.from),
+                });
                 if let Err(error) = remote_clip(&clipboard, &mut engine, received).await {
                     warn!("{error:#}");
                 }
             }
+            // The node holds the sender, so this never ends while it runs.
+            Ok(()) = links.changed() => status.update_links(&links.borrow_and_update()),
+            _ = heartbeat.tick() => {}
             result = &mut shutdown => {
                 info!("shutting down");
                 break result.context("cannot listen for the shutdown signal");
             }
         }
+        status.save(status_file);
     };
     node.shutdown().await;
+    status::remove(status_file);
     result
 }
 
@@ -125,6 +155,7 @@ async fn local_change(
     engine: &mut SyncEngine,
     node: &Node,
     inline_max_bytes: u64,
+    last_sent: &mut Option<ClipEvent>,
 ) -> Result<()> {
     let clipboard = Arc::clone(clipboard);
     // `read_text` may block (up to 2 s by contract), so keep it off the async thread.
@@ -157,6 +188,12 @@ async fn local_change(
             let hash = short_hash(clip.hash);
             node.broadcast(clip).context("cannot send the clip")?;
             info!(size, %hash, "sent clip");
+            *last_sent = Some(ClipEvent {
+                at_ms: now_ms(),
+                size,
+                hash,
+                from: None,
+            });
         }
         LocalAction::Unchanged => debug!(size, "clipboard already synced, nothing to send"),
     }
@@ -205,7 +242,7 @@ fn short_hash(hash: ContentHash) -> String {
 }
 
 /// Milliseconds since the Unix epoch on the local clock (0 if the clock is before 1970).
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| {

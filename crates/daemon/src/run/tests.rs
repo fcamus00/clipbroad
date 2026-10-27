@@ -10,6 +10,7 @@ use std::time::Duration;
 use clipbroad_clipboard::fake::TEXT_FORMAT;
 use clipbroad_config::Peer;
 use iroh::{EndpointId, SecretKey};
+use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{self, Instant};
@@ -64,12 +65,15 @@ impl Spec {
     }
 }
 
-/// [`sync`] running in a task on its own fake clipboard.
+/// [`sync`] running in a task on its own fake clipboard, with its status file in its own
+/// directory.
 struct Daemon {
     id: EndpointId,
     clipboard: FakeClipboard,
+    status_file: PathBuf,
     stop: oneshot::Sender<()>,
     task: JoinHandle<Result<()>>,
+    _dir: TempDir,
 }
 
 impl Daemon {
@@ -78,20 +82,31 @@ impl Daemon {
         let (stop, stopped) = oneshot::channel::<()>();
         let shared: Arc<dyn Clipboard> = Arc::new(clipboard.clone());
         let key = spec.key.clone();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let status_file = dir.path().join("status.toml");
+        let path = status_file.clone();
         let task = tokio::spawn(async move {
             let shutdown = async {
                 // A dropped sender also stops the daemon.
                 let _ = stopped.await;
                 Ok(())
             };
-            sync(shared, &config, &key, shutdown).await
+            sync(shared, &config, &key, &path, shutdown).await
         });
         Self {
             id: spec.id(),
             clipboard,
+            status_file,
             stop,
             task,
+            _dir: dir,
         }
+    }
+
+    /// What `clipbroad status` would read. `None` also while the file cannot be read, as on
+    /// Windows if the daemon is replacing it right now.
+    fn status(&self) -> Option<DaemonStatus> {
+        status::read(&self.status_file).ok().flatten()
     }
 
     fn text(&self) -> Option<String> {
@@ -296,4 +311,53 @@ async fn runs_without_peers() {
     daemon.clipboard.simulate_copy_text("nobody listens");
     time::sleep(QUIET).await;
     daemon.stop().await;
+}
+
+#[tokio::test]
+async fn status_file_follows_peers_and_clips() {
+    let (a, b) = (Spec::new(), Spec::new());
+    let inline_max_bytes = Config::DEFAULT_INLINE_MAX_BYTES.get();
+    let daemon_a = Daemon::start(&a, a.config([&b], inline_max_bytes));
+    let daemon_b = Daemon::start(&b, b.config([&a], inline_max_bytes));
+    let peer_connected = |daemon: &Daemon| {
+        daemon
+            .status()
+            .is_some_and(|status| status.peers.iter().all(|peer| peer.connected))
+    };
+    assert!(
+        eventually(TIMEOUT, || peer_connected(&daemon_a)
+            && peer_connected(&daemon_b))
+        .await
+    );
+
+    daemon_a.clipboard.simulate_copy_text("hello");
+    let hash = short_hash(ContentHash::of(b"hello"));
+    let sent = || daemon_a.status().and_then(|s| s.last_sent);
+    let received = || daemon_b.status().and_then(|s| s.last_received);
+    assert!(eventually(TIMEOUT, || sent().is_some() && received().is_some()).await);
+    let (sent, received) = (sent().expect("sent"), received().expect("received"));
+    assert_eq!((sent.size, &sent.hash, sent.from), (5, &hash, None));
+    assert_eq!(
+        (received.size, &received.hash, received.from),
+        (5, &hash, Some(a.id()))
+    );
+
+    let shown = status::render(daemon_a.status().as_ref(), now_ms());
+    let expected = [
+        "daemon         running (pid ".to_owned(),
+        format!("node id        {}\n", a.id()),
+        "peers          1 of 1 connected\n".to_owned(),
+        format!("connected via 127.0.0.1:{}\n", b.port),
+        format!(", 5 bytes, hash {hash}\n"),
+    ];
+    for line in expected {
+        assert!(shown.contains(&line), "{line:?} missing in:\n{shown}");
+    }
+
+    daemon_b.stop().await;
+    assert!(eventually(TIMEOUT, || !peer_connected(&daemon_a)).await);
+    let status_file = daemon_a.status_file.clone();
+    daemon_a.stop().await;
+    // A daemon that stops removes its file.
+    assert!(!status_file.exists());
 }

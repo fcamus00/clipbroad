@@ -50,6 +50,15 @@ fn pair_rejects_a_bad_ticket() {
 }
 
 #[test]
+fn status_without_a_daemon_says_not_running() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config = dir.path().join("config.toml");
+    let config = config.to_str().expect("temp paths are UTF-8");
+    let shown = stdout(clipbroad(&["status", "--config", config]));
+    assert!(shown.starts_with("daemon         not running\n"), "{shown}");
+}
+
+#[test]
 fn help_describes_commands_and_hides_fake() {
     let help = stdout(clipbroad(&["--help"]));
     // Collapse the column padding, which changes with the longest command name.

@@ -501,3 +501,36 @@ async fn node_keeps_dialing_until_the_peer_shows_up() {
     node_a.shutdown().await;
     node_b.shutdown().await;
 }
+
+#[tokio::test]
+async fn links_follow_the_connection_to_each_peer() {
+    let (a, b) = (Spec::new(), Spec::new());
+    let (node_a, _inbox_a) = a.spawn(vec![b.peer()]).await;
+    assert!(!node_a.lan_discovery());
+    let mut links = node_a.links();
+    assert_eq!(links.borrow()[&b.id()], Link::Disconnected);
+
+    let (node_b, _inbox_b) = b.spawn(vec![a.peer()]).await;
+    let b_id = b.id();
+    let link_to_b = |want_connected: bool| {
+        move |links: &Links| matches!(links[&b_id], Link::Connected { .. }) == want_connected
+    };
+    let connected = time::timeout(TIMEOUT, links.wait_for(link_to_b(true)))
+        .await
+        .expect("connects in time")
+        .expect("node still running")[&b.id()];
+    // Both nodes send from their listening port, whoever dialed.
+    assert_eq!(
+        connected,
+        Link::Connected {
+            addr: Some(b.addr())
+        }
+    );
+
+    node_b.shutdown().await;
+    time::timeout(TIMEOUT, links.wait_for(link_to_b(false)))
+        .await
+        .expect("notices in time")
+        .expect("node still running");
+    node_a.shutdown().await;
+}
