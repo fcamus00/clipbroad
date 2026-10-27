@@ -49,3 +49,34 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked
       - run: cargo nextest run --workspace --locked --no-tests=pass
       - run: cargo test --workspace --doc --locked
+
+  build:
+    name: build (${{ matrix.artifact }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: clipbroad-linux-x86_64
+            exe: clipbroad
+          # macos-latest runners are Apple Silicon.
+          - os: macos-latest
+            artifact: clipbroad-macos-aarch64
+            exe: clipbroad
+          - os: windows-latest
+            artifact: clipbroad-windows-x86_64
+            exe: clipbroad.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p clipbroad
+      - name: Smoke test
+        shell: bash
+        run: target/release/${{ matrix.exe }} --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/release/${{ matrix.exe }}
+          if-no-files-found: error
