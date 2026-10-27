@@ -158,7 +158,8 @@ Detalles (código en `crates/core/src/protocol.rs`):
   después de lo último que vio; ver "Semántica de sincronización"), `kind`, `mime`, `size`, `hash` y
   `payload`. El payload hoy solo puede ser inline; el anuncio de archivos grandes se agrega en la fase 4.
 - **Verificación al recibir:** el contenido solo se obtiene con `Clip::into_content`, que comprueba que el
-  tamaño y el hash BLAKE3 declarados coinciden con el payload (y que el texto sea UTF-8 válido).
+  tamaño y el hash BLAKE3 declarados coinciden con el payload, que el texto sea UTF-8 válido y que una
+  imagen empiece como PNG.
 - El `Debug` de un `Clip` muestra el largo del payload, nunca su contenido, para no filtrarlo en los logs.
 
 ### Semántica de sincronización
@@ -239,7 +240,8 @@ Contrato del trait (detalle completo en los doc comments de `crates/clipboard`):
   devuelve `ClipboardError::Sensitive` sin leer el texto (ver "Contenido sensible").
 - Se reportan **todos** los cambios, incluidos los que causa el propio daemon al escribir; el anti-eco
   se hace en el daemon por hash, igual en todas las plataformas.
-- `ContentHash` es BLAKE3 de los bytes del contenido (texto: UTF-8 tal cual, sin normalizar).
+- `ContentHash` es BLAKE3 de los bytes del contenido (texto: UTF-8 tal cual, sin normalizar; imagen:
+  los bytes PNG).
 
 ### Contenido sensible
 
@@ -307,7 +309,35 @@ que dispara el aviso cuando se active. Mitigaciones previstas:
 ## Imágenes
 
 Se normalizan a PNG en la red (macOS usa TIFF/PNG; Windows usa DIB/PNG). Van inline mientras estén bajo
-el umbral de tamaño.
+el umbral de tamaño. Código en `crates/core/src/content.rs` (`Png`) y `protocol.rs`.
+
+- **En la red siempre PNG.** `ClipContent::Image(Png)` viaja como `ContentKind::Image` con MIME
+  `image/png`. El hash es BLAKE3 de los bytes PNG tal como viajan. Un texto y una imagen nunca tienen
+  los mismos bytes: un PNG empieza con `0x89`, y ningún texto UTF-8 puede empezar así.
+- **La conversión vive en los backends, no en `core`.** Cada backend convierte su formato nativo a PNG
+  al leer y PNG a su formato nativo al escribir (TIFF en macOS, DIB en Windows; Wayland ya ofrece
+  `image/png`). Así `core` no depende del crate `image`, que es pesado; solo lo trae el backend que lo
+  necesite, con las features mínimas (tarea de backends de imágenes).
+- **`core` solo revisa el encabezado.** `Png::try_from` acepta bytes que empiezan con la firma PNG
+  seguida del chunk `IHDR`, y rechaza el resto con `NotPng`. No decodifica la imagen: un PNG roto más
+  allá del encabezado falla en la app que pega, igual que si se hubiera copiado en la misma máquina.
+  `Clip::into_content` rechaza un clip de imagen que no empieza como PNG (`ClipError::NotPng`), así un
+  peer no puede poner bytes cualquiera en el portapapeles como imagen.
+- **`PROTOCOL_VERSION` pasa a 2.** Un nodo con la versión 1 no puede decodificar `ContentKind::Image`:
+  el frame le resulta malformado y cierra la conexión con cada imagen copiada. Con la versión nueva, dos
+  nodos de versiones distintas se rechazan al conectar con el error claro de `Hello`, y hay que
+  actualizar todas las máquinas. El ALPN sigue siendo `clipbroad/1`: si cambiara, la conexión fallaría
+  en el handshake sin decir por qué.
+- **Una imagen más grande que `inline_max_bytes` no se sincroniza:** el daemon la salta con un warning,
+  igual que al texto. Cuando exista el canal de archivos (ver "Archivos") se puede reconsiderar enviarla
+  por ahí. La revisión se agrega en el daemon junto con la lectura de imágenes en los backends.
+- **Requisito para los backends (anti-eco):** el anti-eco compara hashes. Si un backend escribe un PNG y
+  al leerlo de vuelta entrega otros bytes (por ejemplo, porque lo re-codifica desde TIFF), el daemon lo ve
+  como una copia nueva y la reenvía. Dos máquinas que re-codifican podrían reenviarse la imagen sin fin.
+  Por eso un backend debe devolver los mismos bytes PNG que escribió, por ejemplo escribiendo el tipo PNG
+  y leyéndolo primero cuando está.
+- **Mientras los backends no soporten imágenes**, ninguno las lee, y el daemon que recibe una la salta con
+  un warning sin escribirla en el portapapeles.
 
 ## Archivos
 

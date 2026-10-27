@@ -177,7 +177,14 @@ async fn remote_clip(
         .with_context(|| format!("invalid clip from {from}"))?;
     match action {
         RemoteAction::Apply(content) => {
-            let ClipContent::Text(text) = content;
+            let text = match content {
+                ClipContent::Text(text) => text,
+                // No backend writes images yet.
+                ClipContent::Image(_) => {
+                    warn!(%from, size, %hash, "image clips are not supported yet, not applied");
+                    return Ok(());
+                }
+            };
             let clipboard = Arc::clone(clipboard);
             tokio::task::spawn_blocking(move || clipboard.write_text(&text))
                 .await?

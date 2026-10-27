@@ -7,5 +7,5 @@ pub mod protocol;
 pub mod sensitive;
 pub mod sync;
 
-pub use content::ClipContent;
+pub use content::{ClipContent, NotPng, Png};
 pub use hash::ContentHash;

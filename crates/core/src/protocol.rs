@@ -24,10 +24,14 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ClipContent, ContentHash};
+use crate::{ClipContent, ContentHash, Png};
 
 /// Wire protocol version. Bump on any incompatible message change.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// History:
+/// - 1: text clips.
+/// - 2: image clips ([`ContentKind::Image`]). A version 1 peer cannot decode them.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Largest frame body accepted or sent, in bytes.
 ///
@@ -40,6 +44,7 @@ pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 const HEADER_LEN: usize = 4;
 
 const TEXT_MIME: &str = "text/plain;charset=utf-8";
+const PNG_MIME: &str = "image/png";
 
 /// Everything that travels between peers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,11 +110,13 @@ impl fmt::Debug for NodeId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClipId(pub u64);
 
-/// What kind of content a clip carries. Images and files will be added as new variants.
+/// What kind of content a clip carries. Files will be added as a new variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ContentKind {
     /// UTF-8 text.
     Text,
+    /// A PNG image.
+    Image,
 }
 
 /// Clipboard content copied on one machine, sent to the others.
@@ -123,8 +130,8 @@ pub struct Clip {
     /// (see [`crate::sync`]).
     pub timestamp_ms: u64,
     pub kind: ContentKind,
-    /// MIME type of the content. Text is always `text/plain;charset=utf-8`; images will use it to
-    /// name their format.
+    /// MIME type of the content: `text/plain;charset=utf-8` for text, `image/png` for images.
+    /// Informative only: the receiver decodes the payload by `kind`.
     pub mime: String,
     /// Content size in bytes.
     pub size: u64,
@@ -138,17 +145,19 @@ impl Clip {
     #[must_use]
     pub fn new(id: ClipId, origin: NodeId, timestamp_ms: u64, content: ClipContent) -> Self {
         let hash = content.hash();
-        match content {
-            ClipContent::Text(text) => Self {
-                id,
-                origin,
-                timestamp_ms,
-                kind: ContentKind::Text,
-                mime: TEXT_MIME.to_owned(),
-                size: text.len() as u64,
-                hash,
-                payload: Payload::Inline(text.into_bytes()),
-            },
+        let (kind, mime, bytes) = match content {
+            ClipContent::Text(text) => (ContentKind::Text, TEXT_MIME, text.into_bytes()),
+            ClipContent::Image(png) => (ContentKind::Image, PNG_MIME, png.into_bytes()),
+        };
+        Self {
+            id,
+            origin,
+            timestamp_ms,
+            kind,
+            mime: mime.to_owned(),
+            size: bytes.len() as u64,
+            hash,
+            payload: Payload::Inline(bytes),
         }
     }
 
@@ -159,8 +168,8 @@ impl Clip {
     ///
     /// # Errors
     ///
-    /// [`ClipError`] if the size or hash does not match the payload, or if a text payload is not
-    /// valid UTF-8.
+    /// [`ClipError`] if the size or hash does not match the payload, if a text payload is not
+    /// valid UTF-8, or if an image payload does not start like a PNG.
     pub fn into_content(self) -> Result<ClipContent, ClipError> {
         let Payload::Inline(bytes) = self.payload;
         let actual = bytes.len() as u64;
@@ -177,6 +186,9 @@ impl Clip {
             ContentKind::Text => String::from_utf8(bytes)
                 .map(ClipContent::Text)
                 .map_err(|_| ClipError::NotUtf8),
+            ContentKind::Image => Png::try_from(bytes)
+                .map(ClipContent::Image)
+                .map_err(|_| ClipError::NotPng),
         }
     }
 }
@@ -231,6 +243,9 @@ pub enum ClipError {
 
     #[error("text clip is not valid UTF-8")]
     NotUtf8,
+
+    #[error("image clip is not a PNG")]
+    NotPng,
 }
 
 /// Encodes `message` as a frame, ready to write to a stream.
@@ -299,6 +314,7 @@ pub fn decode(buf: &[u8]) -> Result<Option<(Message, usize)>, FrameError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content::{TINY_PNG, tiny_image};
 
     fn text_clip(text: &str) -> Clip {
         Clip::new(
@@ -306,6 +322,15 @@ mod tests {
             NodeId::from_bytes([3; 32]),
             1_700_000_000_000,
             ClipContent::from(text),
+        )
+    }
+
+    fn image_clip() -> Clip {
+        Clip::new(
+            ClipId(8),
+            NodeId::from_bytes([3; 32]),
+            1_700_000_000_000,
+            tiny_image(),
         )
     }
 
@@ -336,9 +361,9 @@ mod tests {
 
     #[test]
     fn hello_wire_format_never_changes() {
-        // Length 2, variant 0 (Hello), version 1. Older and newer peers depend on these bytes.
+        // Length 2, variant 0 (Hello), version 2. Older and newer peers depend on these bytes.
         let frame = encode(&Message::Hello(Hello::CURRENT)).expect("encode");
-        assert_eq!(frame, [0, 0, 0, 2, 0, 1]);
+        assert_eq!(frame, [0, 0, 0, 2, 0, 2]);
     }
 
     #[test]
@@ -468,6 +493,41 @@ mod tests {
         clip.hash = ContentHash::of(&bytes);
         clip.payload = Payload::Inline(bytes);
         assert_eq!(clip.into_content(), Err(ClipError::NotUtf8));
+    }
+
+    #[test]
+    fn image_clip_round_trips_and_gives_back_the_png() {
+        let clip = image_clip();
+        assert_eq!(clip.kind, ContentKind::Image);
+        assert_eq!(clip.mime, "image/png");
+        assert_eq!(clip.size, 70);
+        assert_eq!(clip.hash, ContentHash::of(&TINY_PNG));
+        assert_eq!(clip.payload, Payload::Inline(TINY_PNG.to_vec()));
+
+        let Message::Clip(received) = round_trip(&Message::Clip(clip)) else {
+            panic!("a clip decodes as a clip");
+        };
+        assert_eq!(received.into_content(), Ok(tiny_image()));
+    }
+
+    #[test]
+    fn tampered_image_is_rejected() {
+        let mut bytes = TINY_PNG.to_vec();
+        bytes[20] ^= 1; // image width
+        let mut clip = image_clip();
+        clip.payload = Payload::Inline(bytes);
+        assert_eq!(clip.into_content(), Err(ClipError::HashMismatch));
+    }
+
+    #[test]
+    fn image_that_is_not_a_png_is_rejected() {
+        // Size and hash match, so only the PNG check can catch it.
+        let bytes = b"GIF89a, not a PNG".to_vec();
+        let mut clip = image_clip();
+        clip.size = bytes.len() as u64;
+        clip.hash = ContentHash::of(&bytes);
+        clip.payload = Payload::Inline(bytes);
+        assert_eq!(clip.into_content(), Err(ClipError::NotPng));
     }
 
     #[test]
