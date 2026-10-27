@@ -31,7 +31,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{GlobalFree, HGLOBAL, HWND};
+use windows_sys::Win32::Foundation::{GlobalFree, HGLOBAL, HWND, SetLastError};
 use windows_sys::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, EnumClipboardFormats,
     GetClipboardData, GetClipboardFormatNameW, IsClipboardFormatAvailable, OpenClipboard,
@@ -427,8 +427,13 @@ fn list_formats() -> Result<Vec<String>, ClipboardError> {
     let mut formats = Vec::new();
     let mut format = 0;
     loop {
-        // SAFETY: plain query; the clipboard is open on this thread.
-        format = unsafe { EnumClipboardFormats(format) };
+        // A 0 result is only told apart from a failure by the last error, and `format_name` may
+        // have left one behind, so start each call from a clean slate.
+        // SAFETY: plain calls; the clipboard is open on this thread.
+        format = unsafe {
+            SetLastError(0);
+            EnumClipboardFormats(format)
+        };
         if format == 0 {
             break;
         }
