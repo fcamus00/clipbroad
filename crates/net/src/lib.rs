@@ -29,7 +29,12 @@
 //! The mesh is full and nothing is forwarded, so a clip must come from the machine that copied
 //! it. A clip whose `origin` is not the sending peer is dropped. The receiver still has to get
 //! the content through [`Clip::into_content`], which checks the payload.
+//!
+//! # Pairing
+//!
+//! [`pair`] adds a peer: one machine shows a ticket and the other dials it, on a separate ALPN.
 
+pub mod pair;
 mod peer;
 mod session;
 #[cfg(test)]
@@ -45,7 +50,9 @@ use clipbroad_config::{Config, IdentityKey};
 use clipbroad_core::protocol::{self, Clip, FrameError, Message};
 use iroh::{
     Endpoint, EndpointId, SecretKey,
-    endpoint::{AfterHandshakeOutcome, BindError, BindOpts, Connection, EndpointHooks, presets},
+    endpoint::{
+        AfterHandshakeOutcome, BindError, BindOpts, Builder, Connection, EndpointHooks, presets,
+    },
 };
 use tokio::{
     sync::{broadcast, mpsc},
@@ -93,6 +100,8 @@ pub enum Error {
         #[source]
         source: BindError,
     },
+    #[error("could not generate a random pairing secret")]
+    Random(#[source] getrandom::Error),
 }
 
 /// A running node. Dropping it stops all connections; [`Node::shutdown`] also tells peers.
@@ -125,19 +134,9 @@ impl Node {
     ) -> Result<(Self, mpsc::Receiver<Received>), Error> {
         let port = config.listen_port.get();
         let allowlist = config.peers.iter().map(|peer| peer.id).collect();
-        let endpoint = Endpoint::builder(presets::Minimal)
-            .secret_key(SecretKey::from_bytes(&identity.to_bytes()))
+        let endpoint = endpoint_builder(identity, port)
             .alpns(vec![ALPN.to_vec()])
             .hooks(Allowlist(allowlist))
-            .clear_ip_transports()
-            .bind_addr(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
-            .expect("a single IPv4 bind address is valid")
-            .bind_addr_with_opts(
-                SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
-                // Some machines have IPv6 disabled; IPv4 is enough.
-                BindOpts::default().set_is_required(false),
-            )
-            .expect("a single IPv6 bind address is valid")
             .bind()
             .await
             .map_err(|source| Error::Bind { port, source })?;
@@ -197,6 +196,26 @@ impl Node {
         self.tasks.shutdown().await;
         self.endpoint.close().await;
     }
+}
+
+/// An endpoint with `identity` that will listen on `port` on all interfaces (IPv4, and IPv6 if
+/// available), without relays or address lookup (see the crate docs).
+///
+/// # Panics
+///
+/// Only on a bug: if iroh rejects one unspecified bind address per IP family.
+fn endpoint_builder(identity: &IdentityKey, port: u16) -> Builder {
+    Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::from_bytes(&identity.to_bytes()))
+        .clear_ip_transports()
+        .bind_addr(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
+        .expect("a single IPv4 bind address is valid")
+        .bind_addr_with_opts(
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+            // Some machines have IPv6 disabled; IPv4 is enough.
+            BindOpts::default().set_is_required(false),
+        )
+        .expect("a single IPv6 bind address is valid")
 }
 
 /// Rejects connections from anyone who is not a configured peer.

@@ -33,10 +33,7 @@ pub struct Args {
 
 pub async fn run(args: Args) -> Result<()> {
     let paths = match args.config {
-        Some(config_file) => Paths {
-            secret_key_file: config_file.with_file_name("secret.key"),
-            config_file,
-        },
+        Some(config_file) => Paths::beside_config(config_file),
         None => Paths::discover()?,
     };
     let config = Config::load_or_default(&paths.config_file)?;

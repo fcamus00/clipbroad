@@ -33,6 +33,16 @@ impl Paths {
         Ok(Self::resolve(&home, |var| env::var_os(var)))
     }
 
+    /// Paths for a config file given by the user: the identity is `secret.key` in the same
+    /// directory, so each config file has its own identity.
+    #[must_use]
+    pub fn beside_config(config_file: PathBuf) -> Self {
+        Self {
+            secret_key_file: config_file.with_file_name("secret.key"),
+            config_file,
+        }
+    }
+
     /// Builds the paths from a home directory and an environment lookup, so tests can fake both.
     fn resolve(home: &Path, env: impl Fn(&str) -> Option<OsString>) -> Self {
         // Relative values are invalid per the XDG spec and unsafe on Windows: ignore them.

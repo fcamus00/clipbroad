@@ -69,9 +69,33 @@ Configuración decidida:
 
 ### Emparejamiento
 
-El usuario corre `clipbroad pair` en una máquina, que muestra un ticket (EndpointId + direcciones + un
-secreto de un solo uso), y `clipbroad pair <ticket>` en la otra. Ambas guardan el `EndpointId` de la
-otra en su configuración. Los detalles se cierran en la fase 2.
+El usuario corre `clipbroad pair` en una máquina (A), que muestra un ticket y espera, y
+`clipbroad pair <ticket>` en la otra (B). Ambas agregan a la otra en su configuración y terminan.
+Código en `crates/net/src/pair.rs` y `crates/daemon/src/pair.rs`.
+
+- **Ticket:** una línea en base32 con un byte de versión, el `EndpointId` de A, sus direcciones (en
+  su puerto de escucha) y un secreto aleatorio de 16 bytes.
+- **Flujo:** B marca a A con un ALPN aparte (`clipbroad-pair/1`), fuera de la allowlist, y le manda el
+  secreto, su hostname y sus direcciones. A compara el secreto en tiempo constante; si coincide, guarda
+  a B y recién entonces le responde con su hostname, y B guarda a A. Así B solo guarda a A si A ya
+  guardó a B.
+- **Puerto:** el emparejamiento escucha en el `listen_port` normal en ambas máquinas, así las
+  direcciones que se intercambian (y la dirección desde la que B se conecta, que A también guarda) son
+  las que usará `clipbroad run`. Por eso hay que detener `clipbroad run` mientras se empareja; si está
+  corriendo, `pair` falla con un mensaje que lo dice. No cuesta nada: el daemon lee la config solo al
+  arrancar, así que igual hay que reiniciarlo para que vea al peer nuevo.
+- **Config:** se agrega un bloque `[[peers]]` como texto al final del archivo (se conservan los
+  comentarios), con `id`, `name` y `addrs`. Se crea el archivo si no existe, se valida el resultado
+  antes de escribir, y un peer que ya estaba no se duplica ni se modifica.
+- **Amenazas:** el TLS de iroh ya autentica los dos `EndpointId`; el secreto solo prueba que B vio el
+  ticket en la pantalla de A. A acepta un único pedido válido y deja de escuchar, o deja de escuchar a
+  los 5 minutos: un ticket filtrado después de usado o vencido no sirve, porque ya nadie responde. Un
+  secreto incorrecto solo cierra esa conexión y la sesión sigue esperando (adivinar 128 bits en 5
+  minutos no es factible), así un intento ajeno no le arruina el emparejamiento al usuario. Si alguien
+  usa un ticket filtrado *antes* que B, queda emparejado con A; el usuario lo nota porque su
+  `clipbroad pair <ticket>` falla, y debe quitar ese peer de la config.
+- **Límite:** las direcciones guardadas son las del momento. Si cambia la IP de una máquina en la LAN
+  hay que editar `addrs` a mano (o emparejar de nuevo después de borrar el peer).
 
 ### Protocolo
 
@@ -154,8 +178,8 @@ portapapeles lo detiene. Se apaga con Ctrl+C o SIGTERM.
 - Los logs muestran el id del nodo al arrancar, las conexiones y cada clip enviado o recibido con su
   tamaño y los primeros 8 caracteres del hash, nunca el contenido. `run` registra en nivel info por
   defecto.
-- `--config <archivo>` usa otro archivo de config, y `secret.key` en la misma carpeta como identidad.
-  Sirve para correr dos instancias en una máquina (pruebas) mientras no existe el emparejamiento.
+- `--config <archivo>` (en `run` y `pair`) usa otro archivo de config, y `secret.key` en la misma
+  carpeta como identidad. Sirve para correr dos instancias en una máquina (pruebas).
 - El contenido marcado como sensible no se envía: el daemon lo salta con un log en nivel debug que
   muestra el marcador, nunca el contenido.
 
