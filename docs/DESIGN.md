@@ -60,6 +60,25 @@ otra en su configuración. Los detalles se cierran en la fase 2.
 - El protocolo se diseña desde el MVP con los campos de tipo/MIME/tamaño/hash, para que agregar imágenes y
   archivos no lo rompa.
 
+Detalles (código en `crates/core/src/protocol.rs`):
+- **Frame:** 4 bytes con la longitud (u32 big-endian) y luego el mensaje en `postcard`. `core` solo
+  codifica y decodifica bytes (`encode`, `decode`); `net` hace la lectura y escritura en los streams QUIC.
+  `decode` distingue "faltan bytes" de un error.
+- **Tamaño máximo de frame: 16 MiB**, constante del protocolo (no configurable, porque ambos lados deben
+  coincidir). El receptor lo revisa apenas llegan los 4 bytes de longitud, antes de reservar memoria; el
+  emisor no codifica un frame más grande. Por eso `inline_max_bytes` debe quedar por debajo de ese límite.
+- **Mensajes:** `Hello { protocol_version }` y `Clip`. Cada lado manda `Hello` primero; `decode` devuelve
+  un error tipado si la versión no coincide, y la conexión se cierra.
+- **`Hello` es estable entre versiones:** siempre es la variante 0 y `protocol_version` siempre es su
+  primer campo; solo se le pueden agregar campos al final. `decode` ignora los bytes sobrantes dentro de un
+  frame, así un nodo viejo puede leer la versión de un `Hello` nuevo y rechazarlo con un error claro.
+- **`Clip`:** `id` (número que elige el origen), `origin` (los 32 bytes del `EndpointId`, opacos para
+  `core`), `timestamp_ms` (milisegundos Unix según el reloj del origen), `kind`, `mime`, `size`, `hash` y
+  `payload`. El payload hoy solo puede ser inline; el anuncio de archivos grandes se agrega en la fase 4.
+- **Verificación al recibir:** el contenido solo se obtiene con `Clip::into_content`, que comprueba que el
+  tamaño y el hash BLAKE3 declarados coinciden con el payload (y que el texto sea UTF-8 válido).
+- El `Debug` de un `Clip` muestra el largo del payload, nunca su contenido, para no filtrarlo en los logs.
+
 ### Semántica de sincronización
 
 - **Último en escribir gana.** Cada copia local nueva se envía a todos los peers; al recibir, se escribe
