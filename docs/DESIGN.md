@@ -227,6 +227,16 @@ contenido. Sincronizar archivos significa transferir el contenido, guardarlo en 
 - Las rutas se calculan con la biblioteca estándar en vez del crate `directories`, porque este depende
   de `option-ext` (MPL-2.0), que la política de licencias de `cargo deny` no permite.
 
+## Distribución
+
+- Cada tag `v*` publica un GitHub Release con los 3 binarios (`.tar.gz` / `.zip`) y `SHA256SUMS`. El
+  proceso está en [`RELEASE.md`](RELEASE.md).
+- Workflow propio en vez de `cargo-dist`: alcanza con 3 archivos y checksums, y un workflow corto escrito
+  a mano es más fácil de mantener que uno generado. Se revisa si hacen falta instaladores o Homebrew.
+- La versión vive en `[workspace.package]`; el workflow falla si el tag no coincide con
+  `clipbroad --version`.
+- macOS: sin firma ni notarización por ahora (requiere cuenta de Apple Developer).
+
 ## Fases
 
 | Fase | Contenido | Lista cuando… |
