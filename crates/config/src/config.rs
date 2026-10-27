@@ -6,6 +6,7 @@ use std::{
     path::Path,
 };
 
+use clipbroad_core::protocol::MAX_FRAME_LEN;
 use iroh::EndpointId;
 use serde::Deserialize;
 
@@ -20,7 +21,8 @@ pub struct Config {
     /// UDP port the node listens on. Fixed so that peers can reach it through static addresses;
     /// non-zero because port 0 means "any free port", which changes on every start.
     pub listen_port: NonZeroU16,
-    /// Clips up to this size (in bytes) travel inside the clip message itself.
+    /// Clips up to this size (in bytes) travel inside the clip message itself. At most
+    /// [`Config::MAX_INLINE_MAX_BYTES`].
     pub inline_max_bytes: NonZeroU64,
     /// Paired machines.
     pub peers: Vec<Peer>,
@@ -48,7 +50,7 @@ pub enum ParseError {
     #[error(transparent)]
     Toml(#[from] toml::de::Error),
 
-    /// Valid TOML, but the peer list is not acceptable (repeated id).
+    /// Valid TOML, but a value is not acceptable (repeated peer id, `inline_max_bytes` too large).
     #[error("{0}")]
     Invalid(String),
 }
@@ -68,6 +70,9 @@ impl Config {
     /// 8 MiB: enough for text and typical screenshots.
     pub const DEFAULT_INLINE_MAX_BYTES: NonZeroU64 =
         NonZeroU64::new(8 * 1024 * 1024).expect("non-zero");
+    /// Largest accepted `inline_max_bytes`: a clip must fit in one protocol frame, so this is the
+    /// frame limit minus 64 KiB for the clip's metadata (which takes a few hundred bytes).
+    pub const MAX_INLINE_MAX_BYTES: u64 = (MAX_FRAME_LEN - 64 * 1024) as u64;
 
     /// Parses and validates a config from TOML text.
     ///
@@ -75,7 +80,8 @@ impl Config {
     ///
     /// [`ParseError::Toml`] for syntax errors, unknown fields, wrong types or out-of-range values
     /// (including zero where a non-zero number is required) and malformed peer ids, and
-    /// [`ParseError::Invalid`] for a repeated peer id.
+    /// [`ParseError::Invalid`] for a repeated peer id or an `inline_max_bytes` above
+    /// [`Config::MAX_INLINE_MAX_BYTES`].
     pub fn from_toml_str(text: &str) -> Result<Self, ParseError> {
         let config: Self = toml::from_str(text)?;
         config.validate()?;
@@ -100,6 +106,13 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ParseError> {
+        if self.inline_max_bytes.get() > Self::MAX_INLINE_MAX_BYTES {
+            return Err(ParseError::Invalid(format!(
+                "inline_max_bytes is {}, but the maximum is {} (16 MiB minus 64 KiB)",
+                self.inline_max_bytes,
+                Self::MAX_INLINE_MAX_BYTES
+            )));
+        }
         let mut seen = HashSet::new();
         for peer in &self.peers {
             if !seen.insert(peer.id) {
@@ -229,6 +242,18 @@ mod tests {
             let err = Config::from_toml_str(text).expect_err("zero");
             assert!(err.to_string().contains("nonzero"), "{err}");
         }
+    }
+
+    #[test]
+    fn inline_max_bytes_must_fit_in_a_frame() {
+        let max = Config::MAX_INLINE_MAX_BYTES;
+        let config = Config::from_toml_str(&format!("inline_max_bytes = {max}")).expect("valid");
+        assert_eq!(config.inline_max_bytes.get(), max);
+
+        let err = Config::from_toml_str(&format!("inline_max_bytes = {}", max + 1))
+            .expect_err("too large");
+        assert!(matches!(err, ParseError::Invalid(_)), "{err}");
+        assert!(err.to_string().contains("inline_max_bytes"), "{err}");
     }
 
     #[test]
