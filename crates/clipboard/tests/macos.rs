@@ -11,6 +11,7 @@
 #![cfg(target_os = "macos")]
 
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clipbroad_clipboard::macos::{AccessBehavior, MacosClipboard};
@@ -18,7 +19,7 @@ use clipbroad_clipboard::{Clipboard, ClipboardChange, ClipboardError, ClipboardW
 use clipbroad_core::Png;
 use objc2::rc::autoreleasepool;
 use objc2_app_kit::{NSBitmapImageRep, NSPasteboard};
-use objc2_foundation::{NSArray, NSData, NSString};
+use objc2_foundation::{NSArray, NSData, NSString, NSURL};
 
 /// A few polling ticks.
 const EVENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -129,6 +130,7 @@ async fn real_clipboard_round_trip_and_watch() {
     );
 
     check_images(&clipboard, &mut watch).await;
+    check_files(&clipboard, &mut watch).await;
 }
 
 /// The image part of the smoke test.
@@ -185,5 +187,71 @@ async fn check_images(clipboard: &MacosClipboard, watch: &mut ClipboardWatch) {
             Err(ClipboardError::Sensitive { marker: CONCEALED })
         ),
         "concealed image was read"
+    );
+}
+
+/// The file part of the smoke test.
+async fn check_files(clipboard: &MacosClipboard, watch: &mut ClipboardWatch) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let files: Vec<PathBuf> = ["a b.txt", "ñandú 🦀.txt"]
+        .into_iter()
+        .map(|name| dir.path().join(name))
+        .collect();
+    for file in &files {
+        std::fs::write(file, "contents").expect("create file");
+    }
+
+    // Files we write read back as the same paths.
+    clipboard.write_files(&files).expect("write files");
+    let change = next_change(watch).await;
+    assert!(change.has_format("public.file-url"), "{change:?}");
+    assert_eq!(
+        clipboard.read_files().expect("read files"),
+        Some(files.clone())
+    );
+
+    // Finder may write a file reference URL, which names the file by id; it reads as the path.
+    let reference = autoreleasepool(|_| {
+        let path = NSString::from_str(files[0].to_str().expect("UTF-8 path"));
+        NSURL::fileURLWithPath(&path)
+            .fileReferenceURL()
+            .expect("a reference URL")
+            .absoluteString()
+            .expect("the URL as a string")
+            .to_string()
+    });
+    assert!(reference.starts_with("file:///.file/id="), "{reference}");
+    copy_types(&[("public.file-url", reference.as_bytes())]);
+    next_change(watch).await;
+    assert_eq!(
+        clipboard.read_files().expect("read reference"),
+        Some(vec![files[0].canonicalize().expect("canonical path")])
+    );
+
+    // A copied web link is text, not files, even if an app labels it as a file URL.
+    let url = "https://example.com/file.txt";
+    copy_types(&[
+        ("public.url", url.as_bytes()),
+        ("public.utf8-plain-text", url.as_bytes()),
+    ]);
+    next_change(watch).await;
+    assert_eq!(clipboard.read_files().expect("read files"), None);
+    assert_eq!(
+        clipboard.read_text().expect("read text").as_deref(),
+        Some(url)
+    );
+    copy_types(&[("public.file-url", url.as_bytes())]);
+    next_change(watch).await;
+    assert_eq!(clipboard.read_files().expect("read files"), None);
+
+    // A sensitive marker hides files too.
+    copy_types(&[("public.file-url", b"file:///tmp/a"), (CONCEALED, b"")]);
+    next_change(watch).await;
+    assert!(
+        matches!(
+            clipboard.read_files(),
+            Err(ClipboardError::Sensitive { marker: CONCEALED })
+        ),
+        "concealed files were read"
     );
 }

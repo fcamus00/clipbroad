@@ -7,8 +7,9 @@
 //!
 //! # Threads
 //!
-//! - [`read_text`](Clipboard::read_text) and [`read_image`](Clipboard::read_image): run on a
-//!   short-lived thread so the caller can give up after [`READ_TIMEOUT`]. The app that copied may provide its data lazily, and a frozen app
+//! - [`read_text`](Clipboard::read_text), [`read_image`](Clipboard::read_image) and
+//!   [`read_files`](Clipboard::read_files): run on a short-lived thread so the caller can give up
+//!   after [`READ_TIMEOUT`]. The app that copied may provide its data lazily, and a frozen app
 //!   would otherwise block the caller. A read that times out leaves its thread to finish on its
 //!   own.
 //! - [`watch`](Clipboard::watch): macOS has no change notification, so one thread polls
@@ -19,16 +20,17 @@
 //!
 //! macOS can alert the user when an app reads the pasteboard programmatically. To stay clear of
 //! that, the watcher only reads metadata (`changeCount` and the offered `types`). The content
-//! itself is read only in [`read_text`](Clipboard::read_text) and
-//! [`read_image`](Clipboard::read_image), and only after checking that the pasteboard offers that
-//! kind of content. [`MacosClipboard::access_behavior`] reports what the user allowed.
+//! itself is read only in [`read_text`](Clipboard::read_text),
+//! [`read_image`](Clipboard::read_image) and [`read_files`](Clipboard::read_files), and only after
+//! checking that the pasteboard offers that kind of content. [`MacosClipboard::access_behavior`]
+//! reports what the user allowed.
 //!
 //! # Sensitive content
 //!
 //! `NSPasteboard` has no way to list the types and read the content in one step. So
-//! [`read_text`](Clipboard::read_text) and [`read_image`](Clipboard::read_image) read
-//! `changeCount`, list the types, check them for sensitive markers, read the content, and then
-//! check `changeCount` and the types again. If the
+//! [`read_text`](Clipboard::read_text), [`read_image`](Clipboard::read_image) and
+//! [`read_files`](Clipboard::read_files) read `changeCount`, list the types, check them for
+//! sensitive markers, read the content, and then check `changeCount` and the types again. If the
 //! count moved, another copy happened in between: it starts over, up to [`READ_ATTEMPTS`] times,
 //! and then gives up with an error. The second look at the types catches an app that adds its
 //! marker type after the content within the same copy (writing types one by one does not bump
@@ -44,7 +46,17 @@
 //!
 //! [`read_text`](Clipboard::read_text) only reads `public.utf8-plain-text`, so markup such as
 //! `public.html` next to an image never counts as text.
+//!
+//! # Files
+//!
+//! Finder puts one pasteboard item per copied file, each with a `public.file-url`.
+//! [`read_files`](Clipboard::read_files) turns them into paths with `NSURL`, which also resolves
+//! file reference URLs (`file:///.file/id=...`) to the file's current path. Only `file:` URLs with
+//! no host or `localhost` count; if any item has no such URL (a copied web link has only
+//! `public.url`), the copy is not files and stays text. [`write_files`](Clipboard::write_files)
+//! writes one `NSURL` per path, the way Finder pastes them.
 
+use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
@@ -52,11 +64,13 @@ use std::time::Duration;
 use clipbroad_core::Png;
 use clipbroad_core::sensitive::sensitive_marker;
 use objc2::available;
-use objc2::rc::autoreleasepool;
+use objc2::rc::{Retained, autoreleasepool};
+use objc2::runtime::ProtocolObject;
 use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSPasteboard, NSPasteboardAccessBehavior,
+    NSPasteboardWriting,
 };
-use objc2_foundation::{NSArray, NSData, NSDictionary, NSInteger, NSString, ns_string};
+use objc2_foundation::{NSArray, NSData, NSDictionary, NSInteger, NSString, NSURL, ns_string};
 
 use crate::{ChangeSender, Clipboard, ClipboardChange, ClipboardError, ClipboardWatch};
 
@@ -68,6 +82,9 @@ const IMAGE_PNG: &str = "public.png";
 
 /// The image type read when there is no PNG, converted to PNG: `NSPasteboardTypeTIFF`.
 const IMAGE_TIFF: &str = "public.tiff";
+
+/// A file URL, one per pasteboard item: `NSPasteboardTypeFileURL`.
+const FILE_URL: &str = "public.file-url";
 
 /// Longest wait for the app that owns the pasteboard to hand over its content.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -140,6 +157,32 @@ impl Clipboard for MacosClipboard {
         replace_contents("image", |pasteboard| {
             let data = NSData::with_bytes(png.as_bytes());
             pasteboard.setData_forType(Some(&data), ns_string!(IMAGE_PNG))
+        })
+    }
+
+    fn read_files(&self) -> Result<Option<Vec<PathBuf>>, ClipboardError> {
+        read_with_timeout(read_files_once)
+    }
+
+    fn write_files(&self, paths: &[PathBuf]) -> Result<(), ClipboardError> {
+        // Checked before `replace_contents` clears the pasteboard.
+        let paths = paths
+            .iter()
+            .map(|path| path.to_str().filter(|_| path.is_absolute()))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| ClipboardError::Backend {
+                message: "a file to put on the clipboard has a relative or non-UTF-8 path"
+                    .to_owned(),
+                source: None,
+            })?;
+        replace_contents("files", |pasteboard| {
+            let urls: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = paths
+                .iter()
+                .map(|path| {
+                    ProtocolObject::from_retained(NSURL::fileURLWithPath(&NSString::from_str(path)))
+                })
+                .collect();
+            pasteboard.writeObjects(&NSArray::from_retained_slice(&urls))
         })
     }
 
@@ -300,6 +343,48 @@ fn read_png_once(pasteboard: &NSPasteboard) -> Result<Option<Png>, ClipboardErro
     Png::try_from(bytes)
         .map(Some)
         .map_err(|error| ClipboardError::backend("reading the pasteboard image", error))
+}
+
+/// Reads the file URL of every pasteboard item, only if the pasteboard offers one (see module
+/// docs).
+fn read_files_once(pasteboard: &NSPasteboard) -> Result<Option<Vec<PathBuf>>, ClipboardError> {
+    let file_url = ns_string!(FILE_URL);
+    if pasteboard
+        .availableTypeFromArray(&NSArray::from_slice(&[file_url]))
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let Some(items) = pasteboard.pasteboardItems() else {
+        return nothing_read();
+    };
+    let mut paths = Vec::new();
+    for item in &items {
+        // An item without a file URL (or one whose data cannot be read): not a file copy.
+        let Some(url) = item.stringForType(file_url) else {
+            return nothing_read();
+        };
+        let Some(path) = local_path(&url) else {
+            return Ok(None);
+        };
+        paths.push(path);
+    }
+    Ok((!paths.is_empty()).then_some(paths))
+}
+
+/// The path of a local `file:` URL, resolving a file reference URL; `None` for any other URL or a
+/// reference to a file that no longer exists.
+fn local_path(url: &NSString) -> Option<PathBuf> {
+    let url = NSURL::URLWithString(url)?;
+    let local = url.isFileURL()
+        && url.host().is_none_or(|host| {
+            host.is_empty() || host.to_string().eq_ignore_ascii_case("localhost")
+        });
+    if !local {
+        return None;
+    }
+    let path = url.filePathURL()?.path()?;
+    Some(PathBuf::from(path.to_string()))
 }
 
 /// The result when the pasteboard offered a type but handed over no data: an error if the user

@@ -9,6 +9,9 @@
 mod dib;
 mod error;
 pub mod fake;
+// Windows only, but plain Rust: compiled for tests everywhere so its tests run on every platform.
+#[cfg(any(windows, test))]
+mod hdrop;
 #[cfg(target_os = "macos")]
 pub mod macos;
 mod watch;

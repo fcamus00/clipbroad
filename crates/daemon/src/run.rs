@@ -356,7 +356,7 @@ fn report_write(
     let from = from.fmt_short();
     match written {
         Ok(()) => info!(%from, ?kind, size, %hash, "applied clip"),
-        // macOS and Windows do not write files yet.
+        // A backend without support for this kind of content (the trait's default).
         Err(ClipboardError::Unsupported { content }) => warn!(
             %from, ?kind, size, %hash,
             "this machine's clipboard does not support {content} yet, clip not applied"

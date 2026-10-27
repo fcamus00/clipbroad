@@ -12,11 +12,12 @@
 //!
 //! # Sensitive content
 //!
-//! [`read_text`](Clipboard::read_text) and [`read_image`](Clipboard::read_image) open the clipboard
-//! once, list the formats, read the DWORD of the `CanUploadToCloudClipboard` /
-//! `CanIncludeInClipboardHistory` flags, check them for sensitive markers and read the content, all
-//! before closing it. While the clipboard is open no other app can change it, so the check and the
-//! content always belong to the same copy. A flag whose value cannot be read fails the read.
+//! [`read_text`](Clipboard::read_text), [`read_image`](Clipboard::read_image) and
+//! [`read_files`](Clipboard::read_files) open the clipboard once, list the formats, read the DWORD
+//! of the `CanUploadToCloudClipboard` / `CanIncludeInClipboardHistory` flags, check them for
+//! sensitive markers and read the content, all before closing it. While the clipboard is open no
+//! other app can change it, so the check and the content always belong to the same copy. A flag
+//! whose value cannot be read fails the read.
 //!
 //! # Images
 //!
@@ -32,12 +33,21 @@
 //! `CF_TEXT` and `CF_OEMTEXT`), so markup such as `HTML Format` next to an image never counts as
 //! text.
 //!
+//! # Files
+//!
+//! [`read_files`](Clipboard::read_files) reads `CF_HDROP`, the list of paths Explorer puts on the
+//! clipboard when files are copied (see the `hdrop` module).
+//! [`write_files`](Clipboard::write_files) writes the same format with UTF-16 paths, plus
+//! `Preferred DropEffect` set to `DROPEFFECT_COPY`, so Explorer pastes a copy and never moves the
+//! files out of the cache.
+//!
 //! # Threads
 //!
 //! - Reads and writes ([`read_text`](Clipboard::read_text), [`write_text`](Clipboard::write_text)
-//!   and their image versions): run on a short-lived thread so the caller can give up after [`OPERATION_TIMEOUT`]. Besides the busy
-//!   retries, reading text that the source app renders on demand (delayed rendering) waits for that
-//!   app, and a frozen app would otherwise block the caller. An operation that times out leaves its
+//!   and their image and file versions): run on a short-lived thread so the caller can give up
+//!   after [`OPERATION_TIMEOUT`]. Besides the busy retries, reading text that the source app
+//!   renders on demand (delayed rendering) waits for that app, and a frozen app would otherwise
+//!   block the caller. An operation that times out leaves its
 //!   thread to finish on its own, so a timed-out write may still land later.
 //! - [`watch`](Clipboard::watch): one thread with a message-only window registered with
 //!   `AddClipboardFormatListener`, which receives a `WM_CLIPBOARDUPDATE` per change. A timer wakes
@@ -45,9 +55,11 @@
 //!   unregisters and destroys the window and ends, even if the clipboard never changes again.
 //!   Windows may notify several times for one copy; each notification is reported.
 
-use std::ffi::c_void;
+use std::ffi::{OsString, c_void};
 use std::io;
 use std::marker::PhantomData;
+use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+use std::path::PathBuf;
 use std::ptr;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
@@ -76,6 +88,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use windows_sys::w;
 
 use crate::dib::{self, DibError};
+use crate::hdrop;
 use crate::{ChangeSender, Clipboard, ClipboardChange, ClipboardError, ClipboardWatch};
 
 /// Longest a read or write may block its caller.
@@ -95,6 +108,9 @@ const STOP_TIMER_ID: usize = 1;
 
 /// Longest registered format name Windows stores, plus the terminating NUL.
 const FORMAT_NAME_CAPACITY: usize = 256;
+
+/// `DROPEFFECT_COPY`, the value of `Preferred DropEffect` that makes a paste copy the files.
+const DROPEFFECT_COPY: u32 = 1;
 
 /// The Windows clipboard.
 #[derive(Debug, Clone, Copy, Default)]
@@ -123,6 +139,28 @@ impl Clipboard for WindowsClipboard {
     fn write_image(&self, png: &Png) -> Result<(), ClipboardError> {
         let png = png.clone();
         run_with_timeout("win-write", move || write_png(png.as_bytes()))
+    }
+
+    fn read_files(&self) -> Result<Option<Vec<PathBuf>>, ClipboardError> {
+        run_with_timeout("win-read", || read_unless_sensitive(read_file_list))
+    }
+
+    fn write_files(&self, paths: &[PathBuf]) -> Result<(), ClipboardError> {
+        if paths.iter().any(|path| !path.is_absolute()) {
+            return Err(ClipboardError::Backend {
+                message: "a file to put on the clipboard has a relative path".to_owned(),
+                source: None,
+            });
+        }
+        let wide: Vec<Vec<u16>> = paths
+            .iter()
+            .map(|path| path.as_os_str().encode_wide().collect())
+            .collect();
+        let list = hdrop::encode(&wide).ok_or_else(|| ClipboardError::Backend {
+            message: "a file to put on the clipboard has a NUL in its path".to_owned(),
+            source: None,
+        })?;
+        run_with_timeout("win-write", move || write_file_list(&list))
     }
 
     fn watch(&self) -> Result<ClipboardWatch, ClipboardError> {
@@ -218,7 +256,7 @@ enum ClipboardImage {
 }
 
 fn read_png() -> Result<Option<Png>, ClipboardError> {
-    let png_format = png_format()?;
+    let png_format = registered_format("PNG")?;
     let image = read_unless_sensitive(|open| {
         if is_offered(open, png_format) {
             return Ok(Some(ClipboardImage::Png(read_bytes(open, png_format)?)));
@@ -260,7 +298,7 @@ fn read_png() -> Result<Option<Png>, ClipboardError> {
 }
 
 fn write_png(png: &[u8]) -> Result<(), ClipboardError> {
-    let png_format = png_format()?;
+    let png_format = registered_format("PNG")?;
     // For apps that cannot paste a PNG (Paint and many older apps). Windows derives `CF_DIBV5`
     // and `CF_BITMAP` from it.
     let bitmap = match dib::png_to_dib(png) {
@@ -281,14 +319,41 @@ fn write_png(png: &[u8]) -> Result<(), ClipboardError> {
     bitmap.map_or(Ok(()), |bitmap| bitmap.set_as(CF_DIB.into()))
 }
 
-/// The id of the registered `PNG` clipboard format.
+fn read_file_list(open: &OpenedClipboard) -> Result<Option<Vec<PathBuf>>, ClipboardError> {
+    if !is_offered(open, CF_HDROP.into()) {
+        return Ok(None);
+    }
+    let Some(paths) = hdrop::decode(&read_bytes(open, CF_HDROP.into())?) else {
+        tracing::debug!("the clipboard CF_HDROP holds no readable paths; treating it as no files");
+        return Ok(None);
+    };
+    Ok(Some(
+        paths
+            .iter()
+            .map(|path| PathBuf::from(OsString::from_wide(path)))
+            .collect(),
+    ))
+}
+
+fn write_file_list(list: &[u8]) -> Result<(), ClipboardError> {
+    let drop_effect_format = registered_format("Preferred DropEffect")?;
+    let list_memory = GlobalMemory::with_bytes(list)?;
+    let drop_effect = GlobalMemory::with_bytes(&DROPEFFECT_COPY.to_le_bytes())?;
+    let open = OpenedClipboard::open()?;
+    empty_clipboard(&open)?;
+    list_memory.set_as(CF_HDROP.into())?;
+    drop_effect.set_as(drop_effect_format)
+}
+
+/// The id of the registered clipboard format `name`.
 #[allow(unsafe_code)] // Win32 FFI.
-fn png_format() -> Result<u32, ClipboardError> {
+fn registered_format(name: &str) -> Result<u32, ClipboardError> {
+    let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
     // SAFETY: plain call with a valid NUL-terminated string. Registering an existing name returns
     // its id.
-    match unsafe { RegisterClipboardFormatW(w!("PNG")) } {
+    match unsafe { RegisterClipboardFormatW(wide.as_ptr()) } {
         0 => Err(ClipboardError::backend(
-            "registering the PNG clipboard format",
+            format!("registering the {name} clipboard format"),
             io::Error::last_os_error(),
         )),
         format => Ok(format),
@@ -713,14 +778,8 @@ mod tests {
         assert_eq!(format_name(0x200), "#512");
     }
 
-    /// The id of the registered format `name`.
-    #[allow(unsafe_code)] // Win32 FFI.
     fn registered(name: &str) -> u32 {
-        let name: Vec<u16> = name.encode_utf16().chain([0]).collect();
-        // SAFETY: plain call with a valid NUL-terminated string.
-        let format = unsafe { RegisterClipboardFormatW(name.as_ptr()) };
-        assert_ne!(format, 0, "{}", io::Error::last_os_error());
-        format
+        registered_format(name).expect("register the format")
     }
 
     /// `CF_UNICODETEXT` data for `text`.
@@ -807,7 +866,7 @@ mod tests {
         let html = registered("HTML Format");
         write_formats(&[
             (html, b"<img src=\"x.png\">\0"),
-            (png_format().expect("PNG format"), png.as_bytes()),
+            (registered("PNG"), png.as_bytes()),
         ]);
         change_with(watch, "HTML Format").await;
         assert_eq!(clipboard.read_text().expect("read text"), None);
@@ -818,12 +877,62 @@ mod tests {
 
         // A sensitive marker hides the image too.
         write_formats(&[
-            (png_format().expect("PNG format"), png.as_bytes()),
+            (registered("PNG"), png.as_bytes()),
             (registered(exclude), &0_u32.to_le_bytes()),
         ]);
         change_with(watch, exclude).await;
         assert!(matches!(
             clipboard.read_image(),
+            Err(ClipboardError::Sensitive { marker }) if marker == exclude
+        ));
+    }
+
+    /// The file part of the smoke test.
+    async fn check_files(clipboard: &WindowsClipboard, watch: &mut ClipboardWatch) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let files: Vec<PathBuf> = ["a b.txt", "ñandú 🦀.txt"]
+            .into_iter()
+            .map(|name| dir.path().join(name))
+            .collect();
+        for file in &files {
+            std::fs::write(file, "contents").expect("create file");
+        }
+
+        // Files we write read back as the same paths, and paste as a copy.
+        clipboard.write_files(&files).expect("write files");
+        let change = change_with(watch, "CF_HDROP").await;
+        assert!(change.has_format("Preferred DropEffect"), "{change:?}");
+        assert_eq!(
+            clipboard.read_files().expect("read files"),
+            Some(files.clone())
+        );
+
+        // A copied web link is text, not files.
+        let url = "https://example.com/file.txt";
+        write_formats(&[
+            (CF_UNICODETEXT.into(), &utf16(url)),
+            (registered("UniformResourceLocatorW"), &utf16(url)),
+        ]);
+        change_with(watch, "UniformResourceLocatorW").await;
+        assert_eq!(clipboard.read_files().expect("read files"), None);
+        assert_eq!(
+            clipboard.read_text().expect("read text").as_deref(),
+            Some(url)
+        );
+
+        // A sensitive marker hides files too.
+        let wide: Vec<Vec<u16>> = files
+            .iter()
+            .map(|file| file.as_os_str().encode_wide().collect())
+            .collect();
+        let exclude = "ExcludeClipboardContentFromMonitorProcessing";
+        write_formats(&[
+            (CF_HDROP.into(), &hdrop::encode(&wide).expect("valid paths")),
+            (registered(exclude), &0_u32.to_le_bytes()),
+        ]);
+        change_with(watch, exclude).await;
+        assert!(matches!(
+            clipboard.read_files(),
             Err(ClipboardError::Sensitive { marker }) if marker == exclude
         ));
     }
@@ -888,6 +997,7 @@ mod tests {
         }
 
         check_images(&clipboard, &mut watch).await;
+        check_files(&clipboard, &mut watch).await;
 
         drop(watch);
         let deadline = Instant::now() + STOP_CHECK_INTERVAL * 5;
