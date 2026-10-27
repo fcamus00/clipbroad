@@ -15,10 +15,17 @@ pub fn system_clipboard() -> Result<Arc<dyn Clipboard>> {
 }
 
 /// The system clipboard of this machine.
-// TODO(phase 1): a `#[cfg(target_os = ...)]` function per backend, like the Linux one:
-// - macOS: polling `NSPasteboard.changeCount`.
-// - Windows: `AddClipboardFormatListener`.
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+// Never fails on macOS, but keeps the signature every platform shares.
+#[allow(clippy::unnecessary_wraps)]
+pub fn system_clipboard() -> Result<Arc<dyn Clipboard>> {
+    Ok(Arc::new(clipbroad_clipboard::macos::MacosClipboard))
+}
+
+/// The system clipboard of this machine.
+// TODO(phase 1): a `#[cfg(target_os = "windows")]` function like the Linux one, using
+// `AddClipboardFormatListener`.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn system_clipboard() -> Result<Arc<dyn Clipboard>> {
     anyhow::bail!(
         "the clipboard backend for {} is not implemented yet; \

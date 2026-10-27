@@ -6,6 +6,8 @@
 
 mod error;
 pub mod fake;
+#[cfg(target_os = "macos")]
+pub mod macos;
 mod watch;
 #[cfg(target_os = "linux")]
 pub mod wayland;
