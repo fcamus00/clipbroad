@@ -26,6 +26,9 @@ pub struct Config {
     /// Clips up to this size (in bytes) travel inside the clip message itself. At most
     /// [`Config::MAX_INLINE_MAX_BYTES`].
     pub inline_max_bytes: NonZeroU64,
+    /// Find paired machines on the local network with mDNS. When off, this node sends no multicast
+    /// traffic and only dials peers at their static `addrs`.
+    pub mdns: bool,
     /// Paired machines.
     pub peers: Vec<Peer>,
 }
@@ -62,6 +65,7 @@ impl Default for Config {
         Self {
             listen_port: Self::DEFAULT_LISTEN_PORT,
             inline_max_bytes: Self::DEFAULT_INLINE_MAX_BYTES,
+            mdns: true,
             peers: Vec::new(),
         }
     }
@@ -206,6 +210,7 @@ mod tests {
         assert_eq!(config, Config::default());
         assert_eq!(config.listen_port.get(), 42_420);
         assert_eq!(config.inline_max_bytes.get(), 8 * 1024 * 1024);
+        assert!(config.mdns);
         assert_eq!(config.peers, []);
     }
 
@@ -214,6 +219,7 @@ mod tests {
         let config = Config::from_toml_str(EXAMPLE).expect("docs/config.example.toml is valid");
         assert_eq!(config.listen_port.get(), 42_420);
         assert_eq!(config.inline_max_bytes.get(), 8_388_608);
+        assert!(config.mdns);
         assert_eq!(config.peers.len(), 2);
 
         let laptop = &config.peers[0];
@@ -239,6 +245,12 @@ mod tests {
         let config = Config::from_toml_str("listen_port = 5000").expect("valid");
         assert_eq!(config.listen_port.get(), 5000);
         assert_eq!(config.inline_max_bytes, Config::DEFAULT_INLINE_MAX_BYTES);
+    }
+
+    #[test]
+    fn mdns_can_be_turned_off() {
+        let config = Config::from_toml_str("mdns = false").expect("valid");
+        assert!(!config.mdns);
     }
 
     #[test]

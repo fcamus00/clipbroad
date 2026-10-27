@@ -6,18 +6,20 @@
 //!
 //! # Network
 //!
-//! The endpoint uses iroh's `Minimal` preset: no relay servers and no address lookup (DNS or
-//! pkarr), so no traffic goes to third-party services. Peers are dialed only at the static
-//! addresses in the config. Only peers in the config can connect; anyone else is rejected right
-//! after the TLS handshake.
+//! The endpoint uses iroh's `Minimal` preset: no relay servers and no DNS or pkarr address
+//! lookup, so no traffic goes to third-party services. Peers are dialed at the static addresses
+//! in the config and, if `config.mdns` is on, at the addresses they announce on the LAN with mDNS
+//! (see [`MDNS_SERVICE`]). Discovery only finds addresses: only peers in the config can connect,
+//! and anyone else is rejected right after the TLS handshake.
 //!
 //! # Connections
 //!
-//! Each node dials every peer it has addresses for, and accepts connections from them. Both sides
-//! may dial at once and end up with two connections. Only the node with the smaller id decides
-//! which one stays: it keeps the one that most recently finished the `Hello` exchange and closes
-//! the older one. The other node keeps whatever is still open. "Newest wins" also handles a peer
-//! that restarted while its old connection still looks alive. A lost connection is dialed again
+//! Each node dials every peer it can find (any peer when mDNS is on, otherwise only those with
+//! static addresses), and accepts connections from them. Both sides may dial at once and end up
+//! with two connections. Only the node with the smaller id decides which one stays: it keeps the
+//! one that most recently finished the `Hello` exchange and closes the older one. The other node
+//! keeps whatever is still open. "Newest wins" also handles a peer that restarted while its old
+//! connection still looks alive. A lost connection is dialed again
 //! with exponential backoff (0.5 s up to 30 s).
 //!
 //! Inside a connection each side opens one unidirectional stream and writes frames on it: first
@@ -54,14 +56,19 @@ use iroh::{
         AfterHandshakeOutcome, BindError, BindOpts, Builder, Connection, EndpointHooks, presets,
     },
 };
+use iroh_mdns_address_lookup::MdnsAddressLookup;
 use tokio::{
     sync::{broadcast, mpsc},
     task::JoinSet,
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// ALPN of the clipbroad protocol. Both sides must offer it to connect.
 pub const ALPN: &[u8] = b"clipbroad/1";
+
+/// mDNS service each node announces itself under, as `<id>._clipbroad._udp.local` with its
+/// addresses. Its own name keeps clipbroad apart from other iroh apps on the LAN.
+pub const MDNS_SERVICE: &str = "clipbroad";
 
 /// How many received clips can wait for the daemon before the peers are slowed down.
 const INBOX_CAPACITY: usize = 64;
@@ -118,6 +125,9 @@ impl Node {
     /// Starts listening on `config.listen_port` (all interfaces, IPv4 and IPv6 if available) and
     /// starts connecting to `config.peers`.
     ///
+    /// If `config.mdns` is on but mDNS cannot start (for example, no network interface allows
+    /// multicast), the node logs a warning and runs without it.
+    ///
     /// Returns the node and the receiver of incoming clips. The receiver must be drained: when it
     /// is full, peers wait.
     ///
@@ -134,9 +144,15 @@ impl Node {
     ) -> Result<(Self, mpsc::Receiver<Received>), Error> {
         let port = config.listen_port.get();
         let allowlist = config.peers.iter().map(|peer| peer.id).collect();
-        let endpoint = endpoint_builder(identity, port)
+        let mut builder = endpoint_builder(identity, port)
             .alpns(vec![ALPN.to_vec()])
-            .hooks(Allowlist(allowlist))
+            .hooks(Allowlist(allowlist));
+        let mdns = config.mdns.then(|| start_mdns(identity)).flatten();
+        let discovery = mdns.is_some();
+        if let Some(mdns) = mdns {
+            builder = builder.address_lookup(mdns);
+        }
+        let endpoint = builder
             .bind()
             .await
             .map_err(|source| Error::Bind { port, source })?;
@@ -154,6 +170,7 @@ impl Node {
                 endpoint.clone(),
                 peer.id,
                 &peer.addrs,
+                discovery,
                 outbox.clone(),
                 inbox_tx.clone(),
             );
@@ -216,6 +233,25 @@ fn endpoint_builder(identity: &IdentityKey, port: u16) -> Builder {
             BindOpts::default().set_is_required(false),
         )
         .expect("a single IPv6 bind address is valid")
+}
+
+/// Starts announcing this node on the LAN and listening for other nodes' announcements. Returns
+/// `None`, after a warning, if the multicast sockets cannot be set up.
+fn start_mdns(identity: &IdentityKey) -> Option<MdnsAddressLookup> {
+    let id = SecretKey::from_bytes(&identity.to_bytes()).public();
+    match MdnsAddressLookup::builder()
+        .service_name(MDNS_SERVICE)
+        .build(id)
+    {
+        Ok(mdns) => {
+            info!("LAN discovery (mDNS) on");
+            Some(mdns)
+        }
+        Err(e) => {
+            warn!(error = %e, "LAN discovery (mDNS) could not start; only static addresses work");
+            None
+        }
+    }
 }
 
 /// Rejects connections from anyone who is not a configured peer.

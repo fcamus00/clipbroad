@@ -29,13 +29,21 @@ listen_port = 42420
 # más grande que este valor no se sincroniza (queda un warning en el log).
 inline_max_bytes = 8388608
 
+# Descubrimiento en la LAN con mDNS. Con `true`, este nodo anuncia su id y sus direcciones en la red
+# local y encuentra a los peers emparejados aunque cambien de IP; no hacen falta `addrs` para ellos.
+# Cualquiera en la misma LAN puede ver ese anuncio (el id es público y no da acceso: solo se aceptan
+# los peers de esta lista). No usa ningún servicio de terceros. Con `false` no se envía tráfico
+# multicast y solo se conecta a los peers por sus `addrs`.
+mdns = true
+
 # Máquinas emparejadas. Normalmente las escribe `clipbroad pair`; se pueden editar a mano.
 # Cada una lleva:
 #   id     identidad pública del peer (64 caracteres hexadecimales en minúsculas). Obligatorio y
 #          sin repetir.
 #   name   etiqueta para logs y `clipbroad status`. Opcional.
 #   addrs  direcciones "ip:puerto" para conectar directo cuando el descubrimiento en la LAN no llega,
-#          por ejemplo la IP de Tailscale (100.x.y.z) o su IPv6 (entre corchetes). Opcional.
+#          por ejemplo la IP de Tailscale (100.x.y.z) o su IPv6 (entre corchetes). Opcional. Un peer
+#          sin `addrs` solo se encuentra por mDNS (o cuando él se conecta a este nodo).
 
 [[peers]]
 name = "laptop"
