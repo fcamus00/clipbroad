@@ -21,11 +21,23 @@
 //! that, the watcher only reads metadata (`changeCount` and the offered `types`). The text itself
 //! is read only in [`read_text`](Clipboard::read_text), and only after checking that the
 //! pasteboard offers text. [`MacosClipboard::access_behavior`] reports what the user allowed.
+//!
+//! # Sensitive content
+//!
+//! `NSPasteboard` has no way to list the types and read the text in one step. So
+//! [`read_text`](Clipboard::read_text) reads `changeCount`, lists the types, checks them for
+//! sensitive markers, reads the text, and then checks `changeCount` and the types again. If the
+//! count moved, another copy happened in between: it starts over, up to [`READ_ATTEMPTS`] times,
+//! and then gives up with an error. The second look at the types catches an app that adds its
+//! marker type after the text within the same copy (writing types one by one does not bump
+//! `changeCount`). An app that adds the marker even later, after that second look, is not caught;
+//! password managers that follow nspasteboard.org declare all types before writing any data.
 
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
+use clipbroad_core::sensitive::sensitive_marker;
 use objc2::available;
 use objc2::rc::autoreleasepool;
 use objc2_app_kit::{NSPasteboard, NSPasteboardAccessBehavior};
@@ -38,6 +50,9 @@ const TEXT_UTF8: &str = "public.utf8-plain-text";
 
 /// Longest wait for the app that owns the pasteboard to hand over its content.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How many times a read starts over because another copy happened during it.
+const READ_ATTEMPTS: usize = 3;
 
 /// How often a watch checks `changeCount` and whether its consumer is gone.
 const POLL_INTERVAL: Duration = Duration::from_millis(300);
@@ -140,31 +155,65 @@ impl Clipboard for MacosClipboard {
     }
 }
 
-/// Runs on a read thread. Requests the text only if the pasteboard offers it, so an image or a
-/// file copy is never read.
+/// Runs on a read thread. Reads the text of one pasteboard content, checking it for sensitive
+/// markers before and after (see module docs).
 fn read_string() -> Result<Option<String>, ClipboardError> {
     autoreleasepool(|_| {
         let pasteboard = NSPasteboard::generalPasteboard();
-        let text_type = ns_string!(TEXT_UTF8);
-        if pasteboard
-            .availableTypeFromArray(&NSArray::from_slice(&[text_type]))
-            .is_none()
-        {
-            return Ok(None);
-        }
-        match pasteboard.stringForType(text_type) {
-            Some(text) => Ok(Some(text.to_string())),
-            None if MacosClipboard.access_behavior() == Some(AccessBehavior::AlwaysDeny) => {
-                Err(ClipboardError::Unavailable {
-                    reason: "macOS denies clipboard access to this app; allow it in System \
-                             Settings > Privacy & Security > Paste from Other Apps"
-                        .to_owned(),
-                })
+        for _ in 0..READ_ATTEMPTS {
+            let count = pasteboard.changeCount();
+            check_not_sensitive(&pasteboard)?;
+            let text = read_string_once(&pasteboard)?;
+            check_not_sensitive(&pasteboard)?;
+            if pasteboard.changeCount() == count {
+                return Ok(text);
             }
-            // The pasteboard changed since the check, or the text could not be converted.
-            None => Ok(None),
         }
+        Err(ClipboardError::Backend {
+            message: format!(
+                "the clipboard changed during each of {READ_ATTEMPTS} attempts to read it"
+            ),
+            source: None,
+        })
     })
+}
+
+/// Fails if the pasteboard's types hold a sensitive marker or cannot be listed.
+fn check_not_sensitive(pasteboard: &NSPasteboard) -> Result<(), ClipboardError> {
+    let Some(formats) = type_names(pasteboard) else {
+        return Err(ClipboardError::Backend {
+            message: "could not list the pasteboard types to check for sensitive content"
+                .to_owned(),
+            source: None,
+        });
+    };
+    match sensitive_marker(&formats) {
+        Some(marker) => Err(ClipboardError::Sensitive { marker }),
+        None => Ok(()),
+    }
+}
+
+/// Requests the text only if the pasteboard offers it, so an image or a file copy is never read.
+fn read_string_once(pasteboard: &NSPasteboard) -> Result<Option<String>, ClipboardError> {
+    let text_type = ns_string!(TEXT_UTF8);
+    if pasteboard
+        .availableTypeFromArray(&NSArray::from_slice(&[text_type]))
+        .is_none()
+    {
+        return Ok(None);
+    }
+    match pasteboard.stringForType(text_type) {
+        Some(text) => Ok(Some(text.to_string())),
+        None if MacosClipboard.access_behavior() == Some(AccessBehavior::AlwaysDeny) => {
+            Err(ClipboardError::Unavailable {
+                reason: "macOS denies clipboard access to this app; allow it in System \
+                         Settings > Privacy & Security > Paste from Other Apps"
+                    .to_owned(),
+            })
+        }
+        // The pasteboard changed since the check, or the text could not be converted.
+        None => Ok(None),
+    }
 }
 
 /// Runs on the watcher thread: reports each new `changeCount` until the consumer is gone.
@@ -199,11 +248,16 @@ fn poll_changes(mut last_count: NSInteger, changes: &ChangeSender) {
 /// The types offered by all pasteboard items, without reading any data. If macOS cannot list
 /// them, no formats: the daemon never syncs such a change, so this fails closed.
 fn formats_of(pasteboard: &NSPasteboard) -> Vec<String> {
-    let Some(types) = pasteboard.types() else {
+    type_names(pasteboard).unwrap_or_else(|| {
         tracing::warn!("could not list the pasteboard types; reporting the change with no formats");
-        return Vec::new();
-    };
-    types.iter().map(|format| format.to_string()).collect()
+        Vec::new()
+    })
+}
+
+/// The types offered by all pasteboard items, or `None` if macOS cannot list them.
+fn type_names(pasteboard: &NSPasteboard) -> Option<Vec<String>> {
+    let types = pasteboard.types()?;
+    Some(types.iter().map(|format| format.to_string()).collect())
 }
 
 #[cfg(test)]

@@ -13,7 +13,10 @@
 use std::time::Duration;
 
 use clipbroad_clipboard::macos::{AccessBehavior, MacosClipboard};
-use clipbroad_clipboard::{Clipboard, ClipboardChange, ClipboardWatch};
+use clipbroad_clipboard::{Clipboard, ClipboardChange, ClipboardError, ClipboardWatch};
+use objc2::rc::autoreleasepool;
+use objc2_app_kit::NSPasteboard;
+use objc2_foundation::{NSArray, NSString, ns_string};
 
 /// A few polling ticks.
 const EVENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -24,6 +27,24 @@ async fn next_change(watch: &mut ClipboardWatch) -> ClipboardChange {
         .expect("no change event in time")
         .expect("watch ended")
         .expect("watch failed")
+}
+
+/// Copies `text` marked as concealed, the way nspasteboard.org asks password managers to: declare
+/// every type first, then write the data.
+#[allow(unsafe_code)] // `declareTypes:owner:` is unsafe only because of the owner's type.
+fn copy_concealed(text: &str) {
+    autoreleasepool(|_| {
+        let pasteboard = NSPasteboard::generalPasteboard();
+        let text_type = ns_string!("public.utf8-plain-text");
+        let concealed = ns_string!("org.nspasteboard.ConcealedType");
+        // SAFETY: no owner, so there is no owner type to get wrong.
+        unsafe {
+            pasteboard.declareTypes_owner(&NSArray::from_slice(&[text_type, concealed]), None)
+        };
+        let text = NSString::from_str(text);
+        assert!(pasteboard.setString_forType(&text, text_type));
+        assert!(pasteboard.setString_forType(ns_string!(""), concealed));
+    });
 }
 
 #[tokio::test]
@@ -58,5 +79,21 @@ async fn real_clipboard_round_trip_and_watch() {
     assert_eq!(
         clipboard.read_text().expect("read empty").as_deref(),
         Some("")
+    );
+
+    copy_concealed("hunter2");
+    let change = next_change(&mut watch).await;
+    assert!(
+        change.has_format("org.nspasteboard.ConcealedType"),
+        "{change:?}"
+    );
+    assert!(
+        matches!(
+            clipboard.read_text(),
+            Err(ClipboardError::Sensitive {
+                marker: "org.nspasteboard.ConcealedType"
+            })
+        ),
+        "concealed text was read"
     );
 }

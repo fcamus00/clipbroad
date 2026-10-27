@@ -7,8 +7,8 @@ use crate::ClipboardError;
 /// One observed change of the system clipboard.
 ///
 /// It says *that* the clipboard changed and which formats it now offers, but carries no content.
-/// To get the content, call [`Clipboard::read_text`](crate::Clipboard::read_text) after deciding
-/// that reading is wanted (for example, after checking `formats` for sensitive-content markers).
+/// To get the content, call [`Clipboard::read_text`](crate::Clipboard::read_text), which refuses
+/// content marked as sensitive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardChange {
     /// The formats offered by the clipboard right after the change, using each platform's
@@ -21,7 +21,9 @@ pub struct ClipboardChange {
     /// - **Windows:** registered formats by their registered name (`GetClipboardFormatNameW`),
     ///   e.g. `ExcludeClipboardContentFromMonitorProcessing`; predefined formats by their constant
     ///   name, e.g. `CF_UNICODETEXT`, `CF_HDROP`; any other unnamed format as `#` plus its decimal
-    ///   id, e.g. `#49999`.
+    ///   id, e.g. `#49999`. Flag formats such as `CanUploadToCloudClipboard` appear by name only:
+    ///   reading their value could block the watcher on the app that copied, so only
+    ///   [`read_text`](crate::Clipboard::read_text) reads it.
     ///
     /// Empty when the clipboard became empty (cleared, or on Wayland the owning app exited).
     pub formats: Vec<String>,

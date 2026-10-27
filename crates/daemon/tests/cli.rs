@@ -34,6 +34,7 @@ fn watch_fake_prints_one_line_per_change() {
             r#"[text/plain;charset=utf-8]  "hello from clipbroad" (20 chars)"#,
             r#"[text/plain;charset=utf-8]  "two lines\nand a\ttab" (19 chars)"#,
             r#"[text/plain;charset=utf-8]  "A long text with multibyte characters (ñandú, 🦀) shows that the preview is cut o"… (114 chars)"#,
+            "[text/plain;charset=utf-8, x-kde-passwordManagerHint]  (sensitive: x-kde-passwordManagerHint, not read or synced)",
             "[image/png]  (no text)",
             "[]  (clipboard empty)",
         ]
@@ -52,10 +53,11 @@ fn help_describes_commands_and_hides_fake() {
 
     let run_help = stdout(clipbroad(&["run", "--help"]));
     assert!(run_help.contains("--config <FILE>"), "{run_help}");
-    assert!(run_help.contains("passwords"), "{run_help}");
+    assert!(run_help.contains("password manager"), "{run_help}");
     assert!(!run_help.contains("--fake"), "{run_help}");
 
     let watch_help = stdout(clipbroad(&["watch", "--help"]));
     assert!(watch_help.contains("preview of its text"), "{watch_help}");
+    assert!(watch_help.contains("sensitive"), "{watch_help}");
     assert!(!watch_help.contains("--fake"), "{watch_help}");
 }

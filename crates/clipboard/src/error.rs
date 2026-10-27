@@ -3,7 +3,8 @@ use std::error::Error;
 /// Error returned by [`Clipboard`](crate::Clipboard) operations.
 ///
 /// "The clipboard is empty" and "the clipboard holds no text" are **not** errors; see
-/// [`Clipboard::read_text`](crate::Clipboard::read_text).
+/// [`Clipboard::read_text`](crate::Clipboard::read_text). Sensitive content is
+/// ([`ClipboardError::Sensitive`]), so a caller that forgets to handle it still gets no text.
 #[derive(Debug, thiserror::Error)]
 pub enum ClipboardError {
     /// The clipboard cannot be used at all in this session, and retrying will not help until the
@@ -20,6 +21,14 @@ pub enum ClipboardError {
     /// before returning this.
     #[error("clipboard is busy (held by another application)")]
     Busy,
+
+    /// The content is marked as sensitive (see [`clipbroad_core::sensitive`]), so the text was
+    /// not read. Not a failure: the content must just never leave this machine.
+    #[error("clipboard content is marked as sensitive ({marker}); not read")]
+    Sensitive {
+        /// The marker found among the offered formats, e.g. `x-kde-passwordManagerHint`.
+        marker: &'static str,
+    },
 
     /// Any other failure reported by the OS or the backend library.
     #[error("clipboard backend error: {message}")]

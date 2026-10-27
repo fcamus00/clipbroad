@@ -17,6 +17,13 @@
 //!   wakes the first one up. Both end shortly after the watch is dropped, even if the clipboard
 //!   never changes again.
 //!
+//! # Sensitive content
+//!
+//! [`read_text`](Clipboard::read_text) asks the compositor for the current selection and gets one
+//! data offer with its fixed list of MIME types. It checks that list for sensitive markers and, if
+//! there are none, reads the text from **that same offer**. A newer copy brings a new offer, so the
+//! checked list and the text always belong to the same content.
+//!
 //! # Known compositor gaps
 //!
 //! Hyprland (checked on 0.56.2) sends no data-control event when the clipboard is cleared or when
@@ -30,6 +37,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use clipbroad_core::sensitive::sensitive_marker;
 use rustix::event::{PollFd, PollFlags, Timespec};
 use wl_clipboard_rs::watch::{ClipboardEvent, Watcher};
 use wl_clipboard_rs::{copy, paste, watch};
@@ -74,17 +82,38 @@ impl WaylandClipboard {
 
 impl Clipboard for WaylandClipboard {
     fn read_text(&self) -> Result<Option<String>, ClipboardError> {
+        // A watcher, unlike `paste::get_contents`, hands out the offer together with its MIME
+        // types, so both come from the same content (see module docs). It reports the current
+        // selection first; cancelling up front makes `next_event` return that queued event right
+        // away, or `None` instead of blocking if the compositor sent none.
+        let mut watcher = Watcher::new(watch::ClipboardType::Regular, paste::Seat::Unspecified)
+            .map_err(|error| paste_error("requesting the clipboard", error))?;
+        watcher.cancel_handle().cancel();
+        let (mime_types, mut offer) = match watcher.next_event() {
+            Ok(Some(ClipboardEvent::Changed {
+                mime_types, offer, ..
+            })) => (mime_types, offer),
+            Ok(Some(ClipboardEvent::Cleared { .. })) => return Ok(None),
+            Ok(None) => {
+                return Err(ClipboardError::Backend {
+                    message: "the compositor did not report the current clipboard".to_owned(),
+                    source: None,
+                });
+            }
+            Err(error) => return Err(paste_error("requesting the clipboard", error)),
+        };
+        if let Some(marker) = sensitive_marker(&mime_types) {
+            return Err(ClipboardError::Sensitive { marker });
+        }
         // `MimeType::Text` prefers `text/plain;charset=utf-8`, then `UTF8_STRING`, then any other
         // text type.
-        let pipe = match paste::get_contents(
-            paste::ClipboardType::Regular,
-            paste::Seat::Unspecified,
-            paste::MimeType::Text,
-        ) {
-            Ok((pipe, _mime_type)) => pipe,
-            Err(paste::Error::ClipboardEmpty | paste::Error::NoMimeType) => return Ok(None),
-            Err(error) => return Err(paste_error("requesting clipboard text", error)),
+        let Some(mime_type) = paste::select_mime_type(mime_types, paste::MimeType::Text) else {
+            return Ok(None);
         };
+        let pipe = offer
+            .receive(&mime_type)
+            .map_err(|error| paste_error("requesting clipboard text", error))?;
+        // `watcher` keeps the compositor connection open until the transfer ends.
         let bytes = read_to_end_within(pipe, READ_TIMEOUT)?;
         Ok(String::from_utf8(bytes).ok())
     }

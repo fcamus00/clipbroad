@@ -10,6 +10,14 @@
 //! operation retries for up to [`OPEN_TIMEOUT`] and then gives up with [`ClipboardError::Busy`]
 //! (reads and writes) or reports the change with no formats (the watcher).
 //!
+//! # Sensitive content
+//!
+//! [`read_text`](Clipboard::read_text) opens the clipboard once, lists the formats, reads the
+//! DWORD of the `CanUploadToCloudClipboard` / `CanIncludeInClipboardHistory` flags, checks them for
+//! sensitive markers and reads the text, all before closing it. While the clipboard is open no
+//! other app can change it, so the check and the text always belong to the same content. A flag
+//! whose value cannot be read fails the read.
+//!
 //! # Threads
 //!
 //! - [`read_text`](Clipboard::read_text) and [`write_text`](Clipboard::write_text): run on a
@@ -31,6 +39,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use clipbroad_core::sensitive::{WINDOWS_FLAG_FORMATS, sensitive_marker};
 use windows_sys::Win32::Foundation::{GlobalFree, HGLOBAL, HWND, SetLastError};
 use windows_sys::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, EnumClipboardFormats,
@@ -127,13 +136,20 @@ fn run_with_timeout<T: Send + 'static>(
 
 #[allow(unsafe_code)] // Win32 FFI.
 fn read_unicode_text() -> Result<Option<String>, ClipboardError> {
-    let _open = OpenedClipboard::open()?;
+    let open = OpenedClipboard::open()?;
+    let formats = format_ids(&open)?
+        .into_iter()
+        .map(|format| format_name_with_flag(&open, format))
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(marker) = sensitive_marker(&formats) {
+        return Err(ClipboardError::Sensitive { marker });
+    }
     // SAFETY: plain query; the clipboard is open on this thread.
     if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT.into()) } == 0 {
         return Ok(None);
     }
     // SAFETY: the clipboard is open on this thread. The handle stays owned by the clipboard and
-    // valid until `_open` closes it, which happens after we are done with it.
+    // valid until `open` closes it, which happens after we are done with it.
     let handle = unsafe { GetClipboardData(CF_UNICODETEXT.into()) };
     if handle.is_null() {
         return Err(ClipboardError::backend(
@@ -265,6 +281,16 @@ impl LockedGlobal {
             ));
         }
         Ok(Self { handle, data })
+    }
+
+    /// The whole block as bytes.
+    #[allow(unsafe_code)] // Win32 FFI.
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: the handle is valid (we locked it).
+        let len = unsafe { GlobalSize(self.handle) };
+        // SAFETY: while locked, `data` points to the block's `GlobalSize` bytes. The returned
+        // slice borrows `self`, so it cannot outlive the lock.
+        unsafe { std::slice::from_raw_parts(self.data.cast(), len) }
     }
 
     /// The whole block as UTF-16 units.
@@ -419,11 +445,16 @@ fn forward_changes(changes: ChangeSender) {
     }
 }
 
-/// The names of the formats on the clipboard, in the order Windows reports them. Fails if the
+/// The names of the formats on the clipboard, in the order Windows reports them.
+fn list_formats() -> Result<Vec<String>, ClipboardError> {
+    let open = OpenedClipboard::open()?;
+    Ok(format_ids(&open)?.into_iter().map(format_name).collect())
+}
+
+/// The ids of the formats on the open clipboard, in the order Windows reports them. Fails if the
 /// list cannot be read completely, so a missing sensitive-content marker never goes unnoticed.
 #[allow(unsafe_code)] // Win32 FFI.
-fn list_formats() -> Result<Vec<String>, ClipboardError> {
-    let _open = OpenedClipboard::open()?;
+fn format_ids(_open: &OpenedClipboard) -> Result<Vec<u32>, ClipboardError> {
     let mut formats = Vec::new();
     let mut format = 0;
     loop {
@@ -437,7 +468,7 @@ fn list_formats() -> Result<Vec<String>, ClipboardError> {
         if format == 0 {
             break;
         }
-        formats.push(format_name(format));
+        formats.push(format);
     }
     // 0 means either "no more formats" (the last error is then 0) or a failure.
     let error = io::Error::last_os_error();
@@ -448,6 +479,41 @@ fn list_formats() -> Result<Vec<String>, ClipboardError> {
             error,
         )),
     }
+}
+
+/// [`format_name`], plus `=<value>` for the flag formats in [`WINDOWS_FLAG_FORMATS`], e.g.
+/// `CanUploadToCloudClipboard=0`.
+fn format_name_with_flag(open: &OpenedClipboard, format: u32) -> Result<String, ClipboardError> {
+    let name = format_name(format);
+    if !WINDOWS_FLAG_FORMATS.contains(&name.as_str()) {
+        return Ok(name);
+    }
+    let value = read_dword(open, format)
+        .map_err(|error| ClipboardError::backend(format!("reading the {name} flag"), error))?;
+    Ok(format!("{name}={value}"))
+}
+
+/// The DWORD held by `format` on the open clipboard.
+#[allow(unsafe_code)] // Win32 FFI.
+fn read_dword(_open: &OpenedClipboard, format: u32) -> Result<u32, ClipboardError> {
+    // SAFETY: the clipboard is open on this thread. The handle stays owned by the clipboard and
+    // valid until `_open` closes it, after we are done with it.
+    let handle = unsafe { GetClipboardData(format) };
+    if handle.is_null() {
+        return Err(ClipboardError::backend(
+            "getting the clipboard data",
+            io::Error::last_os_error(),
+        ));
+    }
+    let locked = LockedGlobal::lock(handle)?;
+    let dword = locked
+        .bytes()
+        .first_chunk::<4>()
+        .ok_or_else(|| ClipboardError::Backend {
+            message: "the data is smaller than a DWORD".to_owned(),
+            source: None,
+        })?;
+    Ok(u32::from_le_bytes(*dword))
 }
 
 /// The name of a clipboard format (see [`ClipboardChange::formats`]).
@@ -510,18 +576,18 @@ mod tests {
         assert_eq!(format_name(0x200), "#512");
     }
 
-    /// Writes `text` plus the marker format a password manager would add, the way such an app
-    /// does it.
+    /// Writes `text` plus a registered format `marker` holding the DWORD `value`, the way a
+    /// password manager adds its markers.
     #[allow(unsafe_code)] // Win32 FFI.
-    fn write_with_exclusion_marker(text: &str) {
+    fn write_with_marker(text: &str, marker: &str, value: u16) {
+        let marker_name: Vec<u16> = marker.encode_utf16().chain([0]).collect();
         // SAFETY: plain call with a valid NUL-terminated string.
-        let marker =
-            unsafe { RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing")) };
+        let marker = unsafe { RegisterClipboardFormatW(marker_name.as_ptr()) };
         assert_ne!(marker, 0, "{}", io::Error::last_os_error());
         let units: Vec<u16> = text.encode_utf16().chain([0]).collect();
         let text_memory = GlobalMemory::with_units(&units).expect("allocate text");
-        // The marker's content is irrelevant, only its presence; a DWORD 0 is customary.
-        let flag = GlobalMemory::with_units(&[0, 0]).expect("allocate marker");
+        // A little-endian DWORD.
+        let flag = GlobalMemory::with_units(&[value, 0]).expect("allocate marker");
         let _open = OpenedClipboard::open().expect("open clipboard");
         // SAFETY: the clipboard is open on this thread.
         assert_ne!(unsafe { EmptyClipboard() }, 0);
@@ -577,9 +643,33 @@ mod tests {
             Some("")
         );
 
-        write_with_exclusion_marker("secret");
-        let change = change_with(&mut watch, "ExcludeClipboardContentFromMonitorProcessing").await;
+        // The exclusion marker counts by presence, whatever its value; a DWORD 0 is customary.
+        let exclude = "ExcludeClipboardContentFromMonitorProcessing";
+        write_with_marker("secret", exclude, 0);
+        let change = change_with(&mut watch, exclude).await;
         assert!(change.has_format("CF_UNICODETEXT"), "{change:?}");
+        assert!(matches!(
+            clipboard.read_text(),
+            Err(ClipboardError::Sensitive { marker }) if marker == exclude
+        ));
+
+        // The flags count only when 0.
+        for flag in WINDOWS_FLAG_FORMATS {
+            write_with_marker("secret", flag, 0);
+            change_with(&mut watch, flag).await;
+            let zero = format!("{flag}=0");
+            assert!(matches!(
+                clipboard.read_text(),
+                Err(ClipboardError::Sensitive { marker }) if marker == zero
+            ));
+
+            write_with_marker("shareable", flag, 1);
+            change_with(&mut watch, flag).await;
+            assert_eq!(
+                clipboard.read_text().expect("read").as_deref(),
+                Some("shareable")
+            );
+        }
 
         drop(watch);
         let deadline = Instant::now() + STOP_CHECK_INTERVAL * 5;

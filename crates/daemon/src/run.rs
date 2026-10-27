@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use clipbroad_clipboard::Clipboard;
 use clipbroad_clipboard::fake::FakeClipboard;
+use clipbroad_clipboard::{Clipboard, ClipboardError};
 use clipbroad_config::{Config, IdentityKey, Paths};
 use clipbroad_core::protocol::NodeId;
 use clipbroad_core::sync::{LocalAction, RemoteAction, SyncEngine};
@@ -131,9 +131,18 @@ async fn local_change(
 ) -> Result<()> {
     let clipboard = Arc::clone(clipboard);
     // `read_text` may block (up to 2 s by contract), so keep it off the async thread.
-    let text = tokio::task::spawn_blocking(move || clipboard.read_text())
-        .await?
-        .context("cannot read the clipboard")?;
+    let text = match tokio::task::spawn_blocking(move || clipboard.read_text()).await? {
+        Ok(text) => text,
+        // Expected for every password manager copy: not a problem worth a warning.
+        Err(ClipboardError::Sensitive { marker }) => {
+            debug!(
+                marker,
+                "clipboard content is marked as sensitive, not synced"
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error).context("cannot read the clipboard"),
+    };
     let Some(text) = text else {
         debug!("clipboard holds no text, nothing to send");
         return Ok(());

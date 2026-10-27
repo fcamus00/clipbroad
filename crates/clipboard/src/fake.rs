@@ -25,6 +25,8 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use clipbroad_core::sensitive::sensitive_marker;
+
 use crate::{ChangeSender, Clipboard, ClipboardChange, ClipboardError, ClipboardWatch};
 
 /// The format the fake offers for text. A MIME type, as on Linux.
@@ -40,6 +42,8 @@ pub struct FakeClipboard {
 #[derive(Debug, Default)]
 struct State {
     text: Option<String>,
+    /// What the current content offers, checked by `read_text` like the real backends do.
+    formats: Vec<String>,
     watchers: Vec<ChangeSender>,
 }
 
@@ -57,14 +61,15 @@ impl FakeClipboard {
 
     /// Simulates another application copying arbitrary content.
     ///
-    /// `text` is what [`read_text`](Clipboard::read_text) will return; `formats` is what the
-    /// change event reports. Use it for content a plain-text copy can't express, e.g. a password
-    /// manager (`Some("hunter2")` with `x-kde-passwordManagerHint` among the formats) or an image
-    /// (`None` with `["image/png"]`).
+    /// `text` is what [`read_text`](Clipboard::read_text) will return, unless `formats` holds a
+    /// sensitive-content marker; `formats` is what the change event reports. Use it for content a
+    /// plain-text copy can't express, e.g. a password manager (`Some("hunter2")` with
+    /// `x-kde-passwordManagerHint` among the formats) or an image (`None` with `["image/png"]`).
     pub fn simulate_copy(&self, text: Option<String>, formats: Vec<String>) {
         let mut state = self.lock();
-        let change = ClipboardChange::new(formats);
+        let change = ClipboardChange::new(formats.clone());
         state.text = text;
+        state.formats = formats;
         // Notify every live watcher and forget the ones whose consumer is gone.
         state
             .watchers
@@ -85,7 +90,12 @@ impl FakeClipboard {
 
 impl Clipboard for FakeClipboard {
     fn read_text(&self) -> Result<Option<String>, ClipboardError> {
-        Ok(self.lock().text.clone())
+        // Text and formats change together under the lock, so the check is atomic.
+        let state = self.lock();
+        match sensitive_marker(&state.formats) {
+            Some(marker) => Err(ClipboardError::Sensitive { marker }),
+            None => Ok(state.text.clone()),
+        }
     }
 
     fn write_text(&self, text: &str) -> Result<(), ClipboardError> {
@@ -187,6 +197,31 @@ mod tests {
             next_change(&mut watch)
                 .await
                 .has_format("x-kde-passwordManagerHint")
+        );
+    }
+
+    #[test]
+    fn refuses_to_read_sensitive_content() {
+        let clipboard = FakeClipboard::new();
+        clipboard.simulate_copy(
+            Some("hunter2".to_owned()),
+            vec![
+                TEXT_FORMAT.to_owned(),
+                "x-kde-passwordManagerHint".to_owned(),
+            ],
+        );
+        assert!(matches!(
+            clipboard.read_text(),
+            Err(ClipboardError::Sensitive {
+                marker: "x-kde-passwordManagerHint"
+            })
+        ));
+
+        // The next plain copy is readable again.
+        clipboard.simulate_copy_text("public");
+        assert_eq!(
+            clipboard.read_text().expect("read").as_deref(),
+            Some("public")
         );
     }
 

@@ -30,14 +30,14 @@ enum Command {
     /// Each text copied here is sent to every connected peer, and text copied on a peer is written
     /// to this clipboard. Peers that are offline miss what is copied meanwhile. Logs show this
     /// node's id (peers need it in their config), connections, and each clip's size and short
-    /// hash, never its content. Sensitive content is not filtered yet: passwords copied from a
-    /// password manager are synced too.
+    /// hash, never its content. Content a password manager marks as sensitive is never read or
+    /// sent.
     Run(run::Args),
     /// Print every change of the local clipboard, one line per change, until Ctrl+C.
     ///
     /// Each line shows the time (UTC), the formats the clipboard offers and a preview of its text
-    /// (first 80 characters, with newlines and control characters escaped). Nothing is sent to
-    /// other machines.
+    /// (first 80 characters, with newlines and control characters escaped). Content marked as
+    /// sensitive shows the marker instead, and is never read. Nothing is sent to other machines.
     Watch(watch::Args),
 }
 

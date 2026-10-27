@@ -13,7 +13,8 @@
 use std::time::{Duration, Instant};
 
 use clipbroad_clipboard::wayland::WaylandClipboard;
-use clipbroad_clipboard::{Clipboard, ClipboardChange, ClipboardWatch};
+use clipbroad_clipboard::{Clipboard, ClipboardChange, ClipboardError, ClipboardWatch};
+use wl_clipboard_rs::copy;
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -63,6 +64,27 @@ async fn real_clipboard_round_trip_and_watch() {
     assert_eq!(
         clipboard.read_text().expect("read empty").as_deref(),
         Some("")
+    );
+
+    // What `wl-copy --sensitive` and KeePassXC offer: the text plus `x-kde-passwordManagerHint`.
+    let mut sensitive = copy::Options::new();
+    sensitive.sensitive(true);
+    sensitive
+        .copy(
+            copy::Source::Bytes(b"hunter2"[..].into()),
+            copy::MimeType::Text,
+        )
+        .expect("copy sensitive");
+    let change = next_change(&mut watch).await;
+    assert!(change.has_format("x-kde-passwordManagerHint"), "{change:?}");
+    assert!(
+        matches!(
+            clipboard.read_text(),
+            Err(ClipboardError::Sensitive {
+                marker: "x-kde-passwordManagerHint"
+            })
+        ),
+        "sensitive text was read"
     );
 
     drop(watch);

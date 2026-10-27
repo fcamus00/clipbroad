@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Some(change) = watch.recv().await {
                 let change = change?;
                 println!("change: formats={:?}", change.formats);
-                println!("  text: {:?}", clipboard.read_text()?);
+                println!("  text: {:?}", clipboard.read_text());
             }
         }
         ["read"] => println!("{:?}", clipboard.read_text()?),

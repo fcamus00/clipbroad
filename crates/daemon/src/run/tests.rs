@@ -7,6 +7,7 @@ use std::num::{NonZeroU16, NonZeroU64};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
+use clipbroad_clipboard::fake::TEXT_FORMAT;
 use clipbroad_config::Peer;
 use iroh::{EndpointId, SecretKey};
 use tokio::sync::oneshot;
@@ -253,6 +254,34 @@ async fn skips_what_it_cannot_send_and_keeps_running() {
     assert!(eventually(TIMEOUT, || observer.senders("small").contains(&daemon.id)).await);
     assert_eq!(observer.senders(&too_large), HashSet::new());
     assert_eq!(observer.senders("no formats"), HashSet::new());
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn never_sends_sensitive_content() {
+    let spec = Spec::new();
+    let observer_spec = Spec::new();
+    let observer = Observer::start(&observer_spec, std::slice::from_ref(&spec)).await;
+    let daemon = Daemon::start(
+        &spec,
+        spec.config([&observer_spec], Config::DEFAULT_INLINE_MAX_BYTES.get()),
+    );
+    connect_all(std::slice::from_ref(&daemon), &observer).await;
+
+    // What KeePassXC offers on Linux: the text plus the password manager hint.
+    daemon.clipboard.simulate_copy(
+        Some("hunter2".to_owned()),
+        vec![
+            TEXT_FORMAT.to_owned(),
+            "x-kde-passwordManagerHint".to_owned(),
+        ],
+    );
+    daemon.clipboard.simulate_copy_text("after the password");
+
+    // The daemon handles changes in order, so once the next copy arrives the secret was handled.
+    let next_arrived = || observer.senders("after the password").contains(&daemon.id);
+    assert!(eventually(TIMEOUT, next_arrived).await);
+    assert_eq!(observer.senders("hunter2"), HashSet::new());
     daemon.stop().await;
 }
 
