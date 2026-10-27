@@ -7,8 +7,9 @@ use std::num::{NonZeroU16, NonZeroU64};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use clipbroad_clipboard::fake::TEXT_FORMAT;
+use clipbroad_clipboard::fake::{TEXT_FORMAT, tiny_png};
 use clipbroad_config::Peer;
+use clipbroad_core::Png;
 use iroh::{EndpointId, SecretKey};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -113,6 +114,10 @@ impl Daemon {
         self.clipboard.read_text().expect("the fake never fails")
     }
 
+    fn image(&self) -> Option<Png> {
+        self.clipboard.read_image().expect("the fake never fails")
+    }
+
     async fn stop(self) {
         assert!(!self.task.is_finished(), "daemon ended early: {self:?}");
         let _ = self.stop.send(());
@@ -153,9 +158,9 @@ impl Observer {
         Self { seen, _node: node }
     }
 
-    /// Who sent the content `text`.
-    fn senders(&self, text: &str) -> HashSet<EndpointId> {
-        let hash = ContentHash::of(text.as_bytes());
+    /// Who sent `content` (text, or an image as `ClipContent::Image`).
+    fn senders(&self, content: impl Into<ClipContent>) -> HashSet<EndpointId> {
+        let hash = content.into().hash();
         lock(&self.seen)
             .iter()
             .filter(|(_, seen)| *seen == hash)
@@ -196,7 +201,7 @@ async fn connect_all(daemons: &[Daemon], observer: &Observer) {
                 daemons
                     .iter()
                     .all(|other| other.text().as_deref() == Some(&text))
-                    && observer.senders(&text).contains(&daemon.id)
+                    && observer.senders(text.as_str()).contains(&daemon.id)
             };
             if eventually(Duration::from_millis(500), reached).await {
                 break;
@@ -248,6 +253,47 @@ async fn copy_reaches_every_peer_once_and_is_not_echoed() {
 }
 
 #[tokio::test]
+async fn image_reaches_every_peer_once_and_text_wins_over_it() {
+    let specs = [Spec::new(), Spec::new()];
+    let observer_spec = Spec::new();
+    let observer = Observer::start(&observer_spec, &specs).await;
+    let daemons: Vec<Daemon> = specs
+        .iter()
+        .map(|spec| {
+            let other = specs.iter().filter(|other| other.port != spec.port);
+            let peers = other.chain([&observer_spec]);
+            Daemon::start(
+                spec,
+                spec.config(peers, Config::DEFAULT_INLINE_MAX_BYTES.get()),
+            )
+        })
+        .collect();
+    connect_all(&daemons, &observer).await;
+    let [a, b] = &daemons[..] else {
+        unreachable!("two daemons")
+    };
+
+    a.clipboard.simulate_copy_image(tiny_png());
+    assert!(eventually(TIMEOUT, || b.image() == Some(tiny_png())).await);
+    // B wrote the image, which fired a change event; it must not send it back.
+    time::sleep(QUIET).await;
+    let image = ClipContent::Image(tiny_png());
+    assert_eq!(observer.senders(image.clone()), HashSet::from([a.id]));
+    assert_eq!(a.image(), Some(tiny_png()));
+
+    // A copy that offers both, like spreadsheet cells: only the text is sent.
+    b.clipboard
+        .simulate_copy_text_and_image("cells", tiny_png());
+    assert!(eventually(TIMEOUT, || a.text().as_deref() == Some("cells")).await);
+    assert_eq!(a.image(), None);
+    assert_eq!(observer.senders(image), HashSet::from([a.id]));
+
+    for daemon in daemons {
+        daemon.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn skips_what_it_cannot_send_and_keeps_running() {
     let spec = Spec::new();
     let observer_spec = Spec::new();
@@ -256,10 +302,13 @@ async fn skips_what_it_cannot_send_and_keeps_running() {
     connect_all(std::slice::from_ref(&daemon), &observer).await;
 
     let too_large = "x".repeat(17);
+    // A non-PNG image is not read at all.
     daemon
         .clipboard
-        .simulate_copy(None, vec!["image/png".to_owned()]);
+        .simulate_copy(None, vec!["image/jpeg".to_owned()]);
     daemon.clipboard.simulate_copy_text(&too_large);
+    // The PNG is 70 bytes.
+    daemon.clipboard.simulate_copy_image(tiny_png());
     daemon.clipboard.simulate_clear();
     daemon
         .clipboard
@@ -268,7 +317,11 @@ async fn skips_what_it_cannot_send_and_keeps_running() {
 
     // The daemon handles changes in order, so once "small" arrives the others were handled.
     assert!(eventually(TIMEOUT, || observer.senders("small").contains(&daemon.id)).await);
-    assert_eq!(observer.senders(&too_large), HashSet::new());
+    assert_eq!(observer.senders(too_large.as_str()), HashSet::new());
+    assert_eq!(
+        observer.senders(ClipContent::Image(tiny_png())),
+        HashSet::new()
+    );
     assert_eq!(observer.senders("no formats"), HashSet::new());
     daemon.stop().await;
 }
@@ -348,7 +401,7 @@ async fn status_file_follows_peers_and_clips() {
         format!("node id        {}\n", a.id()),
         "peers          1 of 1 connected\n".to_owned(),
         format!("connected via 127.0.0.1:{}\n", b.port),
-        format!(", 5 bytes, hash {hash}\n"),
+        format!(", text, 5 bytes, hash {hash}\n"),
     ];
     for line in expected {
         assert!(shown.contains(&line), "{line:?} missing in:\n{shown}");

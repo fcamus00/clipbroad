@@ -203,10 +203,11 @@ en el portapapeles local.
 ### Daemon (`clipbroad run`)
 
 Un solo bucle une las piezas (`crates/daemon/src/run.rs`), con el mismo flujo que describe el módulo
-`sync`: un cambio local con formatos se lee (fuera del hilo async), y si es texto nuevo se envía a
-todos; un clip recibido se escribe en el portapapeles si el motor responde `Apply`. Un error al leer,
-escribir o procesar un clip se registra y el daemon sigue; solo una falla al arrancar o del watcher del
-portapapeles lo detiene. Se apaga con Ctrl+C o SIGTERM.
+`sync`: un cambio local con formatos se lee (fuera del hilo async), y si es texto o imagen nuevo se
+envía a todos (ver "Imágenes" para cuál gana si hay ambos); un clip recibido se escribe en el
+portapapeles si el motor responde `Apply`. Un error al leer, escribir o procesar un clip se registra y
+el daemon sigue; solo una falla al arrancar o del watcher del portapapeles lo detiene. Se apaga con
+Ctrl+C o SIGTERM.
 
 - Los logs muestran el id del nodo al arrancar, las conexiones y cada clip enviado o recibido con su
   tamaño y los primeros 8 caracteres del hash, nunca el contenido. `run` registra en nivel info por
@@ -255,6 +256,9 @@ para tests. X11 tiene prioridad baja (el objetivo es Hyprland).
 Contrato del trait (detalle completo en los doc comments de `crates/clipboard`):
 - `read_text` / `write_text` son síncronos y pueden bloquear un poco; el daemon los llama con
   `spawn_blocking`. Portapapeles vacío o sin texto es `Ok(None)`, no un error.
+- `read_image` / `write_image` siguen las mismas reglas con imágenes PNG (ver "Imágenes"). Son
+  opcionales: por defecto `read_image` devuelve `Ok(None)` y `write_image` devuelve
+  `ClipboardError::Unsupported`, así un backend sin imágenes (hoy macOS y Windows) compila igual.
 - Ninguna lectura o escritura bloquea más de 2 segundos: si la app dueña del contenido no responde, el
   backend devuelve error. El límite lo pone el backend porque el daemon no puede cancelar un hilo bloqueado.
 - `watch` devuelve un **canal** (no un callback): el backend empuja eventos desde su propio hilo del SO
@@ -262,8 +266,9 @@ Contrato del trait (detalle completo en los doc comments de `crates/clipboard`):
   sin límite porque los eventos son chicos y a velocidad humana.
 - Un evento no trae el contenido, solo los **formatos ofrecidos** con su nombre nativo (MIME en Linux,
   UTI en macOS, nombre de formato en Windows).
-- `read_text` nunca lee contenido sensible: revisa los marcadores sobre el mismo contenido que lee y
-  devuelve `ClipboardError::Sensitive` sin leer el texto (ver "Contenido sensible").
+- `read_text` y `read_image` nunca leen contenido sensible: revisan los marcadores sobre el mismo
+  contenido que leen y devuelven `ClipboardError::Sensitive` sin leer los datos (ver "Contenido
+  sensible").
 - Se reportan **todos** los cambios, incluidos los que causa el propio daemon al escribir; el anti-eco
   se hace en el daemon por hash, igual en todas las plataformas.
 - `ContentHash` es BLAKE3 de los bytes del contenido (texto: UTF-8 tal cual, sin normalizar; imagen:
@@ -292,7 +297,8 @@ Cómo se aplica (código en `crates/core/src/sensitive.rs` y en cada backend):
   copia: si se revisaran los formatos del evento, un secreto copiado justo después se leería con los
   formatos del contenido anterior. Por eso cada backend lista los formatos y lee el texto del mismo
   contenido, y si encuentra un marcador devuelve `ClipboardError::Sensitive` sin leer el texto. Que
-  sea un error hace que quien lo olvide manejar igual se quede sin el texto.
+  sea un error hace que quien lo olvide manejar igual se quede sin el texto. `read_image` hace lo
+  mismo con la imagen.
   - **Wayland:** pide al compositor la oferta actual, que trae su lista de MIME fija, y lee el texto
     de esa misma oferta. Una copia nueva es otra oferta, así que la lista y el texto siempre son del
     mismo contenido.
@@ -357,14 +363,31 @@ el umbral de tamaño. Código en `crates/core/src/content.rs` (`Png`) y `protoco
   en el handshake sin decir por qué.
 - **Una imagen más grande que `inline_max_bytes` no se sincroniza:** el daemon la salta con un warning,
   igual que al texto. Cuando exista el canal de archivos (ver "Archivos") se puede reconsiderar enviarla
-  por ahí. La revisión se agrega en el daemon junto con la lectura de imágenes en los backends.
+  por ahí.
 - **Requisito para los backends (anti-eco):** el anti-eco compara hashes. Si un backend escribe un PNG y
   al leerlo de vuelta entrega otros bytes (por ejemplo, porque lo re-codifica desde TIFF), el daemon lo ve
   como una copia nueva y la reenvía. Dos máquinas que re-codifican podrían reenviarse la imagen sin fin.
   Por eso un backend debe devolver los mismos bytes PNG que escribió, por ejemplo escribiendo el tipo PNG
   y leyéndolo primero cuando está.
-- **Mientras los backends no soporten imágenes**, ninguno las lee, y el daemon que recibe una la salta con
-  un warning sin escribirla en el portapapeles.
+- **Texto e imagen en la misma copia: gana el texto.** El daemon llama a `read_text` y, solo si no hay
+  texto, a `read_image` (`read_content` en `crates/daemon/src/run.rs`). Las apps que ofrecen ambos en
+  una copia (celdas de una planilla, un documento de oficina) lo hacen sobre todo para que el texto se
+  pueda pegar también como dibujo; lo que la persona quiso copiar es el texto, que además pesa mucho
+  menos. Un clip lleva un solo contenido, así que no se pueden mandar los dos.
+  - **Excepción, "Copiar imagen" del navegador:** Chrome ofrece la imagen y `text/html` con una
+    etiqueta `<img>`, sin texto plano. Por contrato, si la copia trae una imagen legible, `read_text`
+    solo cuenta el texto plano (en Wayland: `text/plain;charset=utf-8`, `UTF8_STRING`, `text/plain`,
+    `STRING`, `TEXT`), así que ahí gana la imagen y no se sincroniza el HTML.
+  - **Límite conocido:** Firefox, al copiar una imagen, ofrece además la URL como texto plano. Ahí
+    gana la URL. Arreglarlo pediría mandar varios formatos en un clip.
+- **Wayland:** lee y escribe solo `image/png`, byte por byte, desde la misma oferta cuya lista de MIME
+  revisó (igual que el texto). Una copia que solo ofrece otros tipos (`image/jpeg`, `image/bmp`)
+  cuenta como sin imagen: convertirla pediría un códec. Las herramientas de captura (`grim`) y los
+  navegadores ofrecen `image/png`.
+- **macOS y Windows todavía no soportan imágenes:** no las leen, y el daemon que recibe una la salta
+  con un warning ("does not support images yet") sin tocar el portapapeles. Llegan en PRs aparte.
+- `clipbroad watch` muestra una imagen como `(image/png, 12345 bytes)` y `clipbroad status` muestra el
+  tipo del último clip (`text` o `image`) junto al tamaño y el hash.
 
 ## Archivos
 

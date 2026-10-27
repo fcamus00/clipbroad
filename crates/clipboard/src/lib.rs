@@ -14,6 +14,7 @@ pub mod wayland;
 #[cfg(windows)]
 pub mod windows;
 
+use clipbroad_core::Png;
 pub use error::ClipboardError;
 pub use watch::{ChangeSender, ClipboardChange, ClipboardWatch, WatchClosed};
 
@@ -27,11 +28,12 @@ pub use watch::{ChangeSender, ClipboardChange, ClipboardWatch, WatchClosed};
 ///
 /// - Implementations are `Send + Sync`; all methods take `&self`, so one instance can be shared
 ///   (e.g. in an `Arc`) and called from any thread. Use interior mutability where needed.
-/// - [`read_text`](Self::read_text) and [`write_text`](Self::write_text) are synchronous and may
-///   block briefly (talking to the compositor, waiting for another app to hand over data, retrying
-///   a busy Windows clipboard). Aim for well under a second, and **never block for more than
-///   2 seconds**: if the source app does not hand over the data in time (a frozen app on Wayland),
-///   give up and return [`ClipboardError::Backend`]. The backend owns this limit because the
+/// - The reads and writes ([`read_text`](Self::read_text), [`write_text`](Self::write_text) and
+///   their image versions) are synchronous and may block briefly (talking to the compositor,
+///   waiting for another app to hand over data, retrying a busy Windows clipboard). Aim for well
+///   under a second, and **never block for more than 2 seconds**: if the source app does not hand
+///   over the data in time (a frozen app on Wayland), give up and return
+///   [`ClipboardError::Backend`]. The backend owns this limit because the
 ///   daemon cannot cancel a blocked thread. Async callers should run them with
 ///   `tokio::task::spawn_blocking`.
 /// - No method requires a Tokio runtime or a particular calling thread. Backends that need a
@@ -42,7 +44,12 @@ pub use watch::{ChangeSender, ClipboardChange, ClipboardWatch, WatchClosed};
 ///
 /// - Text is UTF-8 and is returned and written **verbatim**: no trimming, no line-ending
 ///   conversion, no size limit at this layer.
+/// - Images are PNG ([`Png`]). A backend converts its native format to and from PNG, and must
+///   read back the **exact bytes** it wrote: anti-echo compares hashes, so a re-encoded read-back
+///   looks like a new copy and gets sent again. Image support is optional; see
+///   [`read_image`](Self::read_image).
 /// - Sensitive content (password managers) is never read: see [`read_text`](Self::read_text).
+///   The same rule applies to [`read_image`](Self::read_image).
 ///   Change events still report the markers in [`ClipboardChange::formats`], so tools like
 ///   `clipbroad watch` can show them.
 ///
@@ -59,6 +66,11 @@ pub trait Clipboard: Send + Sync {
     ///   text is `Ok(Some(""))`.
     /// - `Ok(None)` if the clipboard is empty, holds only non-text content (an image, files), or
     ///   the text cannot be decoded as UTF-8 without loss. None of these is an error.
+    ///
+    /// When the same copy also offers an image the backend can read, only plain text counts:
+    /// markup such as HTML next to an image describes the image (a browser's "Copy image" offers
+    /// an `<img>` tag), so return `Ok(None)` if that is the only text. The daemon syncs the text
+    /// when there is some and the image otherwise, so this makes the image win there.
     ///
     /// # Sensitive content
     ///
@@ -95,6 +107,37 @@ pub trait Clipboard: Send + Sync {
     /// [`ClipboardError::Sensitive`].
     fn write_text(&self, text: &str) -> Result<(), ClipboardError>;
 
+    /// Reads the current clipboard content as a PNG image.
+    ///
+    /// Returns `Ok(Some(png))` if the clipboard offers an image the backend can hand over as PNG,
+    /// and `Ok(None)` otherwise (empty, text only, an image type the backend does not convert).
+    /// Same rules as [`read_text`](Self::read_text): 2-second limit, and the sensitive-content
+    /// check on the formats of the same content before reading the image.
+    ///
+    /// The default implementation always returns `Ok(None)`: for a backend without image support,
+    /// the clipboard never holds an image.
+    ///
+    /// # Errors
+    ///
+    /// As for [`read_text`](Self::read_text).
+    fn read_image(&self) -> Result<Option<Png>, ClipboardError> {
+        Ok(None)
+    }
+
+    /// Replaces the whole clipboard content with `png`.
+    ///
+    /// Same rules as [`write_text`](Self::write_text). A later [`read_image`](Self::read_image)
+    /// must return exactly these bytes while the content is ours (see "Content" above).
+    ///
+    /// # Errors
+    ///
+    /// As for [`write_text`](Self::write_text). The default implementation returns
+    /// [`ClipboardError::Unsupported`] without touching the clipboard.
+    fn write_image(&self, png: &Png) -> Result<(), ClipboardError> {
+        let _ = png;
+        Err(ClipboardError::Unsupported { content: "images" })
+    }
+
     /// Starts watching the clipboard and returns the stream of changes.
     ///
     /// Contract for implementations:
@@ -124,9 +167,9 @@ pub trait Clipboard: Send + Sync {
     ///   (next change or next polling tick).
     ///
     /// For consumers: an event says the clipboard *may* have changed and which formats it offers.
-    /// Call [`read_text`](Self::read_text) if wanted; it checks for sensitive markers itself, on
-    /// the content it actually reads. The content can change again between the event and the
-    /// read; if so, another event follows.
+    /// Call [`read_text`](Self::read_text) or [`read_image`](Self::read_image) if wanted; they
+    /// check for sensitive markers themselves, on the content they actually read. The content can
+    /// change again between the event and the read; if so, another event follows.
     ///
     /// # Errors
     ///

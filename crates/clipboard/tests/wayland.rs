@@ -14,9 +14,30 @@ use std::time::{Duration, Instant};
 
 use clipbroad_clipboard::wayland::WaylandClipboard;
 use clipbroad_clipboard::{Clipboard, ClipboardChange, ClipboardError, ClipboardWatch};
+use clipbroad_core::Png;
 use wl_clipboard_rs::copy;
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// PNG signature and `IHDR` chunk header: what `Png::try_from` checks.
+const PNG_START: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR";
+
+/// Copies `text` as `text_mime` and `png` as `image/png`, as one copy.
+fn copy_both(text_mime: &str, text: &str, png: &Png) {
+    let source = |bytes: &[u8], mime: &str| copy::MimeSource {
+        source: copy::Source::Bytes(bytes.into()),
+        mime_type: copy::MimeType::Specific(mime.to_owned()),
+    };
+    let mut options = copy::Options::new();
+    // Offer exactly these two types, like a browser does.
+    options.omit_additional_text_mime_types(true);
+    options
+        .copy_multi(vec![
+            source(text.as_bytes(), text_mime),
+            source(png.as_bytes(), "image/png"),
+        ])
+        .expect("copy text and image");
+}
 
 async fn next_change(watch: &mut ClipboardWatch) -> ClipboardChange {
     tokio::time::timeout(EVENT_TIMEOUT, watch.recv())
@@ -70,6 +91,7 @@ async fn real_clipboard_round_trip_and_watch() {
     let mut sensitive = copy::Options::new();
     sensitive.sensitive(true);
     sensitive
+        .clone()
         .copy(
             copy::Source::Bytes(b"hunter2"[..].into()),
             copy::MimeType::Text,
@@ -85,6 +107,50 @@ async fn real_clipboard_round_trip_and_watch() {
             })
         ),
         "sensitive text was read"
+    );
+
+    // Bigger than a pipe buffer, so it takes many reads. Only the start has to look like a PNG.
+    let mut bytes = PNG_START.to_vec();
+    bytes.extend((0..300_000_u32).map(|i| i.to_le_bytes()[0]));
+    let png = Png::try_from(bytes).expect("starts like a PNG");
+    clipboard.write_image(&png).expect("write image");
+    let change = next_change(&mut watch).await;
+    assert_eq!(change.formats, ["image/png"]);
+    // Byte for byte, or anti-echo would see our own write as a new copy.
+    assert_eq!(
+        clipboard.read_image().expect("read image"),
+        Some(png.clone())
+    );
+    assert_eq!(clipboard.read_text().expect("read text"), None);
+
+    // A browser's "Copy image": the image plus `<img>` markup. The image wins.
+    copy_both("text/html", "<img src=\"x.png\">", &png);
+    next_change(&mut watch).await;
+    assert_eq!(clipboard.read_text().expect("read text"), None);
+    assert!(clipboard.read_image().expect("read image").is_some());
+
+    // Plain text next to an image (a spreadsheet's cells) is still text.
+    copy_both("text/plain;charset=utf-8", "a\tb", &png);
+    next_change(&mut watch).await;
+    assert_eq!(
+        clipboard.read_text().expect("read text").as_deref(),
+        Some("a\tb")
+    );
+
+    // A sensitive marker hides the image too.
+    sensitive
+        .copy(
+            copy::Source::Bytes(png.as_bytes().into()),
+            copy::MimeType::Specific("image/png".to_owned()),
+        )
+        .expect("copy sensitive image");
+    next_change(&mut watch).await;
+    assert!(
+        matches!(
+            clipboard.read_image(),
+            Err(ClipboardError::Sensitive { .. })
+        ),
+        "sensitive image was read"
     );
 
     drop(watch);

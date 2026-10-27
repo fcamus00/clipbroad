@@ -16,6 +16,7 @@ use std::{fs, process};
 
 use anyhow::{Context, Result};
 use clipbroad_config::{Config, Paths};
+use clipbroad_core::protocol::ContentKind;
 use clipbroad_net::{Link, Links, Node};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
@@ -91,10 +92,11 @@ pub enum PasteAccess {
     Other(isize),
 }
 
-/// A clip that was sent or received: when, how big, and its short hash.
+/// A clip that was sent or received: when, what kind, how big, and its short hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClipEvent {
     pub at_ms: u64,
+    pub kind: ContentKind,
     pub size: u64,
     pub hash: String,
     /// Who sent it, for a received clip.
@@ -252,8 +254,12 @@ pub fn render(status: Option<&DaemonStatus>, now_ms: u64) -> String {
             let peer = status.peers.iter().find(|p| p.id == id);
             format!(", from {}", peer.map_or("an unknown peer", peer_name))
         });
+        let kind = match event.kind {
+            ContentKind::Text => "text",
+            ContentKind::Image => "image",
+        };
         format!(
-            "{}, {} bytes, hash {}{from}",
+            "{}, {kind}, {} bytes, hash {}{from}",
             time(event.at_ms, now_ms),
             event.size,
             event.hash

@@ -21,6 +21,7 @@ fn sample() -> DaemonStatus {
         paste_access: None,
         last_sent: Some(ClipEvent {
             at_ms: NOW_MS - 3 * 60_000,
+            kind: ContentKind::Text,
             size: 120,
             hash: "1a2b3c4d".to_owned(),
             from: None,
@@ -54,7 +55,7 @@ LAN discovery  on (mDNS)
 peers          1 of 2 connected
                laptop     {laptop}  connected via 192.168.1.20:4747
                (no name)  {other}  not connected
-last sent      11:57:00 UTC (3 min ago), 120 bytes, hash 1a2b3c4d
+last sent      11:57:00 UTC (3 min ago), text, 120 bytes, hash 1a2b3c4d
 last received  nothing yet
 ",
         node = id(1),
@@ -69,17 +70,16 @@ fn names_the_peer_a_clip_came_from() {
     let status = DaemonStatus {
         last_received: Some(ClipEvent {
             at_ms: NOW_MS - 5_000,
-            size: 5,
+            kind: ContentKind::Image,
+            size: 48_213,
             hash: "9f8e7d6c".to_owned(),
             from: Some(id(2)),
         }),
         ..sample()
     };
-    assert!(
-        render(Some(&status), NOW_MS).contains(
-            "last received  11:59:55 UTC (5 s ago), 5 bytes, hash 9f8e7d6c, from laptop\n"
-        )
-    );
+    assert!(render(Some(&status), NOW_MS).contains(
+        "last received  11:59:55 UTC (5 s ago), image, 48213 bytes, hash 9f8e7d6c, from laptop\n"
+    ));
 }
 
 #[test]
@@ -124,6 +124,7 @@ fn every_field_survives_the_file_format() {
         paste_access: Some(PasteAccess::Other(7)),
         last_received: Some(ClipEvent {
             at_ms: NOW_MS,
+            kind: ContentKind::Image,
             size: 5,
             hash: "9f8e7d6c".to_owned(),
             from: Some(id(2)),

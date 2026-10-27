@@ -35,8 +35,9 @@ fn watch_fake_prints_one_line_per_change() {
             r#"[text/plain;charset=utf-8]  "two lines\nand a\ttab" (19 chars)"#,
             r#"[text/plain;charset=utf-8]  "A long text with multibyte characters (ñandú, 🦀) shows that the preview is cut o"… (114 chars)"#,
             "[text/plain;charset=utf-8, x-kde-passwordManagerHint]  (sensitive: x-kde-passwordManagerHint, not read or synced)",
-            "[image/png]  (no text)",
+            "[image/jpeg]  (no text or PNG image)",
             "[]  (clipboard empty)",
+            "[image/png]  (image/png, 70 bytes)",
         ]
     );
 }

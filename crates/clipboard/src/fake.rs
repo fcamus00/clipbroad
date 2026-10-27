@@ -1,8 +1,8 @@
 //! In-memory [`Clipboard`] for tests of the sync logic.
 //!
 //! It follows the same contract as the real backends, including emitting a change event for its
-//! own [`write_text`](Clipboard::write_text), so logic tested against it (anti-echo especially)
-//! behaves the same on real clipboards.
+//! own writes and returning written images byte for byte, so logic tested against it (anti-echo
+//! especially) behaves the same on real clipboards.
 //!
 //! ```
 //! use clipbroad_clipboard::Clipboard;
@@ -25,12 +25,33 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use clipbroad_core::Png;
 use clipbroad_core::sensitive::sensitive_marker;
 
 use crate::{ChangeSender, Clipboard, ClipboardChange, ClipboardError, ClipboardWatch};
 
 /// The format the fake offers for text. A MIME type, as on Linux.
 pub const TEXT_FORMAT: &str = "text/plain;charset=utf-8";
+
+/// The format the fake offers for images.
+pub const IMAGE_FORMAT: &str = "image/png";
+
+/// A real 1x1 PNG (70 bytes), for tests that need an image.
+///
+/// # Panics
+///
+/// Never: the bytes are a valid PNG.
+#[must_use]
+pub fn tiny_png() -> Png {
+    const BYTES: [u8; 70] = [
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8,
+        0xcf, 0xc0, 0xf0, 0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99, 0x3d, 0x1d, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+    Png::try_from(BYTES.to_vec()).expect("BYTES is a PNG")
+}
 
 /// An in-memory clipboard. Clones share the same state, so a test can keep one handle to
 /// simulate other apps while the code under test owns another.
@@ -42,7 +63,8 @@ pub struct FakeClipboard {
 #[derive(Debug, Default)]
 struct State {
     text: Option<String>,
-    /// What the current content offers, checked by `read_text` like the real backends do.
+    image: Option<Png>,
+    /// What the current content offers, checked by the reads like the real backends do.
     formats: Vec<String>,
     watchers: Vec<ChangeSender>,
 }
@@ -66,9 +88,26 @@ impl FakeClipboard {
     /// plain-text copy can't express, e.g. a password manager (`Some("hunter2")` with
     /// `x-kde-passwordManagerHint` among the formats) or an image (`None` with `["image/png"]`).
     pub fn simulate_copy(&self, text: Option<String>, formats: Vec<String>) {
+        self.set(text, None, formats);
+    }
+
+    /// Simulates another application copying an image (offered as [`IMAGE_FORMAT`]).
+    pub fn simulate_copy_image(&self, png: Png) {
+        self.set(None, Some(png), vec![IMAGE_FORMAT.to_owned()]);
+    }
+
+    /// Simulates an application that offers text and an image for the same copy, like a
+    /// spreadsheet copying cells.
+    pub fn simulate_copy_text_and_image(&self, text: impl Into<String>, png: Png) {
+        let formats = vec![TEXT_FORMAT.to_owned(), IMAGE_FORMAT.to_owned()];
+        self.set(Some(text.into()), Some(png), formats);
+    }
+
+    fn set(&self, text: Option<String>, image: Option<Png>, formats: Vec<String>) {
         let mut state = self.lock();
         let change = ClipboardChange::new(formats.clone());
         state.text = text;
+        state.image = image;
         state.formats = formats;
         // Notify every live watcher and forget the ones whose consumer is gone.
         state
@@ -90,7 +129,7 @@ impl FakeClipboard {
 
 impl Clipboard for FakeClipboard {
     fn read_text(&self) -> Result<Option<String>, ClipboardError> {
-        // Text and formats change together under the lock, so the check is atomic.
+        // Content and formats change together under the lock, so the check is atomic.
         let state = self.lock();
         match sensitive_marker(&state.formats) {
             Some(marker) => Err(ClipboardError::Sensitive { marker }),
@@ -100,6 +139,19 @@ impl Clipboard for FakeClipboard {
 
     fn write_text(&self, text: &str) -> Result<(), ClipboardError> {
         self.simulate_copy_text(text);
+        Ok(())
+    }
+
+    fn read_image(&self) -> Result<Option<Png>, ClipboardError> {
+        let state = self.lock();
+        match sensitive_marker(&state.formats) {
+            Some(marker) => Err(ClipboardError::Sensitive { marker }),
+            None => Ok(state.image.clone()),
+        }
+    }
+
+    fn write_image(&self, png: &Png) -> Result<(), ClipboardError> {
+        self.simulate_copy_image(png.clone());
         Ok(())
     }
 
@@ -223,6 +275,40 @@ mod tests {
             clipboard.read_text().expect("read").as_deref(),
             Some("public")
         );
+    }
+
+    #[tokio::test]
+    async fn images_round_trip_and_replace_text() {
+        let clipboard = FakeClipboard::new();
+        let mut watch = clipboard.watch().expect("watch");
+        clipboard.write_text("text first").expect("write text");
+        next_change(&mut watch).await;
+
+        clipboard.write_image(&tiny_png()).expect("write image");
+
+        assert_eq!(next_change(&mut watch).await.formats, [IMAGE_FORMAT]);
+        assert_eq!(clipboard.read_image().expect("read"), Some(tiny_png()));
+        assert_eq!(clipboard.read_text().expect("read"), None);
+
+        clipboard.write_text("text again").expect("write text");
+        assert_eq!(clipboard.read_image().expect("read"), None);
+    }
+
+    #[test]
+    fn refuses_to_read_a_sensitive_image() {
+        let clipboard = FakeClipboard::new();
+        clipboard.set(
+            None,
+            Some(tiny_png()),
+            vec![
+                IMAGE_FORMAT.to_owned(),
+                "x-kde-passwordManagerHint".to_owned(),
+            ],
+        );
+        assert!(matches!(
+            clipboard.read_image(),
+            Err(ClipboardError::Sensitive { .. })
+        ));
     }
 
     #[tokio::test]

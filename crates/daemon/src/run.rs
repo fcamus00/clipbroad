@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow};
 use clipbroad_clipboard::fake::FakeClipboard;
 use clipbroad_clipboard::{Clipboard, ClipboardError};
 use clipbroad_config::{Config, IdentityKey, Paths};
-use clipbroad_core::protocol::NodeId;
+use clipbroad_core::protocol::{ContentKind, NodeId};
 use clipbroad_core::sync::{LocalAction, RemoteAction, SyncEngine};
 use clipbroad_core::{ClipContent, ContentHash};
 use clipbroad_net::{Node, Received};
@@ -126,6 +126,7 @@ pub async fn sync(
             Some(received) = inbox.recv() => {
                 status.last_received = Some(ClipEvent {
                     at_ms: now_ms(),
+                    kind: received.clip.kind,
                     size: received.clip.size,
                     hash: short_hash(received.clip.hash),
                     from: Some(received.from),
@@ -158,9 +159,9 @@ async fn local_change(
     last_sent: &mut Option<ClipEvent>,
 ) -> Result<()> {
     let clipboard = Arc::clone(clipboard);
-    // `read_text` may block (up to 2 s by contract), so keep it off the async thread.
-    let text = match tokio::task::spawn_blocking(move || clipboard.read_text()).await? {
-        Ok(text) => text,
+    // Reads may block (up to 2 s each by contract), so keep them off the async thread.
+    let content = match tokio::task::spawn_blocking(move || read_content(&*clipboard)).await? {
+        Ok(content) => content,
         // Expected for every password manager copy: not a problem worth a warning.
         Err(ClipboardError::Sensitive { marker }) => {
             debug!(
@@ -171,25 +172,30 @@ async fn local_change(
         }
         Err(error) => return Err(error).context("cannot read the clipboard"),
     };
-    let Some(text) = text else {
-        debug!("clipboard holds no text, nothing to send");
+    let Some(content) = content else {
+        debug!("clipboard holds no text or PNG image, nothing to send");
         return Ok(());
     };
-    let size = text.len() as u64;
+    let (kind, size) = match &content {
+        ClipContent::Text(text) => (ContentKind::Text, text.len()),
+        ClipContent::Image(png) => (ContentKind::Image, png.as_bytes().len()),
+    };
+    let size = size as u64;
     if size > inline_max_bytes {
         warn!(
-            size,
-            inline_max_bytes, "copied text is larger than inline_max_bytes, not synced"
+            ?kind,
+            size, inline_max_bytes, "copied content is larger than inline_max_bytes, not synced"
         );
         return Ok(());
     }
-    match engine.local_changed(ClipContent::from(text), now_ms()) {
+    match engine.local_changed(content, now_ms()) {
         LocalAction::Send(clip) => {
             let hash = short_hash(clip.hash);
             node.broadcast(clip).context("cannot send the clip")?;
-            info!(size, %hash, "sent clip");
+            info!(?kind, size, %hash, "sent clip");
             *last_sent = Some(ClipEvent {
                 at_ms: now_ms(),
+                kind,
                 size,
                 hash,
                 from: None,
@@ -207,31 +213,48 @@ async fn remote_clip(
     received: Received,
 ) -> Result<()> {
     let from = received.from.fmt_short();
-    let (size, hash) = (received.clip.size, short_hash(received.clip.hash));
-    info!(%from, size, %hash, "received clip");
+    let (kind, size) = (received.clip.kind, received.clip.size);
+    let hash = short_hash(received.clip.hash);
+    info!(%from, ?kind, size, %hash, "received clip");
     let action = engine
         .remote_clip(received.clip)
         .with_context(|| format!("invalid clip from {from}"))?;
     match action {
         RemoteAction::Apply(content) => {
-            let text = match content {
-                ClipContent::Text(text) => text,
-                // No backend writes images yet.
-                ClipContent::Image(_) => {
-                    warn!(%from, size, %hash, "image clips are not supported yet, not applied");
-                    return Ok(());
-                }
-            };
             let clipboard = Arc::clone(clipboard);
-            tokio::task::spawn_blocking(move || clipboard.write_text(&text))
-                .await?
-                .context("cannot write the clip to the clipboard")?;
-            info!(%from, size, %hash, "applied clip");
+            let written = tokio::task::spawn_blocking(move || match content {
+                ClipContent::Text(text) => clipboard.write_text(&text),
+                ClipContent::Image(png) => clipboard.write_image(&png),
+            })
+            .await?;
+            match written {
+                Ok(()) => info!(%from, ?kind, size, %hash, "applied clip"),
+                // macOS and Windows do not write images yet.
+                Err(ClipboardError::Unsupported { content }) => warn!(
+                    %from, ?kind, size, %hash,
+                    "this machine's clipboard does not support {content} yet, clip not applied"
+                ),
+                Err(error) => return Err(error).context("cannot write the clip to the clipboard"),
+            }
         }
         RemoteAction::AlreadyHave => debug!(%hash, "clipboard already holds this clip"),
         RemoteAction::Stale => debug!(%hash, "clip is older than the current one, ignored"),
     }
     Ok(())
+}
+
+/// What a local copy holds: its text, or its image if it has no text.
+///
+/// Text wins when a copy offers both: apps that offer both for one copy (a spreadsheet's cells,
+/// an office document) mostly do it so the text can also be pasted as a picture, and the text is
+/// what the person meant and is much smaller. A browser's "Copy image" offers the image with
+/// `<img>` markup but no plain text; backends do not report that markup as text, so the image
+/// wins there.
+pub fn read_content(clipboard: &dyn Clipboard) -> Result<Option<ClipContent>, ClipboardError> {
+    if let Some(text) = clipboard.read_text()? {
+        return Ok(Some(ClipContent::Text(text)));
+    }
+    Ok(clipboard.read_image()?.map(ClipContent::Image))
 }
 
 /// The first 8 hex characters: enough to match clips across machines' logs.
