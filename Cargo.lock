@@ -341,6 +341,10 @@ dependencies = [
  "anyhow",
  "clap",
  "clipbroad-clipboard",
+ "clipbroad-config",
+ "clipbroad-core",
+ "clipbroad-net",
+ "iroh",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -365,6 +369,7 @@ dependencies = [
 name = "clipbroad-config"
 version = "0.1.0"
 dependencies = [
+ "clipbroad-core",
  "getrandom 0.4.3",
  "iroh",
  "serde",

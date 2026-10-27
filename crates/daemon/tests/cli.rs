@@ -41,12 +41,19 @@ fn watch_fake_prints_one_line_per_change() {
 }
 
 #[test]
-fn help_describes_watch_and_hides_fake() {
+fn help_describes_commands_and_hides_fake() {
     let help = stdout(clipbroad(&["--help"]));
     assert!(
         help.contains("watch  Print every change of the local clipboard"),
         "{help}"
     );
+
+    assert!(help.contains("run    Sync the clipboard"), "{help}");
+
+    let run_help = stdout(clipbroad(&["run", "--help"]));
+    assert!(run_help.contains("--config <FILE>"), "{run_help}");
+    assert!(run_help.contains("passwords"), "{run_help}");
+    assert!(!run_help.contains("--fake"), "{run_help}");
 
     let watch_help = stdout(clipbroad(&["watch", "--help"]));
     assert!(watch_help.contains("preview of its text"), "{watch_help}");

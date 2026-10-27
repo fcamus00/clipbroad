@@ -91,7 +91,9 @@ Detalles (código en `crates/core/src/protocol.rs`):
   `decode` distingue "faltan bytes" de un error.
 - **Tamaño máximo de frame: 16 MiB**, constante del protocolo (no configurable, porque ambos lados deben
   coincidir). El receptor lo revisa apenas llegan los 4 bytes de longitud, antes de reservar memoria; el
-  emisor no codifica un frame más grande. Por eso `inline_max_bytes` debe quedar por debajo de ese límite.
+  emisor no codifica un frame más grande. Por eso la config rechaza un `inline_max_bytes` mayor que
+  16 MiB menos 64 KiB (margen para los metadatos del clip), y el daemon no sincroniza un texto copiado
+  más grande que `inline_max_bytes`: lo salta con un warning.
 - **Mensajes:** `Hello { protocol_version }` y `Clip`. Cada lado manda `Hello` primero; `decode` devuelve
   un error tipado si la versión no coincide, y la conexión se cierra.
 - **`Hello` es estable entre versiones:** siempre es la variante 0 y `protocol_version` siempre es su
@@ -140,6 +142,22 @@ en el portapapeles local.
   - No hay puesta al día al reconectar: un peer que se perdió un clip queda con el contenido anterior
     hasta la próxima copia, y copiar de nuevo el mismo texto no lo reenvía.
 - **Contenido sensible: nunca se sincroniza** (ver la sección siguiente).
+
+### Daemon (`clipbroad run`)
+
+Un solo bucle une las piezas (`crates/daemon/src/run.rs`), con el mismo flujo que describe el módulo
+`sync`: un cambio local con formatos se lee (fuera del hilo async), y si es texto nuevo se envía a
+todos; un clip recibido se escribe en el portapapeles si el motor responde `Apply`. Un error al leer,
+escribir o procesar un clip se registra y el daemon sigue; solo una falla al arrancar o del watcher del
+portapapeles lo detiene. Se apaga con Ctrl+C o SIGTERM.
+
+- Los logs muestran el id del nodo al arrancar, las conexiones y cada clip enviado o recibido con su
+  tamaño y los primeros 8 caracteres del hash, nunca el contenido. `run` registra en nivel info por
+  defecto.
+- `--config <archivo>` usa otro archivo de config, y `secret.key` en la misma carpeta como identidad.
+  Sirve para correr dos instancias en una máquina (pruebas) mientras no existe el emparejamiento.
+- Hasta la fase 3.1 no hay filtro de contenido sensible: lo copiado desde un gestor de contraseñas
+  también se sincroniza.
 
 ## Portapapeles por plataforma
 
