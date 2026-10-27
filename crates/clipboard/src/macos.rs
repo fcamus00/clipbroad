@@ -384,7 +384,13 @@ fn local_path(url: &NSString) -> Option<PathBuf> {
         return None;
     }
     let path = url.filePathURL()?.path()?;
-    Some(PathBuf::from(path.to_string()))
+    // The file system hands back decomposed Unicode (NFD: "n" + combining tilde for "ñ"). Other
+    // OSes use the composed form (NFC), and the files hash covers the names, so a name that
+    // changed form would make an applied files clip look like a new copy. APFS and HFS+ open a
+    // file by either form.
+    Some(PathBuf::from(
+        path.precomposedStringWithCanonicalMapping().to_string(),
+    ))
 }
 
 /// The result when the pasteboard offered a type but handed over no data: an error if the user
