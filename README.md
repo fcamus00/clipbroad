@@ -54,6 +54,34 @@ xattr -d com.apple.quarantine clipbroad
 (`gh run download` usually does not set the flag; it is needed when the file was downloaded with a
 browser. If `xattr` says "No such xattr", there is nothing to do.)
 
+## Start at login
+
+`clipbroad service install` makes the daemon (`clipbroad run`) start at every login, and starts it
+right away. Pass `--config <FILE>` to use a config file other than the default one. Running it again
+updates the service and restarts the daemon. `clipbroad service status` shows whether it is installed
+and running and where its logs are; `clipbroad service uninstall` stops and removes it.
+
+The service runs the binary from the path it had during `install`: after moving the binary, run
+`service install` again.
+
+| OS | Mechanism | Logs |
+|---|---|---|
+| Linux | systemd user unit, `~/.config/systemd/user/clipbroad.service` | `journalctl --user -u clipbroad` |
+| macOS | LaunchAgent, `~/Library/LaunchAgents/io.github.fcamus00.clipbroad.plist` | `~/Library/Logs/clipbroad.log` |
+| Windows | `clipbroad` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` | not kept |
+
+On Linux the unit starts with `graphical-session.target` and needs `WAYLAND_DISPLAY` in the systemd
+user manager. Check both with `systemctl --user is-active graphical-session.target` and
+`systemctl --user show-environment`. Starting Hyprland through uwsm sets up both. Otherwise, add
+`exec-once = dbus-update-activation-environment --systemd WAYLAND_DISPLAY` to `hyprland.conf` for
+the variable. Without a session manager that activates the target, start the daemon with
+`exec-once = clipbroad run` in `hyprland.conf` instead of the service. `service install` warns when
+either is missing.
+
+On Windows the daemon runs without a console window, so its logs are lost. Windows does not restart
+it if it crashes; it starts again at the next login. `install` and `uninstall` stop every other
+running `clipbroad.exe`.
+
 ## Development
 
 ```sh

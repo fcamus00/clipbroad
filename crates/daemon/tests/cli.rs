@@ -52,13 +52,18 @@ fn pair_rejects_a_bad_ticket() {
 #[test]
 fn help_describes_commands_and_hides_fake() {
     let help = stdout(clipbroad(&["--help"]));
+    // Collapse the column padding, which changes with the longest command name.
+    let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        help.contains("watch  Print every change of the local clipboard"),
+        help.contains("watch Print every change of the local clipboard"),
         "{help}"
     );
-
-    assert!(help.contains("run    Sync the clipboard"), "{help}");
-    assert!(help.contains("pair   Pair with another machine"), "{help}");
+    assert!(help.contains("run Sync the clipboard"), "{help}");
+    assert!(
+        help.contains("service Start `clipbroad run` at login"),
+        "{help}"
+    );
+    assert!(help.contains("pair Pair with another machine"), "{help}");
 
     let pair_help = stdout(clipbroad(&["pair", "--help"]));
     assert!(pair_help.contains("[TICKET]"), "{pair_help}");
@@ -76,4 +81,16 @@ fn help_describes_commands_and_hides_fake() {
     assert!(watch_help.contains("preview of its text"), "{watch_help}");
     assert!(watch_help.contains("sensitive"), "{watch_help}");
     assert!(!watch_help.contains("--fake"), "{watch_help}");
+}
+
+#[test]
+fn service_help_lists_actions_and_explains_moving_the_binary() {
+    let help = stdout(clipbroad(&["service", "--help"]));
+    for action in ["install", "uninstall", "status"] {
+        assert!(help.contains(action), "{help}");
+    }
+    assert!(help.contains("after moving the binary"), "{help}");
+
+    let install_help = stdout(clipbroad(&["service", "install", "--help"]));
+    assert!(install_help.contains("--config <FILE>"), "{install_help}");
 }

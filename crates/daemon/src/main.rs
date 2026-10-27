@@ -1,6 +1,7 @@
 mod backend;
 mod pair;
 mod run;
+mod service;
 mod watch;
 
 use std::io::IsTerminal;
@@ -47,6 +48,12 @@ enum Command {
     /// (first 80 characters, with newlines and control characters escaped). Content marked as
     /// sensitive shows the marker instead, and is never read. Nothing is sent to other machines.
     Watch(watch::Args),
+    /// Start `clipbroad run` at login: install, uninstall, or check the service.
+    ///
+    /// It uses each OS's own mechanism: a systemd user unit on Linux, a `LaunchAgent` on macOS, and
+    /// a `Run` registry value on Windows. The service runs this executable from its current path,
+    /// so after moving the binary, run `service install` again.
+    Service(service::Args),
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -54,13 +61,14 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let default_level = match cli.command {
         Command::Run(_) => LevelFilter::INFO,
-        Command::Pair(_) | Command::Watch(_) => LevelFilter::WARN,
+        Command::Pair(_) | Command::Watch(_) | Command::Service(_) => LevelFilter::WARN,
     };
     init_logging(default_level, cli.verbose);
     match cli.command {
         Command::Pair(args) => pair::run(args).await,
         Command::Run(args) => run::run(args).await,
         Command::Watch(args) => watch::run(args).await,
+        Command::Service(args) => service::run(args),
     }
 }
 
