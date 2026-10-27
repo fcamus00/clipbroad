@@ -42,8 +42,9 @@ pub use watch::{ChangeSender, ClipboardChange, ClipboardWatch, WatchClosed};
 ///
 /// - Text is UTF-8 and is returned and written **verbatim**: no trimming, no line-ending
 ///   conversion, no size limit at this layer.
-/// - Sensitive-content markers (password managers) are *not* filtered here. Backends report them
-///   in [`ClipboardChange::formats`] and the daemon decides.
+/// - Sensitive content (password managers) is never read: see [`read_text`](Self::read_text).
+///   Change events still report the markers in [`ClipboardChange::formats`], so tools like
+///   `clipbroad watch` can show them.
 ///
 /// # Watching
 ///
@@ -59,11 +60,23 @@ pub trait Clipboard: Send + Sync {
     /// - `Ok(None)` if the clipboard is empty, holds only non-text content (an image, files), or
     ///   the text cannot be decoded as UTF-8 without loss. None of these is an error.
     ///
+    /// # Sensitive content
+    ///
+    /// Before reading the text, list the formats offered **by the same content** and pass them to
+    /// [`sensitive_marker`](clipbroad_core::sensitive::sensitive_marker). If it finds a marker,
+    /// return [`ClipboardError::Sensitive`] without reading the text. The formats in a change
+    /// event are not enough: the content may have changed since, and the check would then pass
+    /// for a secret copied right after. So the listing and the read must be one atomic step, or
+    /// the backend must detect a change in between and retry or give up. Each backend documents
+    /// how it does this. If the formats (or a Windows flag value) cannot be read, return an error:
+    /// unknown means sensitive.
+    ///
     /// # Errors
     ///
-    /// Only for real failures: [`ClipboardError::Unavailable`] when the clipboard cannot be
-    /// accessed at all, [`ClipboardError::Busy`] when another app keeps it locked after a few
-    /// retries, [`ClipboardError::Backend`] for anything else.
+    /// [`ClipboardError::Sensitive`] as above. Otherwise only for real failures:
+    /// [`ClipboardError::Unavailable`] when the clipboard cannot be accessed at all,
+    /// [`ClipboardError::Busy`] when another app keeps it locked after a few retries,
+    /// [`ClipboardError::Backend`] for anything else.
     fn read_text(&self) -> Result<Option<String>, ClipboardError>;
 
     /// Replaces the whole clipboard content with `text`.
@@ -78,7 +91,8 @@ pub trait Clipboard: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Same categories as [`read_text`](Self::read_text).
+    /// Same categories as [`read_text`](Self::read_text), except
+    /// [`ClipboardError::Sensitive`].
     fn write_text(&self, text: &str) -> Result<(), ClipboardError>;
 
     /// Starts watching the clipboard and returns the stream of changes.
@@ -110,9 +124,9 @@ pub trait Clipboard: Send + Sync {
     ///   (next change or next polling tick).
     ///
     /// For consumers: an event says the clipboard *may* have changed and which formats it offers.
-    /// Check the formats first (sensitive markers, non-text content), then call
-    /// [`read_text`](Self::read_text) if wanted. The content can change again between the event
-    /// and the read; if so, another event follows.
+    /// Call [`read_text`](Self::read_text) if wanted; it checks for sensitive markers itself, on
+    /// the content it actually reads. The content can change again between the event and the
+    /// read; if so, another event follows.
     ///
     /// # Errors
     ///

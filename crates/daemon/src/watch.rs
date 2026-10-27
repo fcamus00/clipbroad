@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use clipbroad_clipboard::Clipboard;
 use clipbroad_clipboard::fake::{FakeClipboard, TEXT_FORMAT};
+use clipbroad_clipboard::{Clipboard, ClipboardError};
 
 use crate::backend;
 
@@ -16,7 +16,7 @@ use crate::backend;
 const PREVIEW_CHARS: usize = 80;
 
 /// What `--fake` copies, as `(text, formats)`: one entry per kind of output line.
-const FAKE_COPIES: [(Option<&str>, &[&str]); 5] = [
+const FAKE_COPIES: [(Option<&str>, &[&str]); 6] = [
     (Some("hello from clipbroad"), &[TEXT_FORMAT]),
     (Some("two lines\nand a\ttab"), &[TEXT_FORMAT]),
     (
@@ -26,6 +26,7 @@ const FAKE_COPIES: [(Option<&str>, &[&str]); 5] = [
         ),
         &[TEXT_FORMAT],
     ),
+    (Some("hunter2"), &[TEXT_FORMAT, "x-kde-passwordManagerHint"]),
     (None, &["image/png"]),
     (None, &[]),
 ];
@@ -88,6 +89,9 @@ async fn watch(
             match tokio::task::spawn_blocking(move || clipboard.read_text()).await? {
                 Ok(Some(text)) => preview(&text),
                 Ok(None) => "(no text)".to_owned(),
+                Err(ClipboardError::Sensitive { marker }) => {
+                    format!("(sensitive: {marker}, not read or synced)")
+                }
                 Err(error) => format!("(cannot read text: {error})"),
             }
         };
