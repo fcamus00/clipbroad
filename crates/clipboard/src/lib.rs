@@ -7,6 +7,8 @@
 mod error;
 pub mod fake;
 mod watch;
+#[cfg(target_os = "linux")]
+pub mod wayland;
 
 pub use error::ClipboardError;
 pub use watch::{ChangeSender, ClipboardChange, ClipboardWatch, WatchClosed};
