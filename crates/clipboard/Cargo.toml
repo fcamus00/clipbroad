@@ -9,6 +9,10 @@ publish.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["event"] }
+wl-clipboard-rs.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 
