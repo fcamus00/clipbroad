@@ -207,9 +207,10 @@ en el portapapeles local.
 ### Daemon (`clipbroad run`)
 
 Un solo bucle une las piezas (`crates/daemon/src/run.rs`), con el mismo flujo que describe el módulo
-`sync`: un cambio local con formatos se lee (fuera del hilo async), y si es texto o imagen nuevo se
-envía a todos (ver "Imágenes" para cuál gana si hay ambos); un clip recibido se escribe en el
-portapapeles si el motor responde `Apply`. Un error al leer, escribir o procesar un clip se registra y
+`sync`: un cambio local con formatos se lee (fuera del hilo async), y si es contenido nuevo se
+envía a todos (ver "Archivos" e "Imágenes" para cuál gana si una copia trae varios); un clip recibido
+se escribe en el portapapeles si el motor responde `Apply` (los archivos, después de descargarlos;
+ver "Archivos en el portapapeles"). Un error al leer, escribir o procesar un clip se registra y
 el daemon sigue; solo una falla al arrancar o del watcher del portapapeles lo detiene. Se apaga con
 Ctrl+C o SIGTERM.
 
@@ -262,7 +263,10 @@ Contrato del trait (detalle completo en los doc comments de `crates/clipboard`):
   `spawn_blocking`. Portapapeles vacío o sin texto es `Ok(None)`, no un error.
 - `read_image` / `write_image` siguen las mismas reglas con imágenes PNG (ver "Imágenes"). Son
   opcionales: por defecto `read_image` devuelve `Ok(None)` y `write_image` devuelve
-  `ClipboardError::Unsupported`, así un backend sin imágenes (hoy macOS y Windows) compila igual.
+  `ClipboardError::Unsupported`, así un backend sin imágenes compila igual.
+- `read_files` / `write_files` siguen las mismas reglas con rutas locales de archivos (ver "Archivos
+  en el portapapeles"). También son opcionales, con los mismos valores por defecto: hoy solo Wayland
+  los implementa.
 - Ninguna lectura o escritura bloquea más de 2 segundos: si la app dueña del contenido no responde, el
   backend devuelve error. El límite lo pone el backend porque el daemon no puede cancelar un hilo bloqueado.
 - `watch` devuelve un **canal** (no un callback): el backend empuja eventos desde su propio hilo del SO
@@ -270,7 +274,7 @@ Contrato del trait (detalle completo en los doc comments de `crates/clipboard`):
   sin límite porque los eventos son chicos y a velocidad humana.
 - Un evento no trae el contenido, solo los **formatos ofrecidos** con su nombre nativo (MIME en Linux,
   UTI en macOS, nombre de formato en Windows).
-- `read_text` y `read_image` nunca leen contenido sensible: revisan los marcadores sobre el mismo
+- `read_text`, `read_image` y `read_files` nunca leen contenido sensible: revisan los marcadores sobre el mismo
   contenido que leen y devuelven `ClipboardError::Sensitive` sin leer los datos (ver "Contenido
   sensible").
 - Se reportan **todos** los cambios, incluidos los que causa el propio daemon al escribir; el anti-eco
@@ -301,8 +305,8 @@ Cómo se aplica (código en `crates/core/src/sensitive.rs` y en cada backend):
   copia: si se revisaran los formatos del evento, un secreto copiado justo después se leería con los
   formatos del contenido anterior. Por eso cada backend lista los formatos y lee el texto del mismo
   contenido, y si encuentra un marcador devuelve `ClipboardError::Sensitive` sin leer el texto. Que
-  sea un error hace que quien lo olvide manejar igual se quede sin el texto. `read_image` hace lo
-  mismo con la imagen.
+  sea un error hace que quien lo olvide manejar igual se quede sin el texto. `read_image` y
+  `read_files` hacen lo mismo con la imagen y la lista de archivos.
   - **Wayland:** pide al compositor la oferta actual, que trae su lista de MIME fija, y lee el texto
     de esa misma oferta. Una copia nueva es otra oferta, así que la lista y el texto siempre son del
     mismo contenido.
@@ -375,7 +379,8 @@ el umbral de tamaño. Código en `crates/core/src/content.rs` (`Png`) y `protoco
   Por eso un backend debe devolver los mismos bytes PNG que escribió, por ejemplo escribiendo el tipo PNG
   y leyéndolo primero cuando está.
 - **Texto e imagen en la misma copia: gana el texto.** El daemon llama a `read_text` y, solo si no hay
-  texto, a `read_image` (`read_content` en `crates/daemon/src/run.rs`). Las apps que ofrecen ambos en
+  texto, a `read_image` (`read_content` en `crates/daemon/src/run.rs`; antes de los dos busca
+  archivos, ver "Archivos en el portapapeles"). Las apps que ofrecen ambos en
   una copia (celdas de una planilla, un documento de oficina) lo hacen sobre todo para que el texto se
   pueda pegar también como dibujo; lo que la persona quiso copiar es el texto, que además pesa mucho
   menos. Un clip lleva un solo contenido, así que no se pueden mandar los dos.
@@ -404,7 +409,8 @@ el umbral de tamaño. Código en `crates/core/src/content.rs` (`Png`) y `protoco
   portapapeles puede ser más grande que lo que se puso en él. La revisión de marcadores y la lectura
   pasan en la misma apertura del portapapeles, igual que con el texto.
 - `clipbroad watch` muestra una imagen como `(image/png, 12345 bytes)` y `clipbroad status` muestra el
-  tipo del último clip (`text` o `image`) junto al tamaño y el hash.
+  tipo del último clip (`text` o `image`) junto al tamaño y el hash. Los archivos se muestran como
+  `(3 files, 41.9 MB)` en `watch` y `3 files, 41.9 MB` en `status`.
 
 ## Archivos
 
@@ -488,7 +494,7 @@ Implementación (código en `crates/core/src/files.rs`, `crates/net/src/files.rs
   porque el SO puede devolver los archivos en otro orden al leerlos de vuelta, y el anti-eco necesita
   el mismo hash. El modo de derivación de clave lo separa
   del BLAKE3 simple de un texto o una imagen, así nunca chocan. No depende de dónde están los archivos
-  en cada máquina: al poner las rutas de la caché en el portapapeles (tarea 4.5), el evento local
+  en cada máquina: al poner las rutas de la caché en el portapapeles, el evento local
   calcula el mismo hash y el motor lo reconoce como eco.
 - **Nombres.** Un nombre válido es un solo componente que los tres SO pueden crear tal cual:
   no vacío, hasta 255 bytes, sin `/`, `\` ni los otros caracteres que Windows no permite
@@ -519,7 +525,7 @@ Implementación (código en `crates/core/src/files.rs`, `crates/net/src/files.rs
 - **Un archivo que ya está en la caché no se pide.** Antes se vuelve a calcular su hash, por si una
   app lo editó en el lugar (cuesta unos 17 ms por cada 100 MB); si no coincide, se borra y se pide.
 - **Cancelar es soltar la descarga.** Soltar el future de `fetch_files` cierra el stream (el emisor
-  recibe `STOP_SENDING`) y borra el temporal. El daemon (tarea 4.5) suelta la descarga en curso
+  recibe `STOP_SENDING`) y borra el temporal. El daemon suelta la descarga en curso
   cuando llega un clip más nuevo.
 - **Reintentos.** Si la conexión se cae o se reemplaza a mitad de un archivo, se pide de nuevo desde
   cero en la conexión siguiente, hasta 3 intentos, esperando hasta 10 s a que el peer vuelva. Otros
@@ -558,10 +564,52 @@ Riesgos y límites:
 - **El motor marca el clip como aplicado antes de tener los archivos.** Si la descarga falla, ese
   clip no se reintenta hasta la próxima copia, como pasa hoy con una imagen que el SO no puede
   escribir.
-- **Todavía no se aplican.** Hasta la tarea 4.5 el daemon no lee archivos del portapapeles, y un clip
-  de archivos recibido se salta con un warning.
+- **macOS y Windows todavía no leen ni escriben archivos** (ver "Archivos en el portapapeles"). Un
+  clip de archivos recibido ahí se descarga a la caché y después no se puede poner en el
+  portapapeles: el daemon lo registra con un warning.
 - Se puede volver a evaluar `iroh-blobs` cuando su línea compatible con iroh 1.x se declare lista para
   producción.
+
+### Archivos en el portapapeles
+
+Código en `crates/clipboard` (`read_files`, `write_files`) y `crates/daemon/src/run.rs`.
+
+- **El trait trabaja con rutas.** `read_files` devuelve las rutas locales de los archivos copiados
+  (`Ok(None)` si no hay) y `write_files` pone rutas locales en el portapapeles. Mismas reglas que el
+  texto y las imágenes: 2 s como máximo, se reportan las escrituras propias y la revisión de
+  marcadores sensibles se hace sobre el mismo contenido que se lee. No revisan el sistema de
+  archivos: una ruta puede ser una carpeta o ya no existir, y eso lo resuelve `Offer::read`.
+- **Cuál gana si una copia trae varios: archivos, después texto, después imagen.** Un file manager
+  ofrece las rutas también como texto, pero lo que la persona copió son los archivos. Entre texto e
+  imagen siguen las reglas de "Imágenes" (gana el texto plano, salvo "Copiar imagen" del
+  navegador). `read_content` llama a `read_files`, `read_text` y `read_image` en ese orden.
+- **Wayland, lectura.** Lee `text/uri-list` (RFC 2483) de la misma oferta cuya lista de MIME revisó.
+  Solo cuentan las URIs `file://` con host vacío, `localhost` o el nombre de esta máquina, y se
+  decodifican los `%XX`. Si una sola URI es de otro tipo (un enlace web copiado), la copia no es de
+  archivos y sigue siendo texto. Las líneas que empiezan con `#` son comentarios. Una URI mal
+  codificada, con un NUL, una query o un fragmento tampoco cuenta.
+- **Wayland, escritura.** Ofrece las mismas rutas de tres formas: `text/uri-list`,
+  `x-special/gnome-copied-files` (`copy` y una URI por línea, lo que lee GNOME Files) y texto plano
+  con una ruta por línea, como hace GNOME Files al copiar, para que pegar en una terminal o un editor
+  dé las rutas. Las URIs codifican con `%XX` todo lo que no sea letra, número, `/`, `-`, `.`, `_` o
+  `~`, así los espacios y los caracteres no ASCII ida y vuelta dan la misma ruta.
+- **Al copiar archivos aquí:** `Offer::read` revisa y calcula el hash de cada archivo fuera del hilo
+  async (salta carpetas y archivos sobre el límite con un warning), el daemon arma el clip de
+  archivos y lo envía con `broadcast_files`. `inline_max_bytes` no aplica a los archivos.
+- **Al recibir un clip de archivos:** la caché (`FileCache`) se abre al arrancar. La descarga es un
+  future que el bucle principal atiende junto con todo lo demás, así una descarga grande no frena
+  los clips ni las copias locales. Hay como mucho una: cualquier clip más nuevo (recibido con
+  `Apply`, o una copia local que se envía) la suelta, y eso la cancela (ver "Cancelar es soltar la
+  descarga"). Cuando termina, sigue siendo la más nueva por construcción, y el daemon escribe las
+  rutas de la caché con `write_files`. No es una tarea aparte de tokio porque tendría que compartir
+  el `Node`, y cancelarla y esperar a que suelte el nodo al apagar es más código.
+- **Anti-eco.** Escribir las rutas de la caché dispara un evento local. El daemon las lee, y
+  `Offer::read` calcula el mismo hash de lista que el clip recibido: el hash depende solo de nombre,
+  tamaño y hash de cada archivo, no de dónde están. El motor responde `Unchanged` y no se reenvía.
+  Cuesta leer los archivos otra vez (unos 17 ms por cada 100 MB).
+- **macOS y Windows** (`NSPasteboardTypeFileURL`, `CF_HDROP`) llegan en un PR aparte. Hasta
+  entonces usan los valores por defecto del trait: nunca reportan archivos, y un clip de archivos
+  recibido se descarga pero no se puede escribir (warning en el log).
 
 ## Ciclo de vida del daemon
 

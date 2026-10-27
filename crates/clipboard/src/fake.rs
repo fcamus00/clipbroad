@@ -1,7 +1,7 @@
 //! In-memory [`Clipboard`] for tests of the sync logic.
 //!
 //! It follows the same contract as the real backends, including emitting a change event for its
-//! own writes and returning written images byte for byte, so logic tested against it (anti-echo
+//! own writes and returning written images and files as written, so logic tested against it (anti-echo
 //! especially) behaves the same on real clipboards.
 //!
 //! ```
@@ -23,6 +23,7 @@
 //! # }
 //! ```
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use clipbroad_core::Png;
@@ -35,6 +36,9 @@ pub const TEXT_FORMAT: &str = "text/plain;charset=utf-8";
 
 /// The format the fake offers for images.
 pub const IMAGE_FORMAT: &str = "image/png";
+
+/// The format the fake offers for files. A MIME type, as on Linux.
+pub const FILES_FORMAT: &str = "text/uri-list";
 
 /// A real 1x1 PNG (70 bytes), for tests that need an image.
 ///
@@ -64,6 +68,7 @@ pub struct FakeClipboard {
 struct State {
     text: Option<String>,
     image: Option<Png>,
+    files: Option<Vec<PathBuf>>,
     /// What the current content offers, checked by the reads like the real backends do.
     formats: Vec<String>,
     watchers: Vec<ChangeSender>,
@@ -88,26 +93,45 @@ impl FakeClipboard {
     /// plain-text copy can't express, e.g. a password manager (`Some("hunter2")` with
     /// `x-kde-passwordManagerHint` among the formats) or an image (`None` with `["image/png"]`).
     pub fn simulate_copy(&self, text: Option<String>, formats: Vec<String>) {
-        self.set(text, None, formats);
+        self.set(text, None, None, formats);
     }
 
     /// Simulates another application copying an image (offered as [`IMAGE_FORMAT`]).
     pub fn simulate_copy_image(&self, png: Png) {
-        self.set(None, Some(png), vec![IMAGE_FORMAT.to_owned()]);
+        self.set(None, Some(png), None, vec![IMAGE_FORMAT.to_owned()]);
     }
 
     /// Simulates an application that offers text and an image for the same copy, like a
     /// spreadsheet copying cells.
     pub fn simulate_copy_text_and_image(&self, text: impl Into<String>, png: Png) {
         let formats = vec![TEXT_FORMAT.to_owned(), IMAGE_FORMAT.to_owned()];
-        self.set(Some(text.into()), Some(png), formats);
+        self.set(Some(text.into()), Some(png), None, formats);
     }
 
-    fn set(&self, text: Option<String>, image: Option<Png>, formats: Vec<String>) {
+    /// Simulates a file manager copying the files at `paths`: it offers them as
+    /// [`FILES_FORMAT`] and their paths, one per line, as text.
+    pub fn simulate_copy_files(&self, paths: Vec<PathBuf>) {
+        let text = paths
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let formats = vec![FILES_FORMAT.to_owned(), TEXT_FORMAT.to_owned()];
+        self.set(Some(text), None, Some(paths), formats);
+    }
+
+    fn set(
+        &self,
+        text: Option<String>,
+        image: Option<Png>,
+        files: Option<Vec<PathBuf>>,
+        formats: Vec<String>,
+    ) {
         let mut state = self.lock();
         let change = ClipboardChange::new(formats.clone());
         state.text = text;
         state.image = image;
+        state.files = files;
         state.formats = formats;
         // Notify every live watcher and forget the ones whose consumer is gone.
         state
@@ -152,6 +176,19 @@ impl Clipboard for FakeClipboard {
 
     fn write_image(&self, png: &Png) -> Result<(), ClipboardError> {
         self.simulate_copy_image(png.clone());
+        Ok(())
+    }
+
+    fn read_files(&self) -> Result<Option<Vec<PathBuf>>, ClipboardError> {
+        let state = self.lock();
+        match sensitive_marker(&state.formats) {
+            Some(marker) => Err(ClipboardError::Sensitive { marker }),
+            None => Ok(state.files.clone()),
+        }
+    }
+
+    fn write_files(&self, paths: &[PathBuf]) -> Result<(), ClipboardError> {
+        self.simulate_copy_files(paths.to_vec());
         Ok(())
     }
 
@@ -300,6 +337,7 @@ mod tests {
         clipboard.set(
             None,
             Some(tiny_png()),
+            None,
             vec![
                 IMAGE_FORMAT.to_owned(),
                 "x-kde-passwordManagerHint".to_owned(),
@@ -307,6 +345,44 @@ mod tests {
         );
         assert!(matches!(
             clipboard.read_image(),
+            Err(ClipboardError::Sensitive { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn files_round_trip_with_their_paths_as_text() {
+        let clipboard = FakeClipboard::new();
+        let mut watch = clipboard.watch().expect("watch");
+        let paths = vec![PathBuf::from("/tmp/a b.txt"), PathBuf::from("/tmp/ñ")];
+
+        clipboard.write_files(&paths).expect("write files");
+
+        let change = next_change(&mut watch).await;
+        assert_eq!(change.formats, [FILES_FORMAT, TEXT_FORMAT]);
+        assert_eq!(clipboard.read_files().expect("read"), Some(paths));
+        assert_eq!(
+            clipboard.read_text().expect("read").as_deref(),
+            Some("/tmp/a b.txt\n/tmp/ñ")
+        );
+
+        clipboard.write_text("text again").expect("write text");
+        assert_eq!(clipboard.read_files().expect("read"), None);
+    }
+
+    #[test]
+    fn refuses_to_read_sensitive_files() {
+        let clipboard = FakeClipboard::new();
+        clipboard.set(
+            None,
+            None,
+            Some(vec![PathBuf::from("/tmp/secret")]),
+            vec![
+                FILES_FORMAT.to_owned(),
+                "x-kde-passwordManagerHint".to_owned(),
+            ],
+        );
+        assert!(matches!(
+            clipboard.read_files(),
             Err(ClipboardError::Sensitive { .. })
         ));
     }

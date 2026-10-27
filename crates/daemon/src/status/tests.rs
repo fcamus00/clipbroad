@@ -23,6 +23,7 @@ fn sample() -> DaemonStatus {
             at_ms: NOW_MS - 3 * 60_000,
             kind: ContentKind::Text,
             size: 120,
+            files: None,
             hash: "1a2b3c4d".to_owned(),
             from: None,
         }),
@@ -72,6 +73,7 @@ fn names_the_peer_a_clip_came_from() {
             at_ms: NOW_MS - 5_000,
             kind: ContentKind::Image,
             size: 48_213,
+            files: None,
             hash: "9f8e7d6c".to_owned(),
             from: Some(id(2)),
         }),
@@ -79,6 +81,24 @@ fn names_the_peer_a_clip_came_from() {
     };
     assert!(render(Some(&status), NOW_MS).contains(
         "last received  11:59:55 UTC (5 s ago), image, 48213 bytes, hash 9f8e7d6c, from laptop\n"
+    ));
+}
+
+#[test]
+fn shows_how_many_files_and_their_size() {
+    let status = DaemonStatus {
+        last_received: Some(ClipEvent {
+            at_ms: NOW_MS - 5_000,
+            kind: ContentKind::Files,
+            size: 41_900_000,
+            files: Some(3),
+            hash: "9f8e7d6c".to_owned(),
+            from: Some(id(2)),
+        }),
+        ..sample()
+    };
+    assert!(render(Some(&status), NOW_MS).contains(
+        "last received  11:59:55 UTC (5 s ago), 3 files, 41.9 MB, hash 9f8e7d6c, from laptop\n"
     ));
 }
 
@@ -124,8 +144,9 @@ fn every_field_survives_the_file_format() {
         paste_access: Some(PasteAccess::Other(7)),
         last_received: Some(ClipEvent {
             at_ms: NOW_MS,
-            kind: ContentKind::Image,
+            kind: ContentKind::Files,
             size: 5,
+            files: Some(2),
             hash: "9f8e7d6c".to_owned(),
             from: Some(id(2)),
         }),

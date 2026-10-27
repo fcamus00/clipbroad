@@ -10,12 +10,14 @@
 
 #![cfg(target_os = "linux")]
 
+use std::io::Read;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clipbroad_clipboard::wayland::WaylandClipboard;
 use clipbroad_clipboard::{Clipboard, ClipboardChange, ClipboardError, ClipboardWatch};
 use clipbroad_core::Png;
-use wl_clipboard_rs::copy;
+use wl_clipboard_rs::{copy, paste};
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -37,6 +39,19 @@ fn copy_both(text_mime: &str, text: &str, png: &Png) {
             source(png.as_bytes(), "image/png"),
         ])
         .expect("copy text and image");
+}
+
+/// What another app pasting `mime_type` gets.
+fn paste_as(mime_type: &str) -> String {
+    let (mut pipe, _) = paste::get_contents(
+        paste::ClipboardType::Regular,
+        paste::Seat::Unspecified,
+        paste::MimeType::Specific(mime_type),
+    )
+    .expect("paste");
+    let mut text = String::new();
+    pipe.read_to_string(&mut text).expect("read pasted text");
+    text
 }
 
 async fn next_change(watch: &mut ClipboardWatch) -> ClipboardChange {
@@ -153,6 +168,8 @@ async fn real_clipboard_round_trip_and_watch() {
         "sensitive image was read"
     );
 
+    files_round_trip(&clipboard, &mut watch).await;
+
     drop(watch);
     let deadline = Instant::now() + Duration::from_secs(1);
     while !watch_threads().is_empty() {
@@ -163,4 +180,50 @@ async fn real_clipboard_round_trip_and_watch() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// Part of the test above: files written and read back, and a web link that is not files.
+async fn files_round_trip(clipboard: &WaylandClipboard, watch: &mut ClipboardWatch) {
+    // Files: paths with spaces and non-ASCII round-trip, offered the ways file managers paste.
+    let files = vec![
+        PathBuf::from("/tmp/clipbroad test/ñandú 🦀.txt"),
+        PathBuf::from("/tmp/b.txt"),
+    ];
+    clipboard.write_files(&files).expect("write files");
+    let change = next_change(watch).await;
+    for format in [
+        "text/uri-list",
+        "x-special/gnome-copied-files",
+        "text/plain;charset=utf-8",
+    ] {
+        assert!(change.has_format(format), "{format} missing: {change:?}");
+    }
+    assert_eq!(clipboard.read_files().expect("read files"), Some(files));
+    let uris = "file:///tmp/clipbroad%20test/%C3%B1and%C3%BA%20%F0%9F%A6%80.txt\nfile:///tmp/b.txt";
+    assert_eq!(
+        paste_as("x-special/gnome-copied-files"),
+        format!("copy\n{uris}")
+    );
+    assert_eq!(
+        paste_as("text/uri-list"),
+        format!("{}\r\n", uris.replace('\n', "\r\n"))
+    );
+    assert_eq!(
+        clipboard.read_text().expect("read text").as_deref(),
+        Some("/tmp/clipbroad test/ñandú 🦀.txt\n/tmp/b.txt")
+    );
+
+    // A copied web link is a URI list too, but not files: it stays text.
+    copy::Options::new()
+        .copy(
+            copy::Source::Bytes(b"https://example.com/\r\n"[..].into()),
+            copy::MimeType::Specific("text/uri-list".to_owned()),
+        )
+        .expect("copy a link");
+    next_change(watch).await;
+    assert_eq!(clipboard.read_files().expect("read files"), None);
+    assert_eq!(
+        clipboard.read_text().expect("read text").as_deref(),
+        Some("https://example.com/\r\n")
+    );
 }
