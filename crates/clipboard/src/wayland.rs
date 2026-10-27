@@ -86,7 +86,10 @@ impl Clipboard for WaylandClipboard {
             Err(error) => return Err(paste_error("requesting clipboard text", error)),
         };
         let bytes = read_to_end_within(pipe, READ_TIMEOUT)?;
-        Ok(String::from_utf8(bytes).ok())
+        // The contract maps empty text to `None`, the same as no text.
+        Ok(String::from_utf8(bytes)
+            .ok()
+            .filter(|text| !text.is_empty()))
     }
 
     fn write_text(&self, text: &str) -> Result<(), ClipboardError> {

@@ -60,10 +60,7 @@ async fn real_clipboard_round_trip_and_watch() {
 
     clipboard.write_text("").expect("write empty");
     next_change(&mut watch).await;
-    assert_eq!(
-        clipboard.read_text().expect("read empty").as_deref(),
-        Some("")
-    );
+    assert_eq!(clipboard.read_text().expect("read empty"), None);
 
     drop(watch);
     let deadline = Instant::now() + Duration::from_secs(1);
