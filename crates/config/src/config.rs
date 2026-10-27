@@ -6,6 +6,7 @@ use std::{
     path::Path,
 };
 
+use iroh::EndpointId;
 use serde::Deserialize;
 
 use crate::Error;
@@ -29,8 +30,8 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Peer {
-    /// The peer's public identity (iroh `EndpointId`) as 64 hexadecimal characters.
-    pub id: String,
+    /// The peer's public identity, written in the file as 64 lowercase hexadecimal characters.
+    pub id: EndpointId,
     /// Human-friendly label, only used in logs and status output.
     pub name: Option<String>,
     /// Addresses to dial directly, for networks where LAN discovery does not reach,
@@ -47,7 +48,7 @@ pub enum ParseError {
     #[error(transparent)]
     Toml(#[from] toml::de::Error),
 
-    /// Valid TOML, but the peer list is not acceptable (bad or repeated id).
+    /// Valid TOML, but the peer list is not acceptable (repeated id).
     #[error("{0}")]
     Invalid(String),
 }
@@ -73,8 +74,8 @@ impl Config {
     /// # Errors
     ///
     /// [`ParseError::Toml`] for syntax errors, unknown fields, wrong types or out-of-range values
-    /// (including zero where a non-zero number is required), and [`ParseError::Invalid`] for a
-    /// malformed or repeated peer id.
+    /// (including zero where a non-zero number is required) and malformed peer ids, and
+    /// [`ParseError::Invalid`] for a repeated peer id.
     pub fn from_toml_str(text: &str) -> Result<Self, ParseError> {
         let config: Self = toml::from_str(text)?;
         config.validate()?;
@@ -101,13 +102,7 @@ impl Config {
     fn validate(&self) -> Result<(), ParseError> {
         let mut seen = HashSet::new();
         for peer in &self.peers {
-            if peer.id.len() != 64 || !peer.id.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(ParseError::Invalid(format!(
-                    "peer id {:?} is not valid: expected 64 hexadecimal characters",
-                    peer.id
-                )));
-            }
-            if !seen.insert(peer.id.to_ascii_lowercase()) {
+            if !seen.insert(peer.id) {
                 return Err(ParseError::Invalid(format!(
                     "peer id {} appears more than once",
                     peer.id
@@ -157,7 +152,7 @@ mod tests {
 
         let laptop = &config.peers[0];
         assert_eq!(laptop.name.as_deref(), Some("laptop"));
-        assert_eq!(laptop.id.len(), 64);
+        assert_eq!(laptop.id.to_string(), ID_A);
         assert_eq!(
             laptop.addrs,
             vec![
@@ -217,14 +212,13 @@ mod tests {
     #[test]
     fn bad_peer_id_is_rejected() {
         let err = Config::from_toml_str("[[peers]]\nid = \"not-a-key\"\n").expect_err("invalid");
-        assert!(matches!(err, ParseError::Invalid(_)));
-        assert!(err.to_string().contains("not-a-key"), "{err}");
+        assert!(matches!(err, ParseError::Toml(_)), "{err}");
+        assert!(err.to_string().contains("line 2"), "{err}");
     }
 
     #[test]
     fn duplicate_peer_is_rejected() {
-        let upper = ID_A.to_ascii_uppercase();
-        let text = format!("[[peers]]\nid = \"{ID_A}\"\n[[peers]]\nid = \"{upper}\"\n");
+        let text = format!("[[peers]]\nid = \"{ID_A}\"\n[[peers]]\nid = \"{ID_A}\"\n");
         let err = Config::from_toml_str(&text).expect_err("duplicate");
         assert!(err.to_string().contains("more than once"), "{err}");
     }

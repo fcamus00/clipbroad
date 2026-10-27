@@ -41,6 +41,31 @@ Configuración decidida:
   hostname de MagicDNS resuelto. Puerto de escucha fijo y configurable.
 - **Allowlist**: solo se aceptan conexiones de `EndpointId` emparejados, usando `EndpointHooks`
   (ver el ejemplo `auth-hook` de iroh). Todo lo demás se rechaza.
+- **Features de iroh**: `tls-ring` y `fast-apple-datapath`, sin las de por defecto. Sin `portmapper`
+  (UPnP no hace falta en LAN/Tailscale y trae una dependencia MPL-2.0) ni `metrics`. `cargo deny` solo
+  revisa los targets que se publican (así no cuentan los crates solo-wasm de iroh) y permite
+  CDLA-Permissive-2.0 únicamente para `webpki-roots`. El aviso RUSTSEC-2024-0436 (`paste` sin
+  mantenimiento, no es una vulnerabilidad) se ignora porque iroh lo necesita vía `netwatch`.
+
+### Conexiones (crate `net`)
+
+- **Una conexión por peer**, de larga vida. Cada nodo marca a todos los peers de los que tiene
+  direcciones y acepta las conexiones que le llegan de ellos. Un peer sin direcciones en la config
+  solo puede conectarse marcando él.
+- **Streams:** cada lado abre un stream unidireccional y escribe frames: primero `Hello`, luego un
+  frame por clip. Lee el stream del otro lado igual. No hay pedido/respuesta.
+- **Conexiones duplicadas:** si los dos marcan a la vez quedan dos conexiones. Decide solo el nodo con
+  el id menor: se queda con la que terminó el intercambio de `Hello` más recientemente y cierra la
+  otra. El nodo con el id mayor no cierra nada. Así ambos convergen sin acordar nada, y "la más
+  nueva gana" también cubre a un peer que se reinició mientras su conexión vieja parecía viva.
+- **Reconexión:** con backoff exponencial entre 0,5 s y 30 s por peer. Vuelve al mínimo después de una
+  sesión que llegó a intercambiar `Hello`; un handshake que falla (por ejemplo, versión distinta)
+  sigue subiendo el retraso. El `Hello` tiene un límite de 10 s.
+- **Sin reenvío:** la malla es completa, así que un clip debe venir de la máquina que lo copió. Si
+  `Clip.origin` no es el peer que lo manda, se descarta.
+- **API:** `Node::spawn(identidad, config)` devuelve el nodo y un canal de clips recibidos (con el id
+  del peer). `Node::broadcast(clip)` lo manda a los peers conectados; los que no lo están se lo
+  pierden.
 
 ### Emparejamiento
 
