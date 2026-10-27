@@ -77,7 +77,7 @@ impl PeerTask {
             // Only the node with the smaller id closes duplicate connections (see the crate docs).
             closes_duplicates: endpoint.id() < id,
             live_sessions: AtomicUsize::new(0),
-            newest: watch::Sender::new(None),
+            live: watch::Sender::new(Vec::new()),
         };
         Self {
             endpoint,
@@ -166,9 +166,11 @@ pub(crate) struct PeerState {
     /// Sessions that finished the `Hello` exchange and are still up. Only changed while holding
     /// the `links` lock, so the published link always matches it.
     live_sessions: AtomicUsize,
-    /// The connection that most recently finished the `Hello` exchange. File transfers use it,
-    /// and when this node closes duplicates, it is the one that stays.
-    newest: watch::Sender<Option<Connection>>,
+    /// Connections whose session finished the `Hello` exchange and is still up, oldest first.
+    /// File transfers use the newest one that is still open. Usually there is one; there are two
+    /// for a moment after a duplicate dial, until the node with the smaller id closes one. The
+    /// other node cannot tell which one that will be, so it must not bet on the newest.
+    live: watch::Sender<Vec<Connection>>,
 }
 
 impl PeerState {
@@ -179,26 +181,29 @@ impl PeerState {
     /// abandoned can still complete on the other side, and must not push out a good connection.
     pub(crate) fn greeted(&self, conn: &Connection) -> LiveSession<'_> {
         info!(peer = %conn.remote_id().fmt_short(), "connected");
-        let old = self.newest.send_replace(Some(conn.clone()));
-        if self.closes_duplicates
-            && let Some(old) = old
-            && old.close_reason().is_none()
-        {
-            debug!(peer = %conn.remote_id().fmt_short(), "closing older connection");
-            old.close(close::REPLACED, b"replaced by a newer connection");
-        }
+        self.live.send_modify(|live| {
+            if self.closes_duplicates {
+                for old in live.iter().filter(|old| old.close_reason().is_none()) {
+                    debug!(peer = %conn.remote_id().fmt_short(), "closing older connection");
+                    old.close(close::REPLACED, b"replaced by a newer connection");
+                }
+            }
+            live.push(conn.clone());
+        });
         let addr = selected_ip(conn);
         self.links.send_modify(|links| {
             self.live_sessions.fetch_add(1, Ordering::Relaxed);
             links.insert(self.id, Link::Connected { addr });
         });
-        LiveSession(self)
+        LiveSession {
+            peer: self,
+            conn: conn.clone(),
+        }
     }
 
-    /// Follows the connection that most recently finished the `Hello` exchange, which may have
-    /// closed since.
-    pub(crate) fn newest(&self) -> watch::Receiver<Option<Connection>> {
-        self.newest.subscribe()
+    /// Follows the connections with a live session, oldest first. Some may have closed since.
+    pub(crate) fn live(&self) -> watch::Receiver<Vec<Connection>> {
+        self.live.subscribe()
     }
 
     #[cfg(test)]
@@ -209,11 +214,17 @@ impl PeerState {
 
 /// Keeps a session counted as live while it exists. The last one to go marks the peer
 /// disconnected.
-pub(crate) struct LiveSession<'a>(&'a PeerState);
+pub(crate) struct LiveSession<'a> {
+    peer: &'a PeerState,
+    conn: Connection,
+}
 
 impl Drop for LiveSession<'_> {
     fn drop(&mut self) {
-        let peer = self.0;
+        let peer = self.peer;
+        let id = self.conn.stable_id();
+        peer.live
+            .send_modify(|live| live.retain(|conn| conn.stable_id() != id));
         peer.links.send_if_modified(|links| {
             let was_last = peer.live_sessions.fetch_sub(1, Ordering::Relaxed) == 1;
             if was_last {

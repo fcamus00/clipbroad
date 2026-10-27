@@ -527,3 +527,46 @@ async fn transfer_is_retried_on_the_next_connection() {
 
     node.shutdown().await;
 }
+
+#[tokio::test]
+async fn transfer_uses_the_connection_the_smaller_id_kept() {
+    // After a duplicate dial, the node with the smaller id may keep the older connection and
+    // close the newer one. The bigger node cannot predict which, so it must fetch on whichever
+    // is still open, not on the one that greeted last.
+    let (small, big) = Spec::ordered_pair();
+    let (node, _inbox) = big.spawn(vec![small.peer_without_addrs()]).await;
+    let raw = raw_endpoint(&small).await;
+    let kept = raw_connect(&raw, &big).await;
+    let _kept_streams = raw_hello(&kept).await;
+    let dropped = raw_connect(&raw, &big).await;
+    let _dropped_streams = raw_hello(&dropped).await;
+    wait_until("both sessions are live", || {
+        node.live_sessions_with(small.id()) == 2
+    })
+    .await;
+    dropped.close(VarInt::from_u32(1), b"replaced by a newer connection");
+
+    let cache_dir = tempfile::tempdir().expect("temp dir");
+    let cache = open_cache(&cache_dir, &small_limits());
+    let body = random_bytes(10_000, 7);
+    let entry = entry("kept.bin", &body);
+    let list = one_file(&entry);
+
+    let peer_side = async {
+        let (mut send, _) = accept_request(&kept).await;
+        let ok = response(FileResponse::Ok { size: entry.size });
+        send.write_all(&[&ok[..], &body].concat())
+            .await
+            .expect("write");
+        send.finish().expect("finish");
+        send
+    };
+    let fetch = time::timeout(TIMEOUT, node.fetch_files(small.id(), &list, &cache));
+    let (fetched, _send) = tokio::join!(fetch, peer_side);
+    let paths = fetched
+        .expect("in time")
+        .expect("fetched on the kept connection");
+    assert_eq!(fs::read(&paths[0]).expect("read"), body);
+
+    node.shutdown().await;
+}

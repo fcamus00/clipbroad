@@ -307,7 +307,7 @@ impl Node {
         cache: &FileCache,
     ) -> Result<Vec<PathBuf>, FetchError> {
         let peer = self.peers.get(&from).ok_or(FetchError::UnknownPeer)?;
-        files::fetch(peer.newest(), files, cache).await
+        files::fetch(peer.live(), files, cache).await
     }
 
     /// Closes every connection, telling peers right away, and stops the node.

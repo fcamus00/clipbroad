@@ -226,7 +226,7 @@ impl From<ReadFrameError> for FetchError {
 ///
 /// Dropping the future cancels the transfer: the stream is closed and the temporary file deleted.
 pub(crate) async fn fetch(
-    mut conn: watch::Receiver<Option<Connection>>,
+    mut conn: watch::Receiver<Vec<Connection>>,
     files: &FileList,
     cache: &FileCache,
 ) -> Result<Vec<PathBuf>, FetchError> {
@@ -289,19 +289,22 @@ async fn blocking<T: Send + 'static>(
 }
 
 async fn fetch_with_retries(
-    conn: &mut watch::Receiver<Option<Connection>>,
+    conn: &mut watch::Receiver<Vec<Connection>>,
     entry: &FileEntry,
     cache: &FileCache,
 ) -> Result<PathBuf, FetchError> {
     let mut attempt = 1;
     loop {
-        let live = time::timeout(
-            CONNECT_TIMEOUT,
-            conn.wait_for(|c| c.as_ref().is_some_and(|c| c.close_reason().is_none())),
-        )
-        .await;
+        let open = |conn: &Connection| conn.close_reason().is_none();
+        let live =
+            time::timeout(CONNECT_TIMEOUT, conn.wait_for(|live| live.iter().any(open))).await;
         let current = match live {
-            Ok(Ok(current)) => current.clone().ok_or(FetchError::NotConnected)?,
+            Ok(Ok(live)) => live
+                .iter()
+                .rev()
+                .find(|conn| open(conn))
+                .cloned()
+                .ok_or(FetchError::NotConnected)?,
             _ => return Err(FetchError::NotConnected),
         };
         match transfer(&current, entry, cache).await {
