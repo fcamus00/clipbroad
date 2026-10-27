@@ -20,16 +20,12 @@
 
 # Puerto UDP en el que escucha este nodo. Es fijo para que otros peers puedan llegar a él por una
 # dirección estática (por ejemplo, por Tailscale). Si se cambia, actualizar las direcciones que los
-# otros peers tienen de esta máquina.
+# otros peers tienen de esta máquina. Debe ser mayor que 0.
 listen_port = 42420
 
 # Tamaño máximo (en bytes) de un clip que viaja dentro del propio mensaje. Por defecto 8 MiB, que
 # alcanza para texto y capturas de pantalla típicas. Debe ser mayor que 0.
 inline_max_bytes = 8388608
-
-# Cada cuántos milisegundos se revisa el portapapeles en macOS (allí no hay aviso de cambios).
-# Más bajo = sincroniza antes pero gasta más CPU. Se ignora en Linux y Windows. Debe ser mayor que 0.
-macos_poll_interval_ms = 500
 
 # Máquinas emparejadas. Normalmente las escribe `clipbroad pair`; se pueden editar a mano.
 # Cada una lleva:

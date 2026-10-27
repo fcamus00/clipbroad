@@ -52,7 +52,7 @@ pub enum Error {
 
     /// The secret key file can be read by other users (Unix only).
     #[error(
-        "secret key file {} is accessible by other users (mode {mode:o}); run `chmod 600 {}`",
+        "secret key file {} is accessible by other users (mode {mode:o}); run `chmod 600 '{}'`",
         path.display(),
         path.display()
     )]

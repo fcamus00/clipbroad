@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fs, io, net::SocketAddr, path::Path, time::Duration};
+use std::{collections::HashSet, fs, io, net::SocketAddr, path::Path};
 
 use serde::Deserialize;
 
@@ -14,9 +14,6 @@ pub struct Config {
     pub listen_port: u16,
     /// Clips up to this size (in bytes) travel inside the clip message itself.
     pub inline_max_bytes: u64,
-    /// How often the macOS backend checks the pasteboard for changes, in milliseconds.
-    /// Ignored on other OSes.
-    pub macos_poll_interval_ms: u64,
     /// Paired machines.
     pub peers: Vec<Peer>,
 }
@@ -54,7 +51,6 @@ impl Default for Config {
         Self {
             listen_port: Self::DEFAULT_LISTEN_PORT,
             inline_max_bytes: Self::DEFAULT_INLINE_MAX_BYTES,
-            macos_poll_interval_ms: Self::DEFAULT_MACOS_POLL_INTERVAL_MS,
             peers: Vec::new(),
         }
     }
@@ -64,7 +60,6 @@ impl Config {
     pub const DEFAULT_LISTEN_PORT: u16 = 42_420;
     /// 8 MiB: enough for text and typical screenshots.
     pub const DEFAULT_INLINE_MAX_BYTES: u64 = 8 * 1024 * 1024;
-    pub const DEFAULT_MACOS_POLL_INTERVAL_MS: u64 = 500;
 
     /// Parses and validates a config from TOML text.
     ///
@@ -95,20 +90,17 @@ impl Config {
         })
     }
 
-    #[must_use]
-    pub fn macos_poll_interval(&self) -> Duration {
-        Duration::from_millis(self.macos_poll_interval_ms)
-    }
-
     fn validate(&self) -> Result<(), ParseError> {
         if self.inline_max_bytes == 0 {
             return Err(ParseError::Invalid(
                 "inline_max_bytes must be greater than 0".into(),
             ));
         }
-        if self.macos_poll_interval_ms == 0 {
+        if self.listen_port == 0 {
+            // Port 0 would mean "any free port", which changes on every start and breaks the
+            // static addresses other peers keep for this node.
             return Err(ParseError::Invalid(
-                "macos_poll_interval_ms must be greater than 0".into(),
+                "listen_port must be greater than 0".into(),
             ));
         }
         let mut seen = HashSet::new();
@@ -157,7 +149,6 @@ mod tests {
         assert_eq!(config, Config::default());
         assert_eq!(config.listen_port, 42_420);
         assert_eq!(config.inline_max_bytes, 8 * 1024 * 1024);
-        assert_eq!(config.macos_poll_interval(), Duration::from_millis(500));
         assert_eq!(config.peers, []);
     }
 
@@ -166,7 +157,6 @@ mod tests {
         let config = Config::from_toml_str(EXAMPLE).expect("docs/config.example.toml is valid");
         assert_eq!(config.listen_port, 42_420);
         assert_eq!(config.inline_max_bytes, 8_388_608);
-        assert_eq!(config.macos_poll_interval_ms, 500);
         assert_eq!(config.peers.len(), 2);
 
         let laptop = &config.peers[0];
@@ -245,7 +235,7 @@ mod tests {
 
     #[test]
     fn zero_values_are_rejected() {
-        for text in ["inline_max_bytes = 0", "macos_poll_interval_ms = 0"] {
+        for text in ["inline_max_bytes = 0", "listen_port = 0"] {
             let err = Config::from_toml_str(text).expect_err("zero");
             assert!(err.to_string().contains("greater than 0"), "{err}");
         }

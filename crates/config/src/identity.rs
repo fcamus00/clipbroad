@@ -2,7 +2,7 @@ use std::{
     fmt,
     fs::{self, OpenOptions},
     io::{self, Write as _},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use crate::Error;
@@ -57,7 +57,7 @@ impl IdentityKey {
         let key = Self::generate()?;
         match key.write_new(path) {
             Ok(()) => Ok(key),
-            // Another process created it in the meantime: use theirs.
+            // Another process created it in the meantime, complete (see `write_new`): use theirs.
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Self::load(path),
             Err(e) => Err(Error::io(path, e)),
         }
@@ -78,29 +78,40 @@ impl IdentityKey {
         Ok(Self(bytes))
     }
 
-    /// Writes the key to a file that must not exist yet.
+    /// Writes the key to `path`, which must not exist yet (`AlreadyExists` otherwise).
+    ///
+    /// The bytes go to a temporary file that is then hard-linked into place, so `path` appears
+    /// complete or not at all. A second process starting at the same moment never reads a
+    /// half-written key.
     fn write_new(&self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             create_private_dir(parent)?;
         }
 
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            // Applied at creation, so the key is never readable by others, not even briefly.
-            options.mode(0o600);
-        }
-        let mut file = options.open(path)?;
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(format!(".tmp-{}", std::process::id()));
+        let tmp = PathBuf::from(tmp);
 
-        let written = file.write_all(&self.0).and_then(|()| file.sync_all());
-        if written.is_err() {
-            // Best effort: do not leave a truncated key that would fail on the next start.
-            let _ = fs::remove_file(path);
-        }
-        written
+        let result = write_private(&tmp, &self.0).and_then(|()| fs::hard_link(&tmp, path));
+        // Best effort: the temporary file is never needed afterwards.
+        let _ = fs::remove_file(&tmp);
+        result
     }
+}
+
+/// Writes `bytes` to `path`, readable only by the owner on Unix.
+fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // Applied at creation, so the key is never readable by others, not even briefly.
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 impl fmt::Debug for IdentityKey {
@@ -201,6 +212,24 @@ mod tests {
         let err = IdentityKey::load_or_generate(&path).expect_err("corrupt");
         assert!(matches!(err, Error::KeyLength { len: 37, .. }), "{err}");
         assert!(err.to_string().contains("expected 32"), "{err}");
+    }
+
+    #[test]
+    fn write_new_never_overwrites_and_cleans_up() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("secret.key");
+        IdentityKey::from_bytes([1; 32])
+            .write_new(&path)
+            .expect("first write");
+
+        let err = IdentityKey::from_bytes([2; 32])
+            .write_new(&path)
+            .expect_err("target exists");
+
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).expect("key"), [1; 32]);
+        let files = fs::read_dir(dir.path()).expect("list").count();
+        assert_eq!(files, 1, "temporary file left behind");
     }
 
     #[test]
