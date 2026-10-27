@@ -394,6 +394,32 @@ mod tests {
     }
 
     #[test]
+    fn files_echo_is_recognised_whatever_the_order() {
+        use crate::{FileEntry, FileList};
+        let entry = |name: &str| FileEntry {
+            name: name.to_owned(),
+            size: 3,
+            hash: ContentHash::of(name.as_bytes()),
+        };
+        let list = |names: [&str; 2]| {
+            ClipContent::Files(FileList::new(names.map(entry).to_vec()).expect("valid"))
+        };
+        let mut a = SyncEngine::new(node(1));
+        let mut b = SyncEngine::new(node(2));
+        let clip = sent(a.local_changed(list(["x.txt", "y.txt"]), 1_000));
+        assert_eq!(
+            b.remote_clip(clip),
+            Ok(RemoteAction::Apply(list(["x.txt", "y.txt"])))
+        );
+        // B's OS reports the cached files back, in another order and from other paths: same
+        // names, sizes and hashes, so it is the echo.
+        assert_eq!(
+            b.local_changed(list(["y.txt", "x.txt"]), 1_005),
+            LocalAction::Unchanged
+        );
+    }
+
+    #[test]
     fn out_of_order_delivery_keeps_the_newest() {
         let mut a = SyncEngine::new(node(1));
         let mut b = SyncEngine::new(node(2));

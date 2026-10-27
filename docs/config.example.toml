@@ -19,6 +19,13 @@
 # Mientras corre, `clipbroad run` escribe su estado en `status.toml`, en la misma carpeta que
 # `secret.key`, y lo borra al detenerse. Lo lee `clipbroad status`.
 #
+# Los archivos que llegan de otros peers se guardan en una caché, en `files/<hash>/<nombre>`:
+#   Linux:   ~/.cache/clipbroad/files  (o $XDG_CACHE_HOME/clipbroad/files)
+#   macOS:   ~/Library/Caches/clipbroad/files
+#   Windows: %LOCALAPPDATA%\clipbroad\files
+# Con `--config <archivo>`, la caché es la carpeta `files` junto a ese archivo, así dos instancias
+# en la misma máquina no la comparten.
+#
 # Un nombre de campo mal escrito es un error (no se ignora en silencio).
 
 # Puerto UDP en el que escucha este nodo. Es fijo para que otros peers puedan llegar a él por una
@@ -38,6 +45,20 @@ inline_max_bytes = 8388608
 # los peers de esta lista). No usa ningún servicio de terceros. Con `false` no se envía tráfico
 # multicast y solo se conecta a los peers por sus `addrs`.
 mdns = true
+
+# Tamaño máximo (en bytes) de un archivo copiado. Un archivo más grande no se sincroniza (queda un
+# warning en el log). Por defecto 512 MiB. Debe ser mayor que 0 y no mayor que
+# `file_cache_max_bytes`.
+file_max_bytes = 536870912
+
+# Tamaño máximo (en bytes) de la caché de archivos recibidos. Cuando se pasa, se borran primero
+# los archivos más viejos, salvo los del último clip recibido. También es el límite de todos los
+# archivos de una misma copia juntos. Por defecto 2 GiB. Debe ser mayor que 0.
+file_cache_max_bytes = 2147483648
+
+# Días que un archivo recibido se queda en la caché. Los más viejos se borran en la próxima
+# limpieza, salvo los del último clip recibido. Por defecto 7. Debe ser mayor que 0.
+file_cache_max_days = 7
 
 # Máquinas emparejadas. Normalmente las escribe `clipbroad pair`; se pueden editar a mano.
 # Cada una lleva:

@@ -257,6 +257,7 @@ pub fn render(status: Option<&DaemonStatus>, now_ms: u64) -> String {
         let kind = match event.kind {
             ContentKind::Text => "text",
             ContentKind::Image => "image",
+            ContentKind::Files => "files",
         };
         format!(
             "{}, {kind}, {} bytes, hash {}{from}",

@@ -54,6 +54,7 @@ impl Spec {
             inline_max_bytes: NonZeroU64::new(inline_max_bytes).expect("non-zero"),
             mdns: false,
             peers: peers.into_iter().map(Self::peer).collect(),
+            ..Config::default()
         }
     }
 

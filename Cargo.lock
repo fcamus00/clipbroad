@@ -419,6 +419,7 @@ dependencies = [
 name = "clipbroad-net"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "clipbroad-config",
  "clipbroad-core",
  "data-encoding",
@@ -428,6 +429,7 @@ dependencies = [
  "postcard",
  "serde",
  "subtle",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
