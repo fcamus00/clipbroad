@@ -1,4 +1,10 @@
-use std::{collections::HashSet, fs, io, net::SocketAddr, path::Path};
+use std::{
+    collections::HashSet,
+    fs, io,
+    net::SocketAddr,
+    num::{NonZeroU16, NonZeroU64},
+    path::Path,
+};
 
 use serde::Deserialize;
 
@@ -10,10 +16,11 @@ use crate::Error;
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// UDP port the node listens on. Fixed so that peers can reach it through static addresses.
-    pub listen_port: u16,
+    /// UDP port the node listens on. Fixed so that peers can reach it through static addresses;
+    /// non-zero because port 0 means "any free port", which changes on every start.
+    pub listen_port: NonZeroU16,
     /// Clips up to this size (in bytes) travel inside the clip message itself.
-    pub inline_max_bytes: u64,
+    pub inline_max_bytes: NonZeroU64,
     /// Paired machines.
     pub peers: Vec<Peer>,
 }
@@ -25,7 +32,6 @@ pub struct Peer {
     /// The peer's public identity (iroh `EndpointId`) as 64 hexadecimal characters.
     pub id: String,
     /// Human-friendly label, only used in logs and status output.
-    #[serde(default)]
     pub name: Option<String>,
     /// Addresses to dial directly, for networks where LAN discovery does not reach,
     /// such as a Tailscale address (`100.x.y.z:port`).
@@ -41,7 +47,7 @@ pub enum ParseError {
     #[error(transparent)]
     Toml(#[from] toml::de::Error),
 
-    /// Valid TOML, but a value is not acceptable.
+    /// Valid TOML, but the peer list is not acceptable (bad or repeated id).
     #[error("{0}")]
     Invalid(String),
 }
@@ -57,16 +63,18 @@ impl Default for Config {
 }
 
 impl Config {
-    pub const DEFAULT_LISTEN_PORT: u16 = 42_420;
+    pub const DEFAULT_LISTEN_PORT: NonZeroU16 = NonZeroU16::new(42_420).expect("non-zero");
     /// 8 MiB: enough for text and typical screenshots.
-    pub const DEFAULT_INLINE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+    pub const DEFAULT_INLINE_MAX_BYTES: NonZeroU64 =
+        NonZeroU64::new(8 * 1024 * 1024).expect("non-zero");
 
     /// Parses and validates a config from TOML text.
     ///
     /// # Errors
     ///
-    /// [`ParseError::Toml`] for syntax errors, unknown fields or wrong types, and
-    /// [`ParseError::Invalid`] for values out of range.
+    /// [`ParseError::Toml`] for syntax errors, unknown fields, wrong types or out-of-range values
+    /// (including zero where a non-zero number is required), and [`ParseError::Invalid`] for a
+    /// malformed or repeated peer id.
     pub fn from_toml_str(text: &str) -> Result<Self, ParseError> {
         let config: Self = toml::from_str(text)?;
         config.validate()?;
@@ -91,18 +99,6 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ParseError> {
-        if self.inline_max_bytes == 0 {
-            return Err(ParseError::Invalid(
-                "inline_max_bytes must be greater than 0".into(),
-            ));
-        }
-        if self.listen_port == 0 {
-            // Port 0 would mean "any free port", which changes on every start and breaks the
-            // static addresses other peers keep for this node.
-            return Err(ParseError::Invalid(
-                "listen_port must be greater than 0".into(),
-            ));
-        }
         let mut seen = HashSet::new();
         for peer in &self.peers {
             if peer.id.len() != 64 || !peer.id.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -147,16 +143,16 @@ mod tests {
     fn empty_file_gives_defaults() {
         let config = Config::from_toml_str("").expect("empty config is valid");
         assert_eq!(config, Config::default());
-        assert_eq!(config.listen_port, 42_420);
-        assert_eq!(config.inline_max_bytes, 8 * 1024 * 1024);
+        assert_eq!(config.listen_port.get(), 42_420);
+        assert_eq!(config.inline_max_bytes.get(), 8 * 1024 * 1024);
         assert_eq!(config.peers, []);
     }
 
     #[test]
     fn documented_example_parses() {
         let config = Config::from_toml_str(EXAMPLE).expect("docs/config.example.toml is valid");
-        assert_eq!(config.listen_port, 42_420);
-        assert_eq!(config.inline_max_bytes, 8_388_608);
+        assert_eq!(config.listen_port.get(), 42_420);
+        assert_eq!(config.inline_max_bytes.get(), 8_388_608);
         assert_eq!(config.peers.len(), 2);
 
         let laptop = &config.peers[0];
@@ -180,7 +176,7 @@ mod tests {
     #[test]
     fn partial_file_keeps_other_defaults() {
         let config = Config::from_toml_str("listen_port = 5000").expect("valid");
-        assert_eq!(config.listen_port, 5000);
+        assert_eq!(config.listen_port.get(), 5000);
         assert_eq!(config.inline_max_bytes, Config::DEFAULT_INLINE_MAX_BYTES);
     }
 
@@ -237,7 +233,7 @@ mod tests {
     fn zero_values_are_rejected() {
         for text in ["inline_max_bytes = 0", "listen_port = 0"] {
             let err = Config::from_toml_str(text).expect_err("zero");
-            assert!(err.to_string().contains("greater than 0"), "{err}");
+            assert!(err.to_string().contains("nonzero"), "{err}");
         }
     }
 

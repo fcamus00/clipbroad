@@ -4,7 +4,7 @@
 //! use clipbroad_config::Config;
 //!
 //! let config = Config::from_toml_str("listen_port = 4000").expect("valid config");
-//! assert_eq!(config.listen_port, 4000);
+//! assert_eq!(config.listen_port.get(), 4000);
 //! assert_eq!(config.peers, []);
 //! ```
 

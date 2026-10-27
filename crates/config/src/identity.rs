@@ -1,8 +1,7 @@
 use std::{
-    fmt,
-    fs::{self, OpenOptions},
+    fmt, fs,
     io::{self, Write as _},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use crate::Error;
@@ -80,38 +79,18 @@ impl IdentityKey {
 
     /// Writes the key to `path`, which must not exist yet (`AlreadyExists` otherwise).
     ///
-    /// The bytes go to a temporary file that is then hard-linked into place, so `path` appears
-    /// complete or not at all. A second process starting at the same moment never reads a
-    /// half-written key.
+    /// The bytes go to a temporary file that is then moved into place without overwriting, so
+    /// `path` appears complete or not at all. A second process starting at the same moment never
+    /// reads a half-written key.
     fn write_new(&self, path: &Path) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            create_private_dir(parent)?;
-        }
-
-        let mut tmp = path.as_os_str().to_owned();
-        tmp.push(format!(".tmp-{}", std::process::id()));
-        let tmp = PathBuf::from(tmp);
-
-        let result = write_private(&tmp, &self.0).and_then(|()| fs::hard_link(&tmp, path));
-        // Best effort: the temporary file is never needed afterwards.
-        let _ = fs::remove_file(&tmp);
-        result
+        let dir = path.parent().unwrap_or(Path::new("."));
+        create_private_dir(dir)?;
+        // `tempfile` creates the file with mode 0600 on Unix and deletes it if we stop early.
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        tmp.write_all(&self.0)?;
+        tmp.as_file().sync_all()?;
+        tmp.persist_noclobber(path).map(drop).map_err(|e| e.error)
     }
-}
-
-/// Writes `bytes` to `path`, readable only by the owner on Unix.
-fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        // Applied at creation, so the key is never readable by others, not even briefly.
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
 }
 
 impl fmt::Debug for IdentityKey {
@@ -203,7 +182,7 @@ mod tests {
             .write_new(&path)
             .expect("write");
         // Append garbage while keeping the private permissions.
-        OpenOptions::new()
+        fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .and_then(|mut f| f.write_all(b"extra"))
