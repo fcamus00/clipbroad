@@ -118,7 +118,9 @@ pub struct Clip {
     pub id: ClipId,
     /// Node where the content was copied.
     pub origin: NodeId,
-    /// When it was copied, in milliseconds since the Unix epoch, by the origin's clock.
+    /// When it was copied, in milliseconds since the Unix epoch, by the origin's clock. The origin
+    /// moves it past the newest clip it has seen, so it orders clips even with clocks out of sync
+    /// (see [`crate::sync`]).
     pub timestamp_ms: u64,
     pub kind: ContentKind,
     /// MIME type of the content. Text is always `text/plain;charset=utf-8`; images will use it to
