@@ -52,7 +52,7 @@ impl FakeClipboard {
 
     /// Simulates another application copying plain text (offered as [`TEXT_FORMAT`]).
     pub fn simulate_copy_text(&self, text: impl Into<String>) {
-        self.set(Some(text.into()), vec![TEXT_FORMAT.to_owned()]);
+        self.simulate_copy(Some(text.into()), vec![TEXT_FORMAT.to_owned()]);
     }
 
     /// Simulates another application copying arbitrary content.
@@ -62,15 +62,6 @@ impl FakeClipboard {
     /// manager (`Some("hunter2")` with `x-kde-passwordManagerHint` among the formats) or an image
     /// (`None` with `["image/png"]`).
     pub fn simulate_copy(&self, text: Option<String>, formats: Vec<String>) {
-        self.set(text, formats);
-    }
-
-    /// Simulates the clipboard being cleared (an event with no formats).
-    pub fn simulate_clear(&self) {
-        self.set(None, Vec::new());
-    }
-
-    fn set(&self, text: Option<String>, formats: Vec<String>) {
         let mut state = self.lock();
         let change = ClipboardChange::new(formats);
         state.text = text;
@@ -78,6 +69,11 @@ impl FakeClipboard {
         state
             .watchers
             .retain(|watcher| watcher.send(change.clone()).is_ok());
+    }
+
+    /// Simulates the clipboard being cleared (an event with no formats).
+    pub fn simulate_clear(&self) {
+        self.simulate_copy(None, Vec::new());
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {

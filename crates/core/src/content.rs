@@ -1,10 +1,14 @@
+use std::fmt;
+
 use crate::ContentHash;
 
 /// Something that can be on the clipboard and travel between machines.
 ///
 /// Only text exists today. Images and files will be added as new variants. Match on it
 /// exhaustively (no `_` arm), so adding a variant fails the build at every place that must handle it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// `Debug` prints the size and hash, never the content, so logging a clip cannot leak what was copied.
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum ClipContent {
     /// Plain UTF-8 text, exactly as the OS clipboard returned it (line endings untouched).
     Text(String),
@@ -38,6 +42,18 @@ impl ClipContent {
     }
 }
 
+impl fmt::Debug for ClipContent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(text) => f
+                .debug_struct("Text")
+                .field("len", &text.len())
+                .field("hash", &self.hash())
+                .finish(),
+        }
+    }
+}
+
 impl From<String> for ClipContent {
     fn from(text: String) -> Self {
         Self::Text(text)
@@ -59,6 +75,16 @@ mod tests {
         assert_ne!(
             ClipContent::from("a\nb").hash(),
             ClipContent::from("a\r\nb").hash()
+        );
+    }
+
+    #[test]
+    fn debug_does_not_show_the_content() {
+        let text = format!("{:?}", ClipContent::from("hunter2"));
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(
+            text.starts_with("Text { len: 7, hash: ContentHash("),
+            "{text}"
         );
     }
 

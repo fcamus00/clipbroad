@@ -109,7 +109,7 @@ impl ClipboardWatch {
 
     /// Waits for the next change.
     ///
-    /// Returns `Some(Ok(change))` for each change, `Some(Err(_))` once if the watcher failed, and
+    /// Returns `Some(Ok(change))` for each change, `Some(Err(_))` if the watcher failed (at most once per [`ChangeSender`] clone), and
     /// `None` when the watcher has stopped (after an error, or if the backend went away). Once it
     /// returns `None` it keeps returning `None`.
     ///
