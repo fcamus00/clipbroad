@@ -11,6 +11,8 @@ pub mod macos;
 mod watch;
 #[cfg(target_os = "linux")]
 pub mod wayland;
+#[cfg(windows)]
+pub mod windows;
 
 pub use error::ClipboardError;
 pub use watch::{ChangeSender, ClipboardChange, ClipboardWatch, WatchClosed};
