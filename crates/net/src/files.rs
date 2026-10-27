@@ -296,17 +296,15 @@ async fn fetch_with_retries(
     let mut attempt = 1;
     loop {
         let open = |conn: &Connection| conn.close_reason().is_none();
-        let live =
-            time::timeout(CONNECT_TIMEOUT, conn.wait_for(|live| live.iter().any(open))).await;
-        let current = match live {
-            Ok(Ok(live)) => live
-                .iter()
-                .rev()
-                .find(|conn| open(conn))
-                .cloned()
-                .ok_or(FetchError::NotConnected)?,
-            _ => return Err(FetchError::NotConnected),
-        };
+        // The borrowed list is a read lock on the peer's connections: release it before the
+        // transfer, or the peer task would block replacing a connection meanwhile.
+        let current =
+            match time::timeout(CONNECT_TIMEOUT, conn.wait_for(|live| live.iter().any(open))).await
+            {
+                Ok(Ok(live)) => live.iter().rev().find(|conn| open(conn)).cloned(),
+                _ => None,
+            }
+            .ok_or(FetchError::NotConnected)?;
         match transfer(&current, entry, cache).await {
             Err(error) if error.connection_lost() && attempt < ATTEMPTS => {
                 debug!(%error, attempt, "file transfer lost its connection, trying again");
