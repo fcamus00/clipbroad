@@ -29,8 +29,9 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) struct PeerTask {
     endpoint: Endpoint,
     id: EndpointId,
-    /// Where to dial the peer, or `None` if the config has no address for it (it can still dial
-    /// us).
+    /// Where to dial the peer, or `None` if it has no static address and LAN discovery is off (it
+    /// can still dial us). With discovery on, iroh asks mDNS for the peer's current addresses and
+    /// tries them along with the static ones.
     addr: Option<EndpointAddr>,
     outbox: broadcast::Sender<Frame>,
     inbox: mpsc::Sender<Received>,
@@ -42,10 +43,11 @@ impl PeerTask {
         endpoint: Endpoint,
         id: EndpointId,
         addrs: &[SocketAddr],
+        discovery: bool,
         outbox: broadcast::Sender<Frame>,
         inbox: mpsc::Sender<Received>,
     ) -> Self {
-        let addr = (!addrs.is_empty()).then(|| {
+        let addr = (discovery || !addrs.is_empty()).then(|| {
             addrs
                 .iter()
                 .fold(EndpointAddr::new(id), |addr, ip| addr.with_ip_addr(*ip))
@@ -114,7 +116,7 @@ impl PeerTask {
         }
     }
 
-    /// Waits until `at`, then dials the peer. Must only be called when it has an address.
+    /// Waits until `at`, then dials the peer. Must only be called when it can be dialed.
     async fn dial(&self, at: Instant) -> Option<Connection> {
         let addr = self.addr.clone()?;
         time::sleep_until(at).await;

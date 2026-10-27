@@ -11,6 +11,7 @@ clipbroad-core.workspace = true
 data-encoding.workspace = true
 getrandom.workspace = true
 iroh.workspace = true
+iroh-mdns-address-lookup.workspace = true
 postcard.workspace = true
 serde.workspace = true
 subtle.workspace = true

@@ -19,6 +19,7 @@ clap = { version = "4.6", features = ["derive"] }
 data-encoding = "2.11"
 getrandom = "0.4"
 iroh = { version = "1.4.1", default-features = false, features = ["tls-ring", "fast-apple-datapath"] }
+iroh-mdns-address-lookup = "0.6.1"
 objc2 = "0.6.5"
 objc2-app-kit = { version = "0.3.2", default-features = false }
 objc2-foundation = { version = "0.3.2", default-features = false }

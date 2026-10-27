@@ -34,8 +34,7 @@ Por qué no un servidor central (como ClipCascade):
 Configuración decidida:
 - **Preset `presets::Minimal`**: sin relays de n0 ni descubrimiento DNS/pkarr. Ningún tráfico sale a
   servicios de terceros.
-- **Descubrimiento en LAN** con un crate de mDNS (`iroh-mdns-address-lookup` o `iroh-mdns-peer-lookup`;
-  los formatos son incompatibles entre sí, así que se elige uno y todos los nodos usan el mismo).
+- **Descubrimiento en LAN** con mDNS (ver "Descubrimiento en la LAN (mDNS)" más abajo).
 - **Tailscale**: mDNS no cruza la tailnet, así que cada peer puede tener además direcciones estáticas en la
   configuración (`EndpointAddr::new(id).with_ip_addr(...)`), por ejemplo `100.x.y.z:puerto` o el
   hostname de MagicDNS resuelto. Puerto de escucha fijo y configurable.
@@ -47,11 +46,41 @@ Configuración decidida:
   CDLA-Permissive-2.0 únicamente para `webpki-roots`. El aviso RUSTSEC-2024-0436 (`paste` sin
   mantenimiento, no es una vulnerabilidad) se ignora porque iroh lo necesita vía `netwatch`.
 
+### Descubrimiento en la LAN (mDNS)
+
+Cada nodo anuncia por mDNS su `EndpointId` y sus direcciones, y escucha los anuncios de los demás.
+Así un peer emparejado se encuentra aunque su IP en la LAN haya cambiado (DHCP), sin tocar `addrs`.
+Las direcciones estáticas siguen sirviendo para lo que mDNS no alcanza, como Tailscale.
+
+- **Crate: `iroh-mdns-address-lookup`** (de n0, los autores de iroh). Se descartó
+  `iroh-mdns-peer-lookup`: su licencia dice "TBD" (no pasa `cargo deny`) y pide iroh con las features
+  por defecto, que traen relays y `portmapper`. El elegido usa la misma versión de iroh que el resto
+  (no hay dos iroh en el `Cargo.lock`), es MIT o Apache-2.0 y no agrega avisos ni licencias nuevas.
+- **Integración:** se registra como *address lookup* del endpoint (el preset `Minimal` no trae
+  ninguno). Al marcar a un peer, iroh le pide a mDNS las direcciones actuales del peer y las
+  prueba con las estáticas. Por eso, con mDNS activo, el nodo marca también a los peers sin `addrs`.
+- **Nombre de servicio propio:** `clipbroad` (registros `<id>._clipbroad._udp.local`) en vez del
+  `irohv1` por defecto, para no mezclarse con otras apps de iroh en la misma red. Todos los nodos
+  deben usar el mismo.
+- **Solo encuentra direcciones, nunca da acceso.** La allowlist no cambia: un nodo que se anuncia en
+  la LAN y no está en la config se rechaza igual después del TLS.
+- **Privacidad:** el anuncio es multicast en la red local, así que cualquiera en la misma LAN ve el id
+  público de este nodo, sus direcciones y que corre clipbroad. El id no es secreto (no sirve para
+  conectarse sin estar emparejado), pero permite reconocer a la máquina en esa red. No se usa ningún
+  servicio de terceros: el tráfico no sale de la LAN.
+- **Config:** `mdns = true` por defecto. Con `mdns = false` no se abre ningún socket multicast ni se
+  envía nada, y solo se marca a los peers con `addrs`.
+- **Si no puede arrancar** (por ejemplo, ninguna interfaz permite multicast), el daemon deja un
+  warning y sigue solo con las direcciones estáticas; no vuelve a intentarlo hasta reiniciarse.
+- **Tests:** el test de dos nodos que se encuentran sin direcciones necesita multicast entre sockets
+  locales, que los runners de CI pueden no permitir, así que está marcado `#[ignore]` y se corre a mano
+  (`cargo nextest run -p clipbroad-net --run-ignored only`).
+
 ### Conexiones (crate `net`)
 
-- **Una conexión por peer**, de larga vida. Cada nodo marca a todos los peers de los que tiene
-  direcciones y acepta las conexiones que le llegan de ellos. Un peer sin direcciones en la config
-  solo puede conectarse marcando él.
+- **Una conexión por peer**, de larga vida. Cada nodo marca a todos los peers que puede encontrar
+  (con mDNS activo, todos; si no, los que tienen direcciones en la config) y acepta las conexiones que
+  le llegan de ellos. Sin mDNS, un peer sin direcciones solo puede conectarse marcando él.
 - **Streams:** cada lado abre un stream unidireccional y escribe frames: primero `Hello`, luego un
   frame por clip. Lee el stream del otro lado igual. No hay pedido/respuesta.
 - **Conexiones duplicadas:** si los dos marcan a la vez quedan dos conexiones. Decide solo el nodo con
@@ -94,8 +123,9 @@ Código en `crates/net/src/pair.rs` y `crates/daemon/src/pair.rs`.
   minutos no es factible), así un intento ajeno no le arruina el emparejamiento al usuario. Si alguien
   usa un ticket filtrado *antes* que B, queda emparejado con A; el usuario lo nota porque su
   `clipbroad pair <ticket>` falla, y debe quitar ese peer de la config.
-- **Límite:** las direcciones guardadas son las del momento. Si cambia la IP de una máquina en la LAN
-  hay que editar `addrs` a mano (o emparejar de nuevo después de borrar el peer).
+- **Límite:** las direcciones guardadas son las del momento. Si cambia la IP de una máquina en la LAN,
+  mDNS encuentra la nueva; las guardadas solo quedan desactualizadas. Con `mdns = false` hay que editar
+  `addrs` a mano (o emparejar de nuevo después de borrar el peer).
 
 ### Protocolo
 

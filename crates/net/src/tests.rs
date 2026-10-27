@@ -73,9 +73,15 @@ impl Spec {
         }
     }
 
+    /// Starts the node without mDNS, so it reaches peers only at their static addresses.
     async fn spawn(&self, peers: Vec<Peer>) -> (Node, mpsc::Receiver<Received>) {
+        self.spawn_with(peers, false).await
+    }
+
+    async fn spawn_with(&self, peers: Vec<Peer>, mdns: bool) -> (Node, mpsc::Receiver<Received>) {
         let config = Config {
             listen_port: self.port,
+            mdns,
             peers,
             ..Config::default()
         };
@@ -209,6 +215,49 @@ async fn no_relays_and_no_address_lookup() {
     );
     assert_eq!(node.endpoint.addr().relay_urls().count(), 0);
     node.shutdown().await;
+}
+
+#[tokio::test]
+async fn mdns_is_the_only_address_lookup() {
+    let (node, _inbox) = Spec::new().spawn_with(Vec::new(), true).await;
+
+    let lookup = node.endpoint.address_lookup().expect("endpoint open");
+    assert_eq!(lookup.len(), 1, "only mDNS, no DNS/pkarr");
+    assert!(
+        node.endpoint.home_relay_status().get().is_empty(),
+        "no relays"
+    );
+    node.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "needs multicast between local sockets, which CI runners may not allow; run with \
+            `cargo nextest run -p clipbroad-net --run-ignored only`"]
+async fn nodes_find_each_other_with_mdns() {
+    let (a, b) = (Spec::new(), Spec::new());
+    // Neither knows where the other listens: only mDNS can connect them.
+    let (node_a, mut inbox_a) = a.spawn_with(vec![b.peer_without_addrs()], true).await;
+    let (node_b, mut inbox_b) = b.spawn_with(vec![a.peer_without_addrs()], true).await;
+
+    // Finding a peer can take a few mDNS rounds plus a redial, so allow more than `TIMEOUT`.
+    let connected = time::timeout(Duration::from_secs(30), async {
+        while !(node_a.connected_once_to(&[&b]) && node_b.connected_once_to(&[&a])) {
+            time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    assert!(connected.await.is_ok(), "nodes found each other in time");
+
+    node_a
+        .broadcast(text_clip(a.id(), 1, "from a"))
+        .expect("send");
+    node_b
+        .broadcast(text_clip(b.id(), 1, "from b"))
+        .expect("send");
+    assert_eq!(recv_text(&mut inbox_b).await, (a.id(), "from a".to_owned()));
+    assert_eq!(recv_text(&mut inbox_a).await, (b.id(), "from b".to_owned()));
+
+    node_a.shutdown().await;
+    node_b.shutdown().await;
 }
 
 #[tokio::test]
