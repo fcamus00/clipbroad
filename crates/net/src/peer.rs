@@ -3,7 +3,7 @@
 use std::{
     net::SocketAddr,
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -17,7 +17,7 @@ use tokio::{
 };
 use tracing::{debug, info};
 
-use crate::{ALPN, Frame, Link, Links, Received, close, session};
+use crate::{ALPN, Frame, Link, Links, Received, close, files::Offer, session};
 
 /// Delay before the first redial, and after a session that was up ends.
 const MIN_BACKOFF: Duration = Duration::from_millis(500);
@@ -25,6 +25,19 @@ const MIN_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Longest a single dial may take.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The node-wide channels every peer task uses.
+#[derive(Clone)]
+pub(crate) struct Channels {
+    /// Clips to send to every peer.
+    pub(crate) outbox: broadcast::Sender<Frame>,
+    /// Clips received from any peer.
+    pub(crate) inbox: mpsc::Sender<Received>,
+    /// Files of the latest broadcast clip.
+    pub(crate) offer: watch::Receiver<Option<Arc<Offer>>>,
+    /// Where each peer's [`Link`] is published.
+    pub(crate) links: watch::Sender<Links>,
+}
 
 pub(crate) struct PeerTask {
     endpoint: Endpoint,
@@ -35,6 +48,7 @@ pub(crate) struct PeerTask {
     addr: Option<EndpointAddr>,
     outbox: broadcast::Sender<Frame>,
     inbox: mpsc::Sender<Received>,
+    offer: watch::Receiver<Option<Arc<Offer>>>,
     state: Arc<PeerState>,
 }
 
@@ -44,10 +58,14 @@ impl PeerTask {
         id: EndpointId,
         addrs: &[SocketAddr],
         discovery: bool,
-        outbox: broadcast::Sender<Frame>,
-        inbox: mpsc::Sender<Received>,
-        links: watch::Sender<Links>,
+        channels: Channels,
     ) -> Self {
+        let Channels {
+            outbox,
+            inbox,
+            offer,
+            links,
+        } = channels;
         let addr = (discovery || !addrs.is_empty()).then(|| {
             addrs
                 .iter()
@@ -59,7 +77,7 @@ impl PeerTask {
             // Only the node with the smaller id closes duplicate connections (see the crate docs).
             closes_duplicates: endpoint.id() < id,
             live_sessions: AtomicUsize::new(0),
-            newest: Mutex::new(None),
+            newest: watch::Sender::new(None),
         };
         Self {
             endpoint,
@@ -67,11 +85,11 @@ impl PeerTask {
             addr,
             outbox,
             inbox,
+            offer,
             state: Arc::new(state),
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn state(&self) -> Arc<PeerState> {
         Arc::clone(&self.state)
     }
@@ -114,6 +132,7 @@ impl PeerTask {
                 conn,
                 self.outbox.subscribe(),
                 self.inbox.clone(),
+                self.offer.clone(),
                 Arc::clone(&self.state),
             ));
         }
@@ -147,9 +166,9 @@ pub(crate) struct PeerState {
     /// Sessions that finished the `Hello` exchange and are still up. Only changed while holding
     /// the `links` lock, so the published link always matches it.
     live_sessions: AtomicUsize,
-    /// The connection that most recently finished the `Hello` exchange, kept only when this node
-    /// closes duplicates.
-    newest: Mutex<Option<Connection>>,
+    /// The connection that most recently finished the `Hello` exchange. File transfers use it,
+    /// and when this node closes duplicates, it is the one that stays.
+    newest: watch::Sender<Option<Connection>>,
 }
 
 impl PeerState {
@@ -160,14 +179,13 @@ impl PeerState {
     /// abandoned can still complete on the other side, and must not push out a good connection.
     pub(crate) fn greeted(&self, conn: &Connection) -> LiveSession<'_> {
         info!(peer = %conn.remote_id().fmt_short(), "connected");
-        if self.closes_duplicates {
-            let mut newest = self.newest.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(old) = newest.replace(conn.clone())
-                && old.close_reason().is_none()
-            {
-                debug!(peer = %conn.remote_id().fmt_short(), "closing older connection");
-                old.close(close::REPLACED, b"replaced by a newer connection");
-            }
+        let old = self.newest.send_replace(Some(conn.clone()));
+        if self.closes_duplicates
+            && let Some(old) = old
+            && old.close_reason().is_none()
+        {
+            debug!(peer = %conn.remote_id().fmt_short(), "closing older connection");
+            old.close(close::REPLACED, b"replaced by a newer connection");
         }
         let addr = selected_ip(conn);
         self.links.send_modify(|links| {
@@ -175,6 +193,12 @@ impl PeerState {
             links.insert(self.id, Link::Connected { addr });
         });
         LiveSession(self)
+    }
+
+    /// Follows the connection that most recently finished the `Hello` exchange, which may have
+    /// closed since.
+    pub(crate) fn newest(&self) -> watch::Receiver<Option<Connection>> {
+        self.newest.subscribe()
     }
 
     #[cfg(test)]

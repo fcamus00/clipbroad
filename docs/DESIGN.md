@@ -82,7 +82,8 @@ Las direcciones estáticas siguen sirviendo para lo que mDNS no alcanza, como Ta
   (con mDNS activo, todos; si no, los que tienen direcciones en la config) y acepta las conexiones que
   le llegan de ellos. Sin mDNS, un peer sin direcciones solo puede conectarse marcando él.
 - **Streams:** cada lado abre un stream unidireccional y escribe frames: primero `Hello`, luego un
-  frame por clip. Lee el stream del otro lado igual. No hay pedido/respuesta.
+  frame por clip. Lee el stream del otro lado igual. Cada stream bidireccional es la transferencia de
+  un archivo (ver "Transporte de archivos").
 - **Conexiones duplicadas:** si los dos marcan a la vez quedan dos conexiones. Decide solo el nodo con
   el id menor: se queda con la que terminó el intercambio de `Hello` más recientemente y cierra la
   otra. El nodo con el id mayor no cierra nada. Así ambos convergen sin acordar nada, y "la más
@@ -94,7 +95,8 @@ Las direcciones estáticas siguen sirviendo para lo que mDNS no alcanza, como Ta
   `Clip.origin` no es el peer que lo manda, se descarta.
 - **API:** `Node::spawn(identidad, config)` devuelve el nodo y un canal de clips recibidos (con el id
   del peer). `Node::broadcast(clip)` lo manda a los peers conectados; los que no lo están se lo
-  pierden. `Node::links()` es un canal `watch` con el estado de cada peer (conectado o no, y la
+  pierden. `Node::broadcast_files(clip, oferta)` hace lo mismo con un clip de archivos y desde ese
+  momento sirve esos archivos; `Node::fetch_files(peer, lista, caché)` los descarga. `Node::links()` es un canal `watch` con el estado de cada peer (conectado o no, y la
   dirección del camino que usa la conexión más nueva al conectarse), para `clipbroad status`.
 
 ### Emparejamiento
@@ -149,19 +151,21 @@ Detalles (código en `crates/core/src/protocol.rs`):
   emisor no codifica un frame más grande. Por eso la config rechaza un `inline_max_bytes` mayor que
   16 MiB menos 64 KiB (margen para los metadatos del clip), y el daemon no sincroniza un texto copiado
   más grande que `inline_max_bytes`: lo salta con un warning.
-- **Mensajes:** `Hello { protocol_version }` y `Clip`. Cada lado manda `Hello` primero; `decode` devuelve
-  un error tipado si la versión no coincide, y la conexión se cierra.
+- **Mensajes:** `Hello { protocol_version }`, `Clip`, `FileRequest` y `FileResponse`. Cada lado manda
+  `Hello` primero; `decode` devuelve un error tipado si la versión no coincide, y la conexión se
+  cierra. Los dos últimos solo viajan en los streams bidireccionales de archivos; en el stream de
+  clips son un error de protocolo.
 - **`Hello` es estable entre versiones:** siempre es la variante 0 y `protocol_version` siempre es su
   primer campo; solo se le pueden agregar campos al final. `decode` ignora los bytes sobrantes dentro de un
   frame, así un nodo viejo puede leer la versión de un `Hello` nuevo y rechazarlo con un error claro.
 - **`Clip`:** `id` (número que elige el origen), `origin` (los 32 bytes del `EndpointId`, opacos para
   `core`), `timestamp_ms` (milisegundos Unix según el reloj del origen, adelantado si hace falta para quedar
   después de lo último que vio; ver "Semántica de sincronización"), `kind`, `mime`, `size`, `hash` y
-  `payload`. El payload hoy solo puede ser inline; el anuncio de archivos está bosquejado en
-  "Transporte de archivos" y se agrega en la fase 4.
+  `payload`. El payload es inline (texto e imágenes) o una lista de archivos (ver "Transporte de
+  archivos").
 - **Verificación al recibir:** el contenido solo se obtiene con `Clip::into_content`, que comprueba que el
-  tamaño y el hash BLAKE3 declarados coinciden con el payload, que el texto sea UTF-8 válido y que una
-  imagen empiece como PNG.
+  tamaño y el hash BLAKE3 declarados coinciden con el payload, que el texto sea UTF-8 válido, que una
+  imagen empiece como PNG, que una lista de archivos sea válida y que el payload corresponda al tipo.
 - El `Debug` de un `Clip` muestra el largo del payload, nunca su contenido, para no filtrarlo en los logs.
 
 ### Semántica de sincronización
@@ -471,61 +475,91 @@ Por qué la conexión existente y no un ALPN aparte (`clipbroad-file/1`):
 - Costo: si la conexión se cae o se reemplaza (ver "Conexiones duplicadas"), la transferencia en curso
   se corta y se reintenta en la conexión nueva.
 
-Transferencia (borrador para la tarea de archivos):
-- **Pedido.** El receptor abre un stream bidireccional y manda un frame `FileRequest { hash }`, con el
-  mismo enmarcado que los demás mensajes. El emisor responde con un frame `FileResponse::Ok { size }`
-  seguido de los bytes crudos del archivo hasta cerrar el stream, o con `FileResponse::NotOffered`.
-- **El emisor solo sirve los archivos de su último clip anunciado** (una tabla hash → ruta). Los lee de
-  su ruta original, sin copiarlos. Un hash que no está en la tabla recibe `NotOffered`.
-- **El receptor verifica antes de exponer.** Revisa que `size` sea el anunciado y no pase el límite.
-  Escribe en un temporal dentro de `<cache>/clipbroad/files/<hash>/`, actualiza el BLAKE3 con cada
-  bloque y corta si llegan más bytes que `size`. Al terminar compara tamaño y hash: si coinciden,
-  renombra el temporal al nombre final, y si no, lo borra. El portapapeles solo recibe rutas de
-  archivos verificados.
-- Si el archivo cambió en el emisor después de copiarlo, el hash no coincide y el clip no se aplica.
-- Un archivo que ya está en la caché con ese hash no se pide.
-- Un clip más nuevo cancela las transferencias del anterior (cierra sus streams).
-- Sin reanudación: si algo falla, se borra el temporal y se pide de nuevo desde cero.
+Implementación (código en `crates/core/src/files.rs`, `crates/net/src/files.rs` y
+`crates/net/src/cache.rs`):
 
-Anuncio en `Clip` (borrador, sin implementar):
-
-```rust
-pub enum ContentKind { Text, Image, Files }
-
-pub enum Payload {
-    Inline(Vec<u8>),
-    Files(Vec<FileEntry>),
-}
-
-pub struct FileEntry {
-    pub name: String,       // solo el nombre del archivo, nunca una ruta
-    pub size: u64,
-    pub hash: ContentHash,  // BLAKE3 del contenido
-}
-```
-
-- `kind` es `Files`, `mime` es `text/uri-list`, `size` es la suma de los tamaños y `hash` es el BLAKE3
-  de la lista codificada (nombre, tamaño y hash de cada archivo, en orden). Ese hash no depende de la
-  ruta del archivo en cada máquina, así que el anti-eco funciona como con el texto. Al escribir las
-  rutas de la caché en el portapapeles, el evento local calcula el mismo hash desde los archivos, lo
-  que cuesta unos 17 ms por cada 100 MB.
-- `Clip::into_content` revisa que la lista no esté vacía, que cada nombre sea un solo componente
-  válido (sin `/`, `\`, `..`, NUL ni nombres reservados de Windows), que no se repitan nombres, que la
-  suma de tamaños sea `size`, que el hash de la lista sea `hash` y que el total no pase el límite.
-- Varios archivos por copia entran en la misma lista. Cada backend la traduce a su formato:
-  `text/uri-list` en Wayland, `CF_HDROP` en Windows, URLs de archivo en macOS.
-- Las carpetas quedan fuera de la primera versión: se saltan con un warning.
-- El límite es un total por clip en la config. El emisor no anuncia un clip que lo pasa, y el receptor
-  aplica su propio límite antes de pedir y mientras recibe.
+- **Anuncio.** `ContentKind::Files` y `Payload::Files(Vec<FileEntry>)`, con
+  `FileEntry { name, size, hash }`. `kind` es `Files`, `mime` es `text/uri-list` y `size` es la suma
+  de los tamaños. En `core`, `ClipContent::Files(FileList)` es la lista ya revisada: no vacía, con
+  nombres válidos y sin repetir, ordenada por nombre y con una suma de tamaños que no desborda.
+- **Hash del clip.** BLAKE3 en modo de derivación de clave (contexto `"clipbroad 2026-10 file list"`)
+  sobre cada archivo en orden de nombre: el largo del nombre (u64 little-endian), el nombre en UTF-8,
+  el tamaño (u64 little-endian) y los 32 bytes del hash del archivo. La lista se ordena por nombre
+  porque el SO puede devolver los archivos en otro orden al leerlos de vuelta, y el anti-eco necesita
+  el mismo hash. El modo de derivación de clave lo separa
+  del BLAKE3 simple de un texto o una imagen, así nunca chocan. No depende de dónde están los archivos
+  en cada máquina: al poner las rutas de la caché en el portapapeles (tarea 4.5), el evento local
+  calcula el mismo hash y el motor lo reconoce como eco.
+- **Nombres.** Un nombre válido es un solo componente que los tres SO pueden crear tal cual:
+  no vacío, hasta 255 bytes, sin `/`, `\` ni los otros caracteres que Windows no permite
+  (`: * ? " < > |`), sin caracteres de control (NUL incluido), sin punto ni espacio al final (eso
+  también rechaza `.` y `..`) y sin nombres de dispositivo de Windows (`CON`, `nul.txt`, `COM1`, ...).
+  Las mismas reglas en todos los SO, así un nombre que una máquina acepta lo aceptan todas. El emisor
+  salta con un warning los archivos con un nombre así; el receptor rechaza el clip entero. Los
+  errores nunca incluyen el nombre recibido, que podría meter caracteres de control en los logs.
+- **Pedido.** El receptor abre un stream bidireccional y manda `FileRequest { hash }`. El emisor
+  responde `FileResponse::Ok { size }` seguido de exactamente `size` bytes y cierra el stream, o
+  `FileResponse::NotOffered`. El stream de clips tiene prioridad 1 y los de archivos la 0 por
+  defecto, así un texto copiado no espera detrás de un archivo.
+- **El emisor solo sirve los archivos de su último clip** (`Offer`: hash → ruta y tamaño). Los lee de
+  su ruta original, sin copiarlos. Un hash que no está en la oferta recibe `NotOffered`, y también un
+  archivo cuyo tamaño cambió desde que se copió (si cambió sin cambiar de tamaño, el receptor lo nota
+  por el hash). Cualquier `broadcast` nuevo reemplaza la oferta; uno de texto la vacía. La oferta se
+  publica antes de mandar el clip, así un pedido rápido la encuentra.
+- **El emisor revisa al copiar** (`Offer::read`): salta con un warning las carpetas y todo lo que no
+  sea un archivo regular, los archivos de más de `file_max_bytes`, los nombres inválidos y un segundo
+  archivo con el mismo nombre. Si lo que queda suma más de `file_cache_max_bytes`, no anuncia nada.
+- **El receptor revisa los límites antes de pedir:** cada archivo hasta `file_max_bytes` y todos
+  juntos hasta `file_cache_max_bytes`. Si no, falla sin abrir ningún stream. El `size` de la
+  respuesta debe ser el anunciado.
+- **El receptor verifica antes de exponer.** Escribe en un temporal `.clipbroad-<azar>.part` dentro
+  de `<caché>/<hash>/`, actualiza el BLAKE3 con cada bloque y corta apenas llega un byte de más.
+  Al terminar compara tamaño y hash: si coinciden, renombra el temporal al nombre final, y si no, lo
+  borra. Un stream que no trae nada en 30 s se corta. Solo se devuelven rutas de archivos verificados.
+- **Un archivo que ya está en la caché no se pide.** Antes se vuelve a calcular su hash, por si una
+  app lo editó en el lugar (cuesta unos 17 ms por cada 100 MB); si no coincide, se borra y se pide.
+- **Cancelar es soltar la descarga.** Soltar el future de `fetch_files` cierra el stream (el emisor
+  recibe `STOP_SENDING`) y borra el temporal. El daemon (tarea 4.5) suelta la descarga en curso
+  cuando llega un clip más nuevo.
+- **Reintentos.** Si la conexión se cae o se reemplaza a mitad de un archivo, se pide de nuevo desde
+  cero en la conexión siguiente, hasta 3 intentos, esperando hasta 10 s a que el peer vuelva. Otros
+  errores (hash distinto, `NotOffered`, límites) no se reintentan.
+- **Carpetas:** fuera de la primera versión, se saltan con un warning. Recorrerlas pediría nombres con
+  ruta relativa (y validarlas); comprimirlas, un formato y una dependencia. Se decide cuando haga
+  falta.
 - `PROTOCOL_VERSION` pasa a 3.
 
-Riesgos:
-- **Código propio que mantener.** El prototipo tiene unas 70 líneas entre los dos lados. Con tests y el
-  manejo de errores, se estiman unas 300 en `net`.
+Caché (`FileCache`):
+
+- **Ubicación:** `files/<hash>/<nombre>` dentro de la carpeta de caché de cada SO:
+  `$XDG_CACHE_HOME/clipbroad/files` (`~/.cache/...`) en Linux, `~/Library/Caches/clipbroad/files` en
+  macOS y `%LOCALAPPDATA%\clipbroad\files` en Windows. Con `--config <archivo>` es la carpeta `files`
+  junto a ese archivo, así dos instancias en una máquina nunca comparten la caché. Abrir la caché
+  borra los temporales que dejó un crash, así que solo un proceso puede usar cada carpeta.
+- **Permisos:** en Unix las carpetas se crean `0700` y los archivos quedan `0600`, porque lo copiado
+  puede ser privado. Un archivo pegado desde la caché puede conservar esos permisos.
+- **Limpieza** después de cada descarga: borra los archivos de más de `file_cache_max_days` días y
+  después los más viejos hasta quedar bajo `file_cache_max_bytes`. La antigüedad es la fecha de
+  modificación, que se renueva cuando un archivo se vuelve a usar desde la caché. Nunca borra los
+  archivos del clip que se acaba de descargar, que es lo que el portapapeles tiene; no se sigue qué
+  apunta el portapapeles después. Los temporales de una descarga en curso no se tocan, y solo mira
+  carpetas con nombre de hash, así nada ajeno que termine en la caché se borra.
+- **Config:** `file_max_bytes` (512 MiB por defecto), `file_cache_max_bytes` (2 GiB, también el
+  límite de todos los archivos de una copia) y `file_cache_max_days` (7). `file_max_bytes` no puede
+  ser mayor que `file_cache_max_bytes`.
+
+Riesgos y límites:
+- **Código propio que mantener.** Unas 750 líneas en `net` con comentarios y sin tests (el spike
+  estimaba 300). Casi la mitad es la caché y su limpieza.
 - **Sin reanudación.** En una red lenta, un archivo grande que se corta empieza de cero. Si pasa en el
   uso real, se puede pedir desde un offset (el temporal ya tiene el comienzo) sin cambiar el anuncio.
 - **La verificación es al final.** Un peer emparejado que manda basura nos hace escribir hasta `size`
   bytes antes de detectarla. Es un peer de confianza y el límite acota el daño.
+- **El motor marca el clip como aplicado antes de tener los archivos.** Si la descarga falla, ese
+  clip no se reintenta hasta la próxima copia, como pasa hoy con una imagen que el SO no puede
+  escribir.
+- **Todavía no se aplican.** Hasta la tarea 4.5 el daemon no lee archivos del portapapeles, y un clip
+  de archivos recibido se salta con un warning.
 - Se puede volver a evaluar `iroh-blobs` cuando su línea compatible con iroh 1.x se declare lista para
   producción.
 

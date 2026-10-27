@@ -20,6 +20,8 @@ use tokio::time;
 
 use super::*;
 
+mod files;
+
 /// Upper bound for anything a test waits on. Localhost takes milliseconds; this only stops a
 /// broken test from hanging CI.
 const TIMEOUT: Duration = Duration::from_secs(10);

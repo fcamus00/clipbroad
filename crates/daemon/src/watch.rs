@@ -95,6 +95,11 @@ async fn watch(
                 Ok(Some(ClipContent::Image(png))) => {
                     format!("(image/png, {} bytes)", png.as_bytes().len())
                 }
+                Ok(Some(ClipContent::Files(files))) => format!(
+                    "({} files, {} bytes)",
+                    files.entries().len(),
+                    files.total_size()
+                ),
                 Ok(None) => "(no text or PNG image)".to_owned(),
                 Err(ClipboardError::Sensitive { marker }) => {
                     format!("(sensitive: {marker}, not read or synced)")

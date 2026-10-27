@@ -24,7 +24,15 @@
 //!
 //! Inside a connection each side opens one unidirectional stream and writes frames on it: first
 //! a [`Hello`](clipbroad_core::protocol::Hello), then one frame per clip. It reads the other
-//! side's stream the same way.
+//! side's stream the same way. Each file transfer is a bidirectional stream on the same
+//! connection, with a lower priority than the clip stream (see [`Node::fetch_files`]).
+//!
+//! # Files
+//!
+//! A files clip only announces the files. The sender broadcasts it with
+//! [`Node::broadcast_files`] and from then on serves those files, and only those, from their
+//! original paths ([`Offer`]). The receiver calls [`Node::fetch_files`], which downloads them into
+//! a [`FileCache`] and returns their local paths.
 //!
 //! # Trust
 //!
@@ -36,6 +44,8 @@
 //!
 //! [`pair`] adds a peer: one machine shows a ticket and the other dials it, on a separate ALPN.
 
+mod cache;
+mod files;
 pub mod pair;
 mod peer;
 mod session;
@@ -45,11 +55,17 @@ mod tests;
 use std::{
     collections::{HashMap, HashSet},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::PathBuf,
     sync::Arc,
 };
 
+pub use cache::{Cleaned, FileCache, StoreError};
 use clipbroad_config::{Config, IdentityKey};
-use clipbroad_core::protocol::{self, Clip, FrameError, Message};
+use clipbroad_core::{
+    FileList,
+    protocol::{self, Clip, FrameError, Message},
+};
+pub use files::{FetchError, Offer};
 use iroh::{
     Endpoint, EndpointId, SecretKey,
     endpoint::{
@@ -130,10 +146,11 @@ pub enum Error {
 pub struct Node {
     endpoint: Endpoint,
     outbox: broadcast::Sender<Frame>,
+    /// Files of the latest broadcast clip, served to peers that ask.
+    offer: watch::Sender<Option<Arc<Offer>>>,
     links: watch::Sender<Links>,
     lan_discovery: bool,
     tasks: JoinSet<()>,
-    #[cfg(test)]
     peers: HashMap<EndpointId, Arc<peer::PeerState>>,
 }
 
@@ -175,12 +192,18 @@ impl Node {
 
         let (inbox_tx, inbox) = mpsc::channel(INBOX_CAPACITY);
         let (outbox, _) = broadcast::channel(OUTBOX_CAPACITY);
+        let offer = watch::Sender::new(None);
         let links = config.peers.iter().map(|p| (p.id, Link::Disconnected));
         let links = watch::Sender::new(links.collect());
+        let channels = peer::Channels {
+            outbox: outbox.clone(),
+            inbox: inbox_tx,
+            offer: offer.subscribe(),
+            links: links.clone(),
+        };
         let mut tasks = JoinSet::new();
         let mut routes = HashMap::new();
-        #[cfg(test)]
-        let mut peer_states = HashMap::new();
+        let mut peers = HashMap::new();
         for peer in &config.peers {
             let (conn_tx, conn_rx) = mpsc::channel(4);
             routes.insert(peer.id, conn_tx);
@@ -189,12 +212,9 @@ impl Node {
                 peer.id,
                 &peer.addrs,
                 discovery,
-                outbox.clone(),
-                inbox_tx.clone(),
-                links.clone(),
+                channels.clone(),
             );
-            #[cfg(test)]
-            peer_states.insert(peer.id, peer_task.state());
+            peers.insert(peer.id, peer_task.state());
             tasks.spawn(peer_task.run(conn_rx));
         }
         tasks.spawn(accept_loop(endpoint.clone(), routes));
@@ -202,11 +222,11 @@ impl Node {
         let node = Self {
             endpoint,
             outbox,
+            offer,
             links,
             lan_discovery: discovery,
             tasks,
-            #[cfg(test)]
-            peers: peer_states,
+            peers,
         };
         Ok((node, inbox))
     }
@@ -232,14 +252,62 @@ impl Node {
 
     /// Sends `clip` to every connected peer. Peers that are not connected right now miss it.
     ///
+    /// The files of the previous clip are no longer served. For a files clip, use
+    /// [`Node::broadcast_files`].
+    ///
     /// # Errors
     ///
-    /// [`FrameError::TooLarge`] if the clip does not fit in a frame.
+    /// [`FrameError::TooLarge`] if the clip does not fit in a frame. Nothing changes then.
     pub fn broadcast(&self, clip: Clip) -> Result<(), FrameError> {
+        self.send_clip(clip, None)
+    }
+
+    /// Sends `clip`, which announces the files of `offer`, to every connected peer, and serves
+    /// those files to any peer that asks until the next broadcast. A transfer already running
+    /// for an earlier clip goes on until the receiver stops it.
+    ///
+    /// # Errors
+    ///
+    /// [`FrameError::TooLarge`] if the clip does not fit in a frame (tens of thousands of
+    /// files). Nothing changes then.
+    pub fn broadcast_files(&self, clip: Clip, offer: Offer) -> Result<(), FrameError> {
+        self.send_clip(clip, Some(Arc::new(offer)))
+    }
+
+    fn send_clip(&self, clip: Clip, offer: Option<Arc<Offer>>) -> Result<(), FrameError> {
         let frame = protocol::encode(&Message::Clip(clip))?;
+        // Serve the files before announcing them, so a quick request finds them.
+        self.offer.send_replace(offer);
         // An error only means that no peer is connected.
         let _ = self.outbox.send(frame.into());
         Ok(())
+    }
+
+    /// Downloads the files of a files clip from `from`, the peer that sent it, into `cache`, and
+    /// returns their local paths in the order of `files`. Files already in the cache are not
+    /// downloaded again. Afterwards it cleans the cache, keeping these files.
+    ///
+    /// The limits come first: a file over `file_max_bytes`, or files that add up to more than
+    /// `file_cache_max_bytes`, fail before anything is asked for. Each file is then written to a
+    /// temporary file while it is hashed, and only moved to its cache path if its size and hash
+    /// match `files` (see [`FileCache`]). If the connection drops, the file is asked for again on
+    /// the next connection, up to three tries.
+    ///
+    /// Dropping the future cancels the transfer: the stream is closed and the temporary file
+    /// deleted. When a newer clip arrives, cancel the running fetch this way.
+    ///
+    /// # Errors
+    ///
+    /// [`FetchError`] for the first file that cannot be fetched. Files fetched before it stay in
+    /// the cache.
+    pub async fn fetch_files(
+        &self,
+        from: EndpointId,
+        files: &FileList,
+        cache: &FileCache,
+    ) -> Result<Vec<PathBuf>, FetchError> {
+        let peer = self.peers.get(&from).ok_or(FetchError::UnknownPeer)?;
+        files::fetch(peer.newest(), files, cache).await
     }
 
     /// Closes every connection, telling peers right away, and stops the node.

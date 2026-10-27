@@ -177,10 +177,11 @@ async fn local_change(
         return Ok(());
     };
     let (kind, size) = match &content {
-        ClipContent::Text(text) => (ContentKind::Text, text.len()),
-        ClipContent::Image(png) => (ContentKind::Image, png.as_bytes().len()),
+        ClipContent::Text(text) => (ContentKind::Text, text.len() as u64),
+        ClipContent::Image(png) => (ContentKind::Image, png.as_bytes().len() as u64),
+        // `read_content` does not read file lists yet.
+        ClipContent::Files(files) => (ContentKind::Files, files.total_size()),
     };
-    let size = size as u64;
     if size > inline_max_bytes {
         warn!(
             ?kind,
@@ -222,11 +223,20 @@ async fn remote_clip(
     match action {
         RemoteAction::Apply(content) => {
             let clipboard = Arc::clone(clipboard);
-            let written = tokio::task::spawn_blocking(move || match content {
-                ClipContent::Text(text) => clipboard.write_text(&text),
-                ClipContent::Image(png) => clipboard.write_image(&png),
-            })
-            .await?;
+            let written = match content {
+                ClipContent::Text(text) => {
+                    tokio::task::spawn_blocking(move || clipboard.write_text(&text)).await?
+                }
+                ClipContent::Image(png) => {
+                    tokio::task::spawn_blocking(move || clipboard.write_image(&png)).await?
+                }
+                // Fetching the files and putting their paths on the clipboard comes with the
+                // clipboard backends for files.
+                ClipContent::Files(_) => {
+                    warn!(%from, ?kind, size, %hash, "file clips are not applied yet, clip not applied");
+                    return Ok(());
+                }
+            };
             match written {
                 Ok(()) => info!(%from, ?kind, size, %hash, "applied clip"),
                 // macOS and Windows do not write images yet.
