@@ -6,8 +6,8 @@
 //!
 //! # Threads
 //!
-//! - [`write_text`](Clipboard::write_text) and [`write_image`](Clipboard::write_image): on
-//!   Wayland the app that copied must keep serving the content to whoever pastes.
+//! - [`write_text`](Clipboard::write_text), [`write_image`](Clipboard::write_image) and
+//!   [`write_files`](Clipboard::write_files): on Wayland the app that copied must keep serving the content to whoever pastes.
 //!   `wl_clipboard_rs` does this on a background thread that lives until another copy replaces
 //!   ours (the compositor then cancels our offer and the thread ends) or the process exits. So
 //!   there is at most one such thread per process in steady state, and the clipboard empties when
@@ -19,8 +19,8 @@
 //!
 //! # Sensitive content
 //!
-//! [`read_text`](Clipboard::read_text) and [`read_image`](Clipboard::read_image) ask the compositor
-//! for the current selection and get one data offer with its fixed list of MIME types. They check
+//! [`read_text`](Clipboard::read_text), [`read_image`](Clipboard::read_image) and
+//! [`read_files`](Clipboard::read_files) ask the compositor for the current selection and get one data offer with its fixed list of MIME types. They check
 //! that list for sensitive markers and, if there are none, read the content from **that same
 //! offer**. A newer copy brings a new offer, so the checked list and the content always belong to
 //! the same copy.
@@ -36,6 +36,18 @@
 //! [`read_text`](Clipboard::read_text) returns `None`, so the image is what gets synced and not
 //! the `<img>` markup.
 //!
+//! # Files
+//!
+//! Copied files are read from `text/uri-list` (RFC 2483), which file managers and
+//! `wl-copy --type text/uri-list` offer. Only `file://` URIs with an empty host, `localhost` or
+//! this machine's host name count, percent-decoded into paths. One URI of any other kind (a copied
+//! web link) means the copy is not files, so it stays text. Lines starting with `#` are comments.
+//!
+//! Writing offers three types for the same paths: `text/uri-list`, `x-special/gnome-copied-files`
+//! (`copy` and then one URI per line; what GNOME Files pastes from) and the plain paths, one per
+//! line, as text, so pasting into a terminal or an editor gives the paths, as with a copy from
+//! GNOME Files. Reading back prefers `text/uri-list`, so the daemon finds the same paths.
+//!
 //! # Known compositor gaps
 //!
 //! Hyprland (checked on 0.56.2) sends no data-control event when the clipboard is cleared or when
@@ -43,8 +55,12 @@
 //! one whenever the compositor does send it.
 
 use std::error::Error;
+use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::io::{self, Read};
 use std::os::fd::AsFd;
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -65,6 +81,12 @@ const PLAIN_TEXT: [&str; 5] = [TEXT_UTF8, "UTF8_STRING", "text/plain", "STRING",
 
 /// The only image type read and written.
 const IMAGE_PNG: &str = "image/png";
+
+/// Copied files, as `file://` URIs (RFC 2483).
+const URI_LIST: &str = "text/uri-list";
+
+/// What GNOME Files pastes from: `copy` (or `cut`), then one URI per line.
+const GNOME_COPIED_FILES: &str = "x-special/gnome-copied-files";
 
 /// Longest wait for the app that owns the clipboard to hand over its content.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -155,6 +177,44 @@ impl Clipboard for WaylandClipboard {
                 copy::Source::Bytes(png.as_bytes().into()),
                 copy::MimeType::Specific(IMAGE_PNG.to_owned()),
             )
+            .map_err(copy_error)
+    }
+
+    fn read_files(&self) -> Result<Option<Vec<PathBuf>>, ClipboardError> {
+        read_current(|mime_types, offer| {
+            if !mime_types.iter().any(|offered| offered == URI_LIST) {
+                return Ok(None);
+            }
+            let list = receive(offer, URI_LIST)?;
+            let host = rustix::system::uname();
+            Ok(parse_uri_list(&list, host.nodename().to_bytes()))
+        })
+    }
+
+    fn write_files(&self, paths: &[PathBuf]) -> Result<(), ClipboardError> {
+        let uris = paths
+            .iter()
+            .map(|path| file_uri(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        let uri_list = format!("{}\r\n", uris.join("\r\n"));
+        let gnome = format!("copy\n{}", uris.join("\n"));
+        let text = paths
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source = |bytes: String, mime: &str| copy::MimeSource {
+            source: copy::Source::Bytes(bytes.into_bytes().into()),
+            mime_type: copy::MimeType::Specific(mime.to_owned()),
+        };
+        // The plain text goes first: the library also offers the first text type it gets as
+        // `text/plain`, `UTF8_STRING`, `STRING` and `TEXT`, and `text/uri-list` counts as text.
+        copy::Options::new()
+            .copy_multi(vec![
+                source(text, TEXT_UTF8),
+                source(uri_list, URI_LIST),
+                source(gnome, GNOME_COPIED_FILES),
+            ])
             .map_err(copy_error)
     }
 
@@ -305,6 +365,79 @@ fn read_to_end_within(
     }
 }
 
+/// The local paths in a `text/uri-list`, or `None` if it holds no URI or any URI that is not a
+/// local file (see module docs). `host` is this machine's host name.
+fn parse_uri_list(list: &[u8], host: &[u8]) -> Option<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    // RFC 2483 separates lines with CRLF; some apps write a plain LF.
+    for line in list.split(|&byte| byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() || line.starts_with(b"#") {
+            continue;
+        }
+        paths.push(file_path(line, host)?);
+    }
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// The path of a `file://` URI on this machine, or `None` for any other URI.
+fn file_path(uri: &[u8], host: &[u8]) -> Option<PathBuf> {
+    let (scheme, rest) = uri.split_at_checked(7)?;
+    if !scheme.eq_ignore_ascii_case(b"file://") {
+        return None;
+    }
+    let (uri_host, encoded) = rest.split_at(rest.iter().position(|&byte| byte == b'/')?);
+    let local = uri_host.is_empty()
+        || uri_host.eq_ignore_ascii_case(b"localhost")
+        || uri_host.eq_ignore_ascii_case(host);
+    // A query or fragment is not part of a file URI.
+    if !local || encoded.iter().any(|&byte| byte == b'?' || byte == b'#') {
+        return None;
+    }
+    let path = percent_decode(encoded)?;
+    // No path can hold a NUL.
+    if path.contains(&0) {
+        return None;
+    }
+    Some(PathBuf::from(OsString::from_vec(path)))
+}
+
+/// `%XX` escapes decoded into bytes, or `None` if an escape is malformed.
+fn percent_decode(encoded: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(encoded.len());
+    let mut bytes = encoded.iter();
+    while let Some(&byte) = bytes.next() {
+        if byte == b'%' {
+            let hex = [*bytes.next()?, *bytes.next()?];
+            decoded.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
+        } else {
+            decoded.push(byte);
+        }
+    }
+    Some(decoded)
+}
+
+/// `file://` and the absolute `path`, with every byte outside RFC 3986's unreserved characters
+/// and `/` percent-encoded (spaces, non-ASCII, `%`, `#`, ...).
+fn file_uri(path: &Path) -> Result<String, ClipboardError> {
+    if !path.is_absolute() {
+        return Err(ClipboardError::Backend {
+            message: "a file to put on the clipboard has a relative path".to_owned(),
+            source: None,
+        });
+    }
+    let mut uri = String::from("file://");
+    for &byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {
+            uri.push(char::from(byte));
+        } else {
+            // Writing to a String never fails.
+            let _ = write!(uri, "%{byte:02X}");
+        }
+    }
+    Ok(uri)
+}
+
 fn paste_error(context: &str, error: paste::Error) -> ClipboardError {
     match error {
         paste::Error::NoSeats
@@ -365,6 +498,56 @@ mod tests {
 
         assert!(matches!(result, Err(ClipboardError::Backend { .. })));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    fn paths(list: &str) -> Option<Vec<PathBuf>> {
+        parse_uri_list(list.as_bytes(), b"devbox")
+    }
+
+    #[test]
+    fn local_file_uris_are_files() {
+        let list = "# copied\r\nfile:///tmp/a%20b/%C3%B1and%C3%BA.txt\r\nfile://localhost/x\r\n\
+                    FILE://devbox/y\nfile:///z%2525";
+        let expected = ["/tmp/a b/ñandú.txt", "/x", "/y", "/z%25"].map(PathBuf::from);
+        assert_eq!(paths(list), Some(expected.to_vec()));
+    }
+
+    #[test]
+    fn any_other_uri_means_no_files() {
+        for list in [
+            "https://example.com/file.txt",
+            "file:///tmp/a\r\nhttps://example.com/",
+            "file://otherhost/tmp/a",
+            "file:///tmp/a%2",
+            "file:///tmp/a%zz",
+            "file:///tmp/a%00b",
+            "file:///tmp/a?query",
+            "file:relative",
+            "/tmp/a",
+            "",
+            "# only a comment\r\n",
+        ] {
+            assert_eq!(paths(list), None, "{list:?}");
+        }
+    }
+
+    #[test]
+    fn written_uris_read_back_as_the_same_paths() {
+        let written = [
+            PathBuf::from("/tmp/a b/ñandú 🦀.txt"),
+            PathBuf::from("/tmp/100% #1?.txt"),
+            PathBuf::from(OsString::from_vec(b"/tmp/not utf-8 \xff".to_vec())),
+        ];
+        let uris: Vec<String> = written
+            .iter()
+            .map(|path| file_uri(path).expect("absolute"))
+            .collect();
+        assert_eq!(
+            uris[0],
+            "file:///tmp/a%20b/%C3%B1and%C3%BA%20%F0%9F%A6%80.txt"
+        );
+        assert_eq!(paths(&uris.join("\r\n")), Some(written.to_vec()));
+        assert!(file_uri(Path::new("relative")).is_err());
     }
 
     #[test]

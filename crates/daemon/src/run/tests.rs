@@ -2,15 +2,19 @@
 //! never copies and records every clip that reaches it, which shows what each daemon sends.
 
 use std::collections::HashSet;
-use std::net::{Ipv4Addr, UdpSocket};
+use std::fs;
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::num::{NonZeroU16, NonZeroU64};
+use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use clipbroad_clipboard::fake::{TEXT_FORMAT, tiny_png};
 use clipbroad_config::Peer;
-use clipbroad_core::Png;
-use iroh::{EndpointId, SecretKey};
+use clipbroad_core::protocol::{self, Clip, ClipId, Hello, Message};
+use clipbroad_core::{FileEntry, FileList, Png};
+use iroh::endpoint::presets;
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -67,12 +71,13 @@ impl Spec {
     }
 }
 
-/// [`sync`] running in a task on its own fake clipboard, with its status file in its own
-/// directory.
+/// [`sync`] running in a task on its own fake clipboard, with its status file and file cache in
+/// its own directory.
 struct Daemon {
     id: EndpointId,
     clipboard: FakeClipboard,
     status_file: PathBuf,
+    cache_dir: PathBuf,
     stop: oneshot::Sender<()>,
     task: JoinHandle<Result<()>>,
     _dir: TempDir,
@@ -85,20 +90,21 @@ impl Daemon {
         let shared: Arc<dyn Clipboard> = Arc::new(clipboard.clone());
         let key = spec.key.clone();
         let dir = tempfile::tempdir().expect("temp dir");
-        let status_file = dir.path().join("status.toml");
-        let path = status_file.clone();
+        let paths = Paths::beside_config(dir.path().join("config.toml"));
+        let (status_file, cache_dir) = (paths.status_file(), paths.file_cache_dir.clone());
         let task = tokio::spawn(async move {
             let shutdown = async {
                 // A dropped sender also stops the daemon.
                 let _ = stopped.await;
                 Ok(())
             };
-            sync(shared, &config, &key, &path, shutdown).await
+            sync(shared, &config, &key, &paths, shutdown).await
         });
         Self {
             id: spec.id(),
             clipboard,
             status_file,
+            cache_dir,
             stop,
             task,
             _dir: dir,
@@ -117,6 +123,10 @@ impl Daemon {
 
     fn image(&self) -> Option<Png> {
         self.clipboard.read_image().expect("the fake never fails")
+    }
+
+    fn files(&self) -> Option<Vec<PathBuf>> {
+        self.clipboard.read_files().expect("the fake never fails")
     }
 
     async fn stop(self) {
@@ -159,7 +169,7 @@ impl Observer {
         Self { seen, _node: node }
     }
 
-    /// Who sent `content` (text, or an image as `ClipContent::Image`).
+    /// Who sent `content` (text, or an image or files as their `ClipContent`).
     fn senders(&self, content: impl Into<ClipContent>) -> HashSet<EndpointId> {
         let hash = content.into().hash();
         lock(&self.seen)
@@ -292,6 +302,163 @@ async fn image_reaches_every_peer_once_and_text_wins_over_it() {
     for daemon in daemons {
         daemon.stop().await;
     }
+}
+
+/// The announced list of the files at `paths`, as the daemon that copies them builds it.
+fn file_list(paths: &[PathBuf]) -> FileList {
+    let offer = Offer::read(paths, &Config::default()).expect("files are readable");
+    offer.expect("files can be synced").list().clone()
+}
+
+#[tokio::test]
+async fn files_land_in_the_peers_cache_and_clipboard_once() {
+    let specs = [Spec::new(), Spec::new()];
+    let observer_spec = Spec::new();
+    let observer = Observer::start(&observer_spec, &specs).await;
+    let daemons: Vec<Daemon> = specs
+        .iter()
+        .map(|spec| {
+            let other = specs.iter().filter(|other| other.port != spec.port);
+            let peers = other.chain([&observer_spec]);
+            Daemon::start(
+                spec,
+                spec.config(peers, Config::DEFAULT_INLINE_MAX_BYTES.get()),
+            )
+        })
+        .collect();
+    connect_all(&daemons, &observer).await;
+    let [a, b] = &daemons[..] else {
+        unreachable!("two daemons")
+    };
+    let source = tempfile::tempdir().expect("temp dir");
+    let copied = [
+        ("ñandú 🦀.txt", vec![7_u8; 3]),
+        ("report.pdf", vec![1; 300_000]),
+    ]
+    .map(|(name, bytes)| {
+        let path = source.path().join(name);
+        fs::write(&path, bytes).expect("write a file to copy");
+        path
+    });
+    // A folder in the same copy is skipped.
+    let folder = source.path().join("folder");
+    fs::create_dir(&folder).expect("create a folder");
+    let list = file_list(&copied);
+
+    // What a file manager does: the files, and their paths as text.
+    let mut with_folder = copied.to_vec();
+    with_folder.push(folder);
+    a.clipboard.simulate_copy_files(with_folder);
+
+    let landed = || b.files().is_some_and(|paths| paths.len() == 2);
+    assert!(eventually(TIMEOUT, landed).await);
+    let paths = b.files().expect("files on the clipboard");
+    for original in &copied {
+        let path = paths
+            .iter()
+            .find(|path| path.file_name() == original.file_name())
+            .expect("every file arrives with its name");
+        assert!(path.starts_with(&b.cache_dir), "{path:?} not in the cache");
+        assert_eq!(fs::read(path).ok(), fs::read(original).ok());
+    }
+    // B put the cache paths on its clipboard, which fired a change event. Read back, the files
+    // hash the same, so B must not send them back.
+    time::sleep(QUIET).await;
+    let files = ClipContent::Files(list);
+    assert_eq!(observer.senders(files), HashSet::from([a.id]));
+    let text_paths = a.text().expect("the copy offers the paths as text");
+    assert_eq!(observer.senders(text_paths.as_str()), HashSet::new());
+    let status = || b.status().and_then(|s| s.last_received);
+    assert!(eventually(TIMEOUT, || status().is_some_and(|r| r.files == Some(2))).await);
+
+    for daemon in daemons {
+        daemon.stop().await;
+    }
+}
+
+/// An iroh endpoint with `spec`'s identity that is not a clipbroad node: it speaks the protocol
+/// by hand, so it can announce files and then never send them. Returns the endpoint too: the
+/// connection lasts as long as it.
+async fn raw_peer(spec: &Spec, daemon: &Spec) -> (Endpoint, iroh::endpoint::Connection) {
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::from_bytes(&spec.key.to_bytes()))
+        .clear_ip_transports()
+        .bind_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("valid bind address")
+        .bind()
+        .await
+        .expect("raw endpoint binds");
+    let addr = EndpointAddr::new(daemon.id())
+        .with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, daemon.port.get())));
+    let conn = time::timeout(TIMEOUT, endpoint.connect(addr, clipbroad_net::ALPN))
+        .await
+        .expect("connect in time")
+        .expect("handshake succeeds");
+    (endpoint, conn)
+}
+
+async fn write(send: &mut iroh::endpoint::SendStream, message: &Message) {
+    let frame = protocol::encode(message).expect("encode");
+    send.write_all(&frame).await.expect("write frame");
+}
+
+#[tokio::test]
+async fn a_newer_clip_cancels_the_running_download() {
+    let (spec, peer) = (Spec::new(), Spec::new());
+    let mut config = spec.config([&peer], Config::DEFAULT_INLINE_MAX_BYTES.get());
+    // Without addresses the daemon never dials the raw peer; the raw peer dials it.
+    config.peers[0].addrs.clear();
+    let daemon = Daemon::start(&spec, config);
+    let (_endpoint, conn) = raw_peer(&peer, &spec).await;
+    let mut clips = conn.open_uni().await.expect("open stream");
+    write(&mut clips, &Message::Hello(Hello::CURRENT)).await;
+
+    let origin = NodeId::from_bytes(*peer.id().as_bytes());
+    let files = FileList::new(vec![FileEntry {
+        name: "never sent.bin".to_owned(),
+        size: 1_000_000,
+        hash: ContentHash::of(b"anything"),
+    }])
+    .expect("valid list");
+    let at = now_ms();
+    let announce = Clip::new(ClipId(1), origin, at, ClipContent::Files(files));
+    write(&mut clips, &Message::Clip(announce)).await;
+    // The daemon asks for the file; never answering keeps the download running.
+    let (reply, _request) = time::timeout(TIMEOUT, conn.accept_bi())
+        .await
+        .expect("the daemon asks for the file")
+        .expect("file stream");
+
+    let newer = Clip::new(ClipId(2), origin, at + 1, ClipContent::from("newer"));
+    write(&mut clips, &Message::Clip(newer)).await;
+
+    assert!(eventually(TIMEOUT, || daemon.text().as_deref() == Some("newer")).await);
+    // Dropping the download closed its stream, which tells us to stop sending.
+    time::timeout(TIMEOUT, reply.stopped())
+        .await
+        .expect("the daemon stops the transfer")
+        .expect("stream stopped, not lost");
+    assert!(
+        no_partial_files(&daemon.cache_dir),
+        "a temporary file was left"
+    );
+    assert_eq!(daemon.files(), None);
+    daemon.stop().await;
+}
+
+/// Whether no file under `dir` is a transfer's temporary file.
+fn no_partial_files(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return true;
+    };
+    entries.flatten().all(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            no_partial_files(&path)
+        } else {
+            !path.to_string_lossy().ends_with(".part")
+        }
+    })
 }
 
 #[tokio::test]

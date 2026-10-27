@@ -36,8 +36,10 @@ enum Command {
     Pair(pair::Args),
     /// Sync the clipboard with the peers in the config file until Ctrl+C or SIGTERM.
     ///
-    /// Each text copied here is sent to every connected peer, and text copied on a peer is written
-    /// to this clipboard. Peers that are offline miss what is copied meanwhile. Logs show this
+    /// Each text, image or set of files copied here is sent to every connected peer, and what a
+    /// peer copies is written to this clipboard. Files are downloaded into a local cache first,
+    /// and the clipboard gets their paths there. Peers that are offline miss what is copied
+    /// meanwhile. Logs show this
     /// node's id (peers need it in their config), connections, and each clip's size and short
     /// hash, never its content. Content a password manager marks as sensitive is never read or
     /// sent.
@@ -45,7 +47,8 @@ enum Command {
     /// Print every change of the local clipboard, one line per change, until Ctrl+C.
     ///
     /// Each line shows the time (UTC), the formats the clipboard offers and a preview of its text
-    /// (first 80 characters, with newlines and control characters escaped). Content marked as
+    /// (first 80 characters, with newlines and control characters escaped), or the size of its
+    /// image or files. Content marked as
     /// sensitive shows the marker instead, and is never read. Nothing is sent to other machines.
     Watch(watch::Args),
     /// Start `clipbroad run` at login: install, uninstall, or check the service.

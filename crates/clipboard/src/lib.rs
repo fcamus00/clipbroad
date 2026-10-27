@@ -17,6 +17,8 @@ pub mod wayland;
 #[cfg(windows)]
 pub mod windows;
 
+use std::path::PathBuf;
+
 use clipbroad_core::Png;
 pub use error::ClipboardError;
 pub use watch::{ChangeSender, ClipboardChange, ClipboardWatch, WatchClosed};
@@ -32,8 +34,9 @@ pub use watch::{ChangeSender, ClipboardChange, ClipboardWatch, WatchClosed};
 /// - Implementations are `Send + Sync`; all methods take `&self`, so one instance can be shared
 ///   (e.g. in an `Arc`) and called from any thread. Use interior mutability where needed.
 /// - The reads and writes ([`read_text`](Self::read_text), [`write_text`](Self::write_text) and
-///   their image versions) are synchronous and may block briefly (talking to the compositor,
-///   waiting for another app to hand over data, retrying a busy Windows clipboard). Aim for well
+///   their image and file versions) are synchronous and may block briefly (talking to the
+///   compositor, waiting for another app to hand over data, retrying a busy Windows clipboard).
+///   Aim for well
 ///   under a second, and **never block for more than 2 seconds**: if the source app does not hand
 ///   over the data in time (a frozen app on Wayland), give up and return
 ///   [`ClipboardError::Backend`]. The backend owns this limit because the
@@ -51,8 +54,11 @@ pub use watch::{ChangeSender, ClipboardChange, ClipboardWatch, WatchClosed};
 ///   read back the **exact bytes** it wrote: anti-echo compares hashes, so a re-encoded read-back
 ///   looks like a new copy and gets sent again. Image support is optional; see
 ///   [`read_image`](Self::read_image).
+/// - Files are local absolute paths. The clipboard only holds references to them, never their
+///   bytes. File support is optional; see [`read_files`](Self::read_files).
 /// - Sensitive content (password managers) is never read: see [`read_text`](Self::read_text).
-///   The same rule applies to [`read_image`](Self::read_image).
+///   The same rule applies to [`read_image`](Self::read_image) and
+///   [`read_files`](Self::read_files).
 ///   Change events still report the markers in [`ClipboardChange::formats`], so tools like
 ///   `clipbroad watch` can show them.
 ///
@@ -141,6 +147,41 @@ pub trait Clipboard: Send + Sync {
         Err(ClipboardError::Unsupported { content: "images" })
     }
 
+    /// Reads the local paths of the files on the clipboard, as a file manager's "Copy" puts them.
+    ///
+    /// Returns `Ok(Some(paths))` if the clipboard holds a non-empty list of local files, in the
+    /// order the clipboard lists them, and `Ok(None)` otherwise (empty, text, an image, or
+    /// references that are not all local files, such as a copied web link). The paths are not
+    /// checked against the file system: they may be folders or no longer exist. Same rules as
+    /// [`read_text`](Self::read_text): 2-second limit, and the sensitive-content check on the
+    /// formats of the same content before reading the list.
+    ///
+    /// The default implementation always returns `Ok(None)`: for a backend without file support,
+    /// the clipboard never holds files.
+    ///
+    /// # Errors
+    ///
+    /// As for [`read_text`](Self::read_text).
+    fn read_files(&self) -> Result<Option<Vec<PathBuf>>, ClipboardError> {
+        Ok(None)
+    }
+
+    /// Replaces the whole clipboard content with references to the local files at `paths`, so
+    /// file managers paste them as files. `paths` are absolute and not empty.
+    ///
+    /// Same rules as [`write_text`](Self::write_text). A later [`read_files`](Self::read_files)
+    /// must return these paths while the content is ours: anti-echo hashes the files it finds
+    /// there.
+    ///
+    /// # Errors
+    ///
+    /// As for [`write_text`](Self::write_text). The default implementation returns
+    /// [`ClipboardError::Unsupported`] without touching the clipboard.
+    fn write_files(&self, paths: &[PathBuf]) -> Result<(), ClipboardError> {
+        let _ = paths;
+        Err(ClipboardError::Unsupported { content: "files" })
+    }
+
     /// Starts watching the clipboard and returns the stream of changes.
     ///
     /// Contract for implementations:
@@ -170,7 +211,8 @@ pub trait Clipboard: Send + Sync {
     ///   (next change or next polling tick).
     ///
     /// For consumers: an event says the clipboard *may* have changed and which formats it offers.
-    /// Call [`read_text`](Self::read_text) or [`read_image`](Self::read_image) if wanted; they
+    /// Call [`read_text`](Self::read_text), [`read_image`](Self::read_image) or
+    /// [`read_files`](Self::read_files) if wanted; they
     /// check for sensitive markers themselves, on the content they actually read. The content can
     /// change again between the event and the read; if so, another event follows.
     ///

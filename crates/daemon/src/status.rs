@@ -24,7 +24,7 @@ use tracing::warn;
 
 use crate::backend;
 use crate::run::now_ms;
-use crate::watch::utc_time;
+use crate::watch::{files_summary, utc_time};
 
 /// How often the daemon rewrites the file when nothing changes.
 pub const HEARTBEAT: Duration = Duration::from_secs(5);
@@ -97,7 +97,10 @@ pub enum PasteAccess {
 pub struct ClipEvent {
     pub at_ms: u64,
     pub kind: ContentKind,
+    /// In bytes; for files, all of them together.
     pub size: u64,
+    /// How many files, for a files clip.
+    pub files: Option<usize>,
     pub hash: String,
     /// Who sent it, for a received clip.
     pub from: Option<EndpointId>,
@@ -254,15 +257,14 @@ pub fn render(status: Option<&DaemonStatus>, now_ms: u64) -> String {
             let peer = status.peers.iter().find(|p| p.id == id);
             format!(", from {}", peer.map_or("an unknown peer", peer_name))
         });
-        let kind = match event.kind {
-            ContentKind::Text => "text",
-            ContentKind::Image => "image",
-            ContentKind::Files => "files",
+        let what = match event.kind {
+            ContentKind::Text => format!("text, {} bytes", event.size),
+            ContentKind::Image => format!("image, {} bytes", event.size),
+            ContentKind::Files => files_summary(event.files.unwrap_or(0), event.size),
         };
         format!(
-            "{}, {kind}, {} bytes, hash {}{from}",
+            "{}, {what}, hash {}{from}",
             time(event.at_ms, now_ms),
-            event.size,
             event.hash
         )
     };

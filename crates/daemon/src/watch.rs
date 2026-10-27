@@ -1,7 +1,9 @@
 //! `clipbroad watch`: print every change of the local clipboard.
 
+use std::fs;
 use std::future::Future;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,10 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use clipbroad_clipboard::fake::{self, FakeClipboard, TEXT_FORMAT};
 use clipbroad_clipboard::{Clipboard, ClipboardError};
-use clipbroad_core::ClipContent;
 
 use crate::backend;
-use crate::run::read_content;
+use crate::run::{Copied, read_content};
 
 /// Text previews are cut to this many characters.
 const PREVIEW_CHARS: usize = 80;
@@ -89,23 +90,9 @@ async fn watch(
             "(clipboard empty)".to_owned()
         } else {
             let clipboard = Arc::clone(&clipboard);
-            // Reads may block (up to 2 s each by contract), so keep them off the async thread.
-            match tokio::task::spawn_blocking(move || read_content(&*clipboard)).await? {
-                Ok(Some(ClipContent::Text(text))) => preview(&text),
-                Ok(Some(ClipContent::Image(png))) => {
-                    format!("(image/png, {} bytes)", png.as_bytes().len())
-                }
-                Ok(Some(ClipContent::Files(files))) => format!(
-                    "({} files, {} bytes)",
-                    files.entries().len(),
-                    files.total_size()
-                ),
-                Ok(None) => "(no text or PNG image)".to_owned(),
-                Err(ClipboardError::Sensitive { marker }) => {
-                    format!("(sensitive: {marker}, not read or synced)")
-                }
-                Err(error) => format!("(cannot read: {error})"),
-            }
+            // Reads may block (up to 2 s each by contract), and so may looking up file sizes:
+            // keep them off the async thread.
+            tokio::task::spawn_blocking(move || describe(read_content(&*clipboard))).await?
         };
         writeln!(
             out,
@@ -114,6 +101,63 @@ async fn watch(
             change.formats.join(", ")
         )?;
     }
+}
+
+/// What a change holds, for its output line.
+fn describe(content: Result<Option<Copied>, ClipboardError>) -> String {
+    match content {
+        Ok(Some(Copied::Files(paths))) => describe_files(&paths),
+        Ok(Some(Copied::Text(text))) => preview(&text),
+        Ok(Some(Copied::Image(png))) => format!("(image/png, {} bytes)", png.as_bytes().len()),
+        Ok(None) => "(no files, text or PNG image)".to_owned(),
+        Err(ClipboardError::Sensitive { marker }) => {
+            format!("(sensitive: {marker}, not read or synced)")
+        }
+        Err(error) => format!("(cannot read: {error})"),
+    }
+}
+
+/// `(3 files, 41.9 MB)`, with sizes from the file system. Folders and paths that cannot be read
+/// are counted apart: `run` does not sync them.
+fn describe_files(paths: &[PathBuf]) -> String {
+    let sizes: Vec<u64> = paths
+        .iter()
+        .filter_map(|path| fs::metadata(path).ok().filter(fs::Metadata::is_file))
+        .map(|meta| meta.len())
+        .collect();
+    let skipped = match paths.len() - sizes.len() {
+        0 => String::new(),
+        n => format!(", {n} not synced (folders or unreadable)"),
+    };
+    format!(
+        "({}{skipped})",
+        files_summary(sizes.len(), sizes.iter().sum())
+    )
+}
+
+/// `3 files, 41.9 MB`.
+pub fn files_summary(count: usize, bytes: u64) -> String {
+    let noun = if count == 1 { "file" } else { "files" };
+    format!("{count} {noun}, {}", human_size(bytes))
+}
+
+/// `512 bytes`, `41.9 MB`: decimal units, one decimal digit, rounded.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["kB", "MB", "GB", "TB", "PB"];
+    let mut scale = 1_u128;
+    let mut unit = None;
+    for name in UNITS {
+        if u128::from(bytes) < scale * 1000 {
+            break;
+        }
+        scale *= 1000;
+        unit = Some(name);
+    }
+    let Some(unit) = unit else {
+        return format!("{bytes} bytes");
+    };
+    let tenths = (u128::from(bytes) * 10 + scale / 2) / scale;
+    format!("{}.{} {unit}", tenths / 10, tenths % 10)
 }
 
 /// Copies each of [`FAKE_COPIES`] and then an image, handing control back to [`watch`] after
@@ -175,6 +219,43 @@ mod tests {
     #[test]
     fn preview_escapes_control_characters() {
         assert_eq!(preview("a\r\n\u{1b}[31m"), r#""a\r\n\u{1b}[31m" (8 chars)"#);
+    }
+
+    #[test]
+    fn human_size_uses_decimal_units() {
+        let cases = [
+            (0, "0 bytes"),
+            (999, "999 bytes"),
+            (1000, "1.0 kB"),
+            (41_949_999, "41.9 MB"),
+            (41_950_000, "42.0 MB"),
+            (2 * 1024 * 1024 * 1024, "2.1 GB"),
+            (u64::MAX, "18446.7 PB"),
+        ];
+        for (bytes, shown) in cases {
+            assert_eq!(human_size(bytes), shown);
+        }
+    }
+
+    #[test]
+    fn files_show_their_count_and_size_and_what_is_skipped() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("a b.txt");
+        fs::write(&file, vec![0; 1500]).expect("write");
+        assert_eq!(
+            describe_files(std::slice::from_ref(&file)),
+            "(1 file, 1.5 kB)"
+        );
+        let paths = [
+            file.clone(),
+            file,
+            dir.path().to_owned(),
+            dir.path().join("gone"),
+        ];
+        assert_eq!(
+            describe_files(&paths),
+            "(2 files, 3.0 kB, 2 not synced (folders or unreadable))"
+        );
     }
 
     #[test]
