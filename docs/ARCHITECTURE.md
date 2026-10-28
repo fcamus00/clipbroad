@@ -661,7 +661,15 @@ Code in `crates/clipboard` (`read_files`, `write_files`) and `crates/daemon/src/
 - Each `v*` tag publishes a GitHub Release with the 3 binaries (`.tar.gz` / `.zip`) and `SHA256SUMS`. The
   process is in [`RELEASE.md`](RELEASE.md).
 - A custom workflow instead of `cargo-dist`: 3 archives and checksums are enough, and a short hand-written
-  workflow is easier to maintain than a generated one. It will be reviewed if installers or Homebrew are needed.
+  workflow is easier to maintain than a generated one.
+- Package managers instead of our own installers: Homebrew (macOS), Scoop (Windows) and AUR
+  (Arch). Each one installs to a path that survives upgrades, so the login service does not break, and
+  none of them sets the macOS quarantine flag. The `publish` job in `release.yml` updates them on
+  each stable release.
+- Homebrew only on macOS: on Linux, `current_exe` resolves Homebrew's symlink into the versioned
+  folder, which `brew upgrade` deletes, and the service would point to a binary that no longer exists.
+- Scoop without a *shim*: the manifest adds the app folder to `PATH`. The shim is also called
+  `clipbroad.exe`, and `service install` would kill it while stopping the other `clipbroad.exe` processes.
 - The version lives in `[workspace.package]`; the workflow fails if the tag does not match
   `clipbroad --version`.
 - macOS: no signing or notarization for now (that requires an Apple Developer account).

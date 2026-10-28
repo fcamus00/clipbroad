@@ -89,3 +89,55 @@ jobs:
           prerelease=()
           if [[ "$TAG" == *-* ]]; then prerelease=(--prerelease); fi
           gh release create "$TAG" dist/* --verify-tag --generate-notes "${prerelease[@]}"
+
+  # Updates the Homebrew tap, the Scoop bucket and the AUR package. Pre-releases stay on GitHub only.
+  publish:
+    name: publish (${{ matrix.target }})
+    needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: homebrew-tap
+            repo: git@github.com:fcamus00/homebrew-tap.git
+            branch: main
+            key: HOMEBREW_TAP_SSH_KEY
+          - target: scoop-bucket
+            repo: git@github.com:fcamus00/scoop-bucket.git
+            branch: main
+            key: SCOOP_BUCKET_SSH_KEY
+          - target: aur
+            repo: ssh://aur@aur.archlinux.org/clipbroad-bin.git
+            branch: master
+            key: AUR_SSH_KEY
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Render
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$TAG" --pattern SHA256SUMS
+          packaging/render.sh "${TAG#v}" SHA256SUMS out
+      - name: Push
+        env:
+          SSH_KEY: ${{ secrets[matrix.key] }}
+          TARGET: ${{ matrix.target }}
+          REPO: ${{ matrix.repo }}
+          BRANCH: ${{ matrix.branch }}
+        run: |
+          key="$RUNNER_TEMP/key"
+          install -m 600 /dev/null "$key"
+          printf '%s\n' "$SSH_KEY" > "$key"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o UserKnownHostsFile=$PWD/packaging/known_hosts"
+          git clone "$REPO" repo
+          cp -r "out/$TARGET/." repo/
+          cd repo
+          git add -A
+          # A re-run after a partial failure has nothing new to commit.
+          if git diff --cached --quiet; then exit 0; fi
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "clipbroad ${TAG#v}"
+          git push origin "HEAD:$BRANCH"

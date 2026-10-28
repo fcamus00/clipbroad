@@ -30,6 +30,29 @@ A tag with a suffix (`v0.2.0-rc.1`) creates a **pre-release**. The binary versio
   `clipbroad-<tag>-<platform>/` folder, as `.tar.gz` (Linux, macOS) or `.zip` (Windows).
 - **release**: collects the 3 archives, writes `SHA256SUMS` and creates the release with `gh release create`
   (notes generated from the merged PRs).
+- **publish**: only on tags without a suffix. Updates the package managers (see below).
+
+## Package managers
+
+| Manager | Platform | Repo it updates | Secret with the SSH key |
+|---|---|---|---|
+| Homebrew | macOS (Apple Silicon) | [`fcamus00/homebrew-tap`](https://github.com/fcamus00/homebrew-tap) | `HOMEBREW_TAP_SSH_KEY` |
+| Scoop | Windows | [`fcamus00/scoop-bucket`](https://github.com/fcamus00/scoop-bucket) | `SCOOP_BUCKET_SSH_KEY` |
+| AUR | Arch Linux | [`clipbroad-bin`](https://aur.archlinux.org/packages/clipbroad-bin) | `AUR_SSH_KEY` |
+
+The templates live in `packaging/`, with `@VERSION@` and `@SHA256@` in place of the version and the checksum.
+The `publish` job downloads the release's `SHA256SUMS`, fills the templates with `packaging/render.sh` and
+commits to each repo with its SSH key. The GitHub and AUR host keys are pinned in
+`packaging/known_hosts`. If one target fails, the others continue; "Re-run failed jobs" retries it without
+duplicating commits.
+
+- On GitHub, the key is a *deploy key* with write access to that repo. On the AUR, it is an SSH key of the
+  maintainer's account. To rotate a key: generate a new one, register the public key where it belongs
+  and store the private key with `gh secret set <SECRET> --repo fcamus00/clipbroad < key`.
+- When changing `packaging/aur/PKGBUILD`, update `packaging/aur/.SRCINFO` to match. `packaging/check.sh`
+  fills the templates with fake checksums and checks that the formula, the manifest and the `.SRCINFO`
+  are valid (it needs `ruby`, `jq` and `makepkg`; it skips the ones that are missing).
+- Pre-releases are not published: the pacman version does not allow `-`.
 
 ## If something fails
 
@@ -42,6 +65,8 @@ gh release delete v0.2.0 --yes   # only if the release got created
 ```
 
 ## Install from a release
+
+The usual way is to install with a package manager (commands in `README.md`). By hand:
 
 ```sh
 gh release download v0.2.0 --repo fcamus00/clipbroad --pattern '*linux-x86_64*' --pattern SHA256SUMS
