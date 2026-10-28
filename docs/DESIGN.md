@@ -345,7 +345,9 @@ que dispara el aviso cuando se active. Mitigaciones previstas:
 - Usar los métodos `detect` para saber qué tipos hay **sin leer** antes de decidir leer.
 - Documentar el permiso en Ajustes del Sistema → Privacidad y seguridad → "Pegar desde otras apps"
   (Allow). No existe un entitlement que lo evite.
-- Por verificar en el spike de la fase 1: si leer solo `changeCount` dispara el aviso.
+- Resultado de la prueba manual (octubre 2026, `v0.1.0-rc.1`): en el Mac del dueño, `watch` y `run`
+  leyeron texto, imágenes y archivos sin que macOS mostrara ningún aviso. No se probó con la
+  preferencia de desarrollador `EnablePasteboardPrivacyDeveloperPreview` activa.
 
 ## Imágenes
 
