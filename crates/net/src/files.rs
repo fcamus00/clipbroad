@@ -2,7 +2,7 @@
 //!
 //! Each transfer is one bidirectional QUIC stream on the connection the peer already has with
 //! this node: the receiver sends a [`FileRequest`], the sender answers with a [`FileResponse`]
-//! and, if it serves the file, its raw bytes. See "File transport" in `docs/DESIGN.md`.
+//! and, if it serves the file, its raw bytes. See "File transport" in `docs/ARCHITECTURE.md`.
 //!
 //! # Trust
 //!

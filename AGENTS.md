@@ -6,7 +6,7 @@ always edit here.
 ## Project
 
 `clipbroad` syncs the clipboard across the owner's machines (Linux/Hyprland, macOS, Windows) with
-a P2P daemon in Rust, without a server. **Read `docs/DESIGN.md` before any non-trivial change**: it
+a P2P daemon in Rust, without a server. **Read `docs/ARCHITECTURE.md` before any non-trivial change**: it
 holds the architecture decisions, the phased plan and the known risks.
 
 The project owner supervises by results and does not read Rust in detail. Because of that:
@@ -19,12 +19,12 @@ The project owner supervises by results and does not read Rust in detail. Becaus
 ## Structure
 
 ```
-crates/core       # content types, protocol, anti-echo, filters. No OS code.
-crates/clipboard  # Clipboard trait + per-OS backends + in-memory fake for tests
-crates/net        # iroh transport, pairing, broadcast
-crates/config     # TOML config, identity (secret key) and per-OS paths
-crates/daemon     # `clipbroad` binary (CLI + orchestration)
-docs/DESIGN.md    # decisions and plan
+crates/core           # content types, protocol, anti-echo, filters. No OS code.
+crates/clipboard      # Clipboard trait + per-OS backends + in-memory fake for tests
+crates/net            # iroh transport, pairing, broadcast
+crates/config         # TOML config, identity (secret key) and per-OS paths
+crates/daemon         # `clipbroad` binary (CLI + orchestration)
+docs/ARCHITECTURE.md  # decisions and plan
 ```
 
 Layer rules: `core` depends on nothing from the OS or the network. Everything that touches the OS lives in
@@ -65,7 +65,7 @@ Linux, macOS and Windows.
 - Before adding a crate: check the current version (`cargo info <crate>`), that it is maintained and
   that its license passes `cargo deny check`. Justify the dependency in the PR.
 - Shared versions go in `[workspace.dependencies]`; crates inherit them with `.workspace = true`.
-- Prefer the crates already chosen in `docs/DESIGN.md` (iroh, wl-clipboard-rs, arboard, ...).
+- Prefer the crates already chosen in `docs/ARCHITECTURE.md` (iroh, wl-clipboard-rs, arboard, ...).
 
 ## Rust guide
 
@@ -79,8 +79,8 @@ Reference for deeper reviews: [Microsoft Pragmatic Rust Guidelines](https://micr
 
 ## Workflow
 
-- One branch and one PR per unit of work, ideally a phase or sub-phase of `docs/DESIGN.md`.
+- One branch and one PR per unit of work, ideally a phase or sub-phase of `docs/ARCHITECTURE.md`.
 - Commits with [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, ...).
 - A PR is merged only with green CI on all three OSes.
-- If a design decision changes, update `docs/DESIGN.md` in the same PR.
+- If a design decision changes, update `docs/ARCHITECTURE.md` in the same PR.
 - Do not push to `main` directly.

@@ -1,4 +1,4 @@
-# clipbroad: design
+# clipbroad: architecture
 
 Share the clipboard across the owner's machines (Linux/Hyprland, macOS, Windows).
 Inspired by [ClipCascade](https://github.com/Sathvik-Rao/ClipCascade), but in Rust and without a server.

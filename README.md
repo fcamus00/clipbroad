@@ -3,7 +3,7 @@
 Share the clipboard between your own machines (Linux/Wayland, macOS, Windows). Peer-to-peer over your
 LAN or Tailscale; no server, no third-party services.
 
-> Status: early development. See [docs/DESIGN.md](docs/DESIGN.md) for the design and roadmap.
+> Status: early development. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and roadmap.
 
 ## Download a release
 
