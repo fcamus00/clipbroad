@@ -1,79 +1,79 @@
-# Ejemplo de configuración de clipbroad (config.toml).
+# Example clipbroad configuration (config.toml).
 #
-# Todos los campos son opcionales: si falta uno, se usa el valor por defecto que se muestra aquí.
-# Si el archivo no existe, clipbroad arranca con todos los valores por defecto.
+# Every field is optional: if one is missing, clipbroad uses the default value shown here.
+# If the file does not exist, clipbroad starts with all the default values.
 #
-# Ubicación del archivo:
-#   Linux:   ~/.config/clipbroad/config.toml  (o $XDG_CONFIG_HOME/clipbroad/config.toml)
+# File location:
+#   Linux:   ~/.config/clipbroad/config.toml  (or $XDG_CONFIG_HOME/clipbroad/config.toml)
 #   macOS:   ~/Library/Application Support/clipbroad/config.toml
 #   Windows: %LOCALAPPDATA%\clipbroad\config.toml
 #
-# La identidad del nodo (clave secreta) NO va en este archivo: se guarda aparte en `secret.key`
-# y se genera sola la primera vez que arranca el daemon.
-#   Linux:   ~/.local/share/clipbroad/secret.key  (o $XDG_DATA_HOME/...; permisos 0600)
-#   macOS:   ~/Library/Application Support/clipbroad/secret.key  (permisos 0600)
-#   Windows: %LOCALAPPDATA%\clipbroad\secret.key  (permisos heredados de la carpeta del usuario)
-# En Unix, si alguien cambia los permisos de `secret.key` para que otros usuarios puedan leerlo,
-# clipbroad se niega a arrancar hasta que se corrija con `chmod 600`.
+# The node identity (secret key) does NOT go in this file: it is stored separately in `secret.key`
+# and the daemon generates it the first time it starts.
+#   Linux:   ~/.local/share/clipbroad/secret.key  (or $XDG_DATA_HOME/...; permissions 0600)
+#   macOS:   ~/Library/Application Support/clipbroad/secret.key  (permissions 0600)
+#   Windows: %LOCALAPPDATA%\clipbroad\secret.key  (permissions inherited from the user folder)
+# On Unix, if someone changes the permissions of `secret.key` so other users can read it,
+# clipbroad refuses to start until it is fixed with `chmod 600`.
 #
-# Mientras corre, `clipbroad run` escribe su estado en `status.toml`, en la misma carpeta que
-# `secret.key`, y lo borra al detenerse. Lo lee `clipbroad status`.
+# While it runs, `clipbroad run` writes its status to `status.toml`, in the same folder as
+# `secret.key`, and deletes it when it stops. `clipbroad status` reads it.
 #
-# Los archivos que llegan de otros peers se guardan en una caché, en `files/<hash>/<nombre>`:
-#   Linux:   ~/.cache/clipbroad/files  (o $XDG_CACHE_HOME/clipbroad/files)
+# Files that arrive from other peers are stored in a cache, in `files/<hash>/<name>`:
+#   Linux:   ~/.cache/clipbroad/files  (or $XDG_CACHE_HOME/clipbroad/files)
 #   macOS:   ~/Library/Caches/clipbroad/files
 #   Windows: %LOCALAPPDATA%\clipbroad\files
-# Con `--config <archivo>`, la caché es la carpeta `files` junto a ese archivo, así dos instancias
-# en la misma máquina no la comparten.
+# With `--config <file>`, the cache is the `files` folder next to that file, so two instances
+# on the same machine do not share it.
 #
-# Un nombre de campo mal escrito es un error (no se ignora en silencio).
+# A misspelled field name is an error (it is not silently ignored).
 
-# Puerto UDP en el que escucha este nodo. Es fijo para que otros peers puedan llegar a él por una
-# dirección estática (por ejemplo, por Tailscale). Si se cambia, actualizar las direcciones que los
-# otros peers tienen de esta máquina. Debe ser mayor que 0.
+# UDP port this node listens on. It is fixed so other peers can reach it at a
+# static address (for example, over Tailscale). If you change it, update the addresses the
+# other peers have for this machine. Must be greater than 0.
 listen_port = 42420
 
-# Tamaño máximo (en bytes) de un clip que viaja dentro del propio mensaje. Por defecto 8 MiB, que
-# alcanza para texto y capturas de pantalla típicas. Debe ser mayor que 0 y como mucho 16711680
-# (16 MiB menos 64 KiB), porque un clip tiene que caber en un mensaje del protocolo. Un texto copiado
-# más grande que este valor no se sincroniza (queda un warning en el log).
+# Maximum size (in bytes) of a clip that travels inside the message itself. Default 8 MiB, which
+# is enough for text and typical screenshots. Must be greater than 0 and at most 16711680
+# (16 MiB minus 64 KiB), because a clip has to fit in a protocol message. Copied text
+# larger than this value is not synced (a warning goes to the log).
 inline_max_bytes = 8388608
 
-# Descubrimiento en la LAN con mDNS. Con `true`, este nodo anuncia su id y sus direcciones en la red
-# local y encuentra a los peers emparejados aunque cambien de IP; no hacen falta `addrs` para ellos.
-# Cualquiera en la misma LAN puede ver ese anuncio (el id es público y no da acceso: solo se aceptan
-# los peers de esta lista). No usa ningún servicio de terceros. Con `false` no se envía tráfico
-# multicast y solo se conecta a los peers por sus `addrs`.
+# LAN discovery with mDNS. With `true`, this node announces its id and addresses on the local
+# network and finds paired peers even if their IP changes; they do not need `addrs`.
+# Anyone on the same LAN can see that announcement (the id is public and grants no access: only
+# the peers in this list are accepted). It uses no third-party service. With `false` no multicast
+# traffic is sent and the node only connects to peers by their `addrs`.
 mdns = true
 
-# Tamaño máximo (en bytes) de un archivo copiado. Un archivo más grande no se sincroniza (queda un
-# warning en el log). Por defecto 512 MiB. Debe ser mayor que 0 y no mayor que
+# Maximum size (in bytes) of a copied file. A larger file is not synced (a
+# warning goes to the log). Default 512 MiB. Must be greater than 0 and not greater than
 # `file_cache_max_bytes`.
 file_max_bytes = 536870912
 
-# Tamaño máximo (en bytes) de la caché de archivos recibidos. Cuando se pasa, se borran primero
-# los archivos más viejos, salvo los del último clip recibido. También es el límite de todos los
-# archivos de una misma copia juntos. Por defecto 2 GiB. Debe ser mayor que 0.
+# Maximum size (in bytes) of the cache of received files. When it is exceeded, the oldest
+# files are deleted first, except those of the last received clip. It is also the limit for all the
+# files of a single copy together. Default 2 GiB. Must be greater than 0.
 file_cache_max_bytes = 2147483648
 
-# Días que un archivo recibido se queda en la caché. Los más viejos se borran en la próxima
-# limpieza, salvo los del último clip recibido. Por defecto 7. Debe ser mayor que 0.
+# Days a received file stays in the cache. Older ones are deleted in the next
+# cleanup, except those of the last received clip. Default 7. Must be greater than 0.
 file_cache_max_days = 7
 
-# Máquinas emparejadas. Normalmente las escribe `clipbroad pair`; se pueden editar a mano.
-# Cada una lleva:
-#   id     identidad pública del peer (64 caracteres hexadecimales en minúsculas). Obligatorio y
-#          sin repetir.
-#   name   etiqueta para logs y `clipbroad status`. Opcional.
-#   addrs  direcciones "ip:puerto" para conectar directo cuando el descubrimiento en la LAN no llega,
-#          por ejemplo la IP de Tailscale (100.x.y.z) o su IPv6 (entre corchetes). Opcional. Un peer
-#          sin `addrs` solo se encuentra por mDNS (o cuando él se conecta a este nodo).
+# Paired machines. `clipbroad pair` usually writes them; you can edit them by hand.
+# Each one has:
+#   id     public identity of the peer (64 lowercase hexadecimal characters). Required and
+#          unique.
+#   name   label for logs and `clipbroad status`. Optional.
+#   addrs  "ip:port" addresses to connect directly when LAN discovery does not reach,
+#          for example the Tailscale IP (100.x.y.z) or its IPv6 (in brackets). Optional. A peer
+#          without `addrs` is only found through mDNS (or when it connects to this node).
 
 [[peers]]
 name = "laptop"
 id = "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6"
 addrs = ["100.101.102.103:42420", "[fd7a:115c:a1e0::1]:42420"]
 
-# Peer que solo se encuentra por la LAN (sin direcciones estáticas).
+# Peer that is only found over the LAN (no static addresses).
 [[peers]]
 id = "3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29"
