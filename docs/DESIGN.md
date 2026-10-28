@@ -1,686 +1,686 @@
-# clipbroad: diseño
+# clipbroad: design
 
-Compartir el portapapeles entre las máquinas propias (Linux/Hyprland, macOS, Windows).
-Inspirado en [ClipCascade](https://github.com/Sathvik-Rao/ClipCascade), pero en Rust y sin servidor.
+Share the clipboard across the owner's machines (Linux/Hyprland, macOS, Windows).
+Inspired by [ClipCascade](https://github.com/Sathvik-Rao/ClipCascade), but in Rust and without a server.
 
-Este documento registra las **decisiones** y su porqué. Si una decisión cambia, se actualiza aquí en el
-mismo PR que la cambia.
+This document records the **decisions** and their reasons. If a decision changes, it is updated here in the
+same PR that changes it.
 
-## Alcance
+## Scope
 
-- **Plataformas:** Linux (Wayland, Hyprland como objetivo principal), macOS y Windows.
-- **Red:** misma LAN; opcionalmente a través de Tailscale. No se contempla internet abierto sin Tailscale.
-- **Contenido:** MVP solo texto. Después, imágenes y luego archivos.
-- **Fuera de alcance (indefinidamente):** móvil (Android/iOS), sincronización con terceros, cuentas de usuario.
+- **Platforms:** Linux (Wayland, Hyprland as the main target), macOS and Windows.
+- **Network:** same LAN; optionally over Tailscale. The open internet without Tailscale is not considered.
+- **Content:** MVP text only. Then images, and then files.
+- **Out of scope (indefinitely):** mobile (Android/iOS), sync with third parties, user accounts.
 
-## Arquitectura
+## Architecture
 
-**P2P en malla completa, sin servidor.** El mismo binario `clipbroad` corre como daemon en cada máquina y
-se conecta directo con cada peer emparejado.
+**Full-mesh P2P, without a server.** The same `clipbroad` binary runs as a daemon on each machine and
+connects directly to each paired peer.
 
-Por qué no un servidor central (como ClipCascade):
-- Un salto en vez de dos (más rápido, en especial para imágenes y archivos).
-- Sin punto único de falla: si una máquina está apagada, las demás siguen sincronizando.
-- Un solo artefacto que construir y desplegar.
+Why not a central server (like ClipCascade):
+- One hop instead of two (faster, especially for images and files).
+- No single point of failure: if a machine is off, the others keep syncing.
+- A single artifact to build and deploy.
 
-### Transporte: iroh
+### Transport: iroh
 
-[`iroh`](https://github.com/n0-computer/iroh) 1.x (QUIC). Lo que aporta:
-- Identidad por clave pública Ed25519 (`EndpointId`); la `SecretKey` se persiste en disco para que la
-  identidad sea estable.
-- Cifrado y autenticación de peers (TLS sobre QUIC); no escribimos criptografía propia.
-- Conexiones directas por LAN o por Tailscale.
+[`iroh`](https://github.com/n0-computer/iroh) 1.x (QUIC). What it provides:
+- Identity by Ed25519 public key (`EndpointId`); the `SecretKey` is persisted on disk so the
+  identity is stable.
+- Peer encryption and authentication (TLS over QUIC); we do not write our own cryptography.
+- Direct connections over the LAN or over Tailscale.
 
-Configuración decidida:
-- **Preset `presets::Minimal`**: sin relays de n0 ni descubrimiento DNS/pkarr. Ningún tráfico sale a
-  servicios de terceros.
-- **Descubrimiento en LAN** con mDNS (ver "Descubrimiento en la LAN (mDNS)" más abajo).
-- **Tailscale**: mDNS no cruza la tailnet, así que cada peer puede tener además direcciones estáticas en la
-  configuración (`EndpointAddr::new(id).with_ip_addr(...)`), por ejemplo `100.x.y.z:puerto` o el
-  hostname de MagicDNS resuelto. Puerto de escucha fijo y configurable.
-- **Allowlist**: solo se aceptan conexiones de `EndpointId` emparejados, usando `EndpointHooks`
-  (ver el ejemplo `auth-hook` de iroh). Todo lo demás se rechaza.
-- **Features de iroh**: `tls-ring` y `fast-apple-datapath`, sin las de por defecto. Sin `portmapper`
-  (UPnP no hace falta en LAN/Tailscale y trae una dependencia MPL-2.0) ni `metrics`. `cargo deny` solo
-  revisa los targets que se publican (así no cuentan los crates solo-wasm de iroh) y permite
-  CDLA-Permissive-2.0 únicamente para `webpki-roots`. El aviso RUSTSEC-2024-0436 (`paste` sin
-  mantenimiento, no es una vulnerabilidad) se ignora porque iroh lo necesita vía `netwatch`.
+Chosen configuration:
+- **`presets::Minimal` preset**: no n0 relays and no DNS/pkarr discovery. No traffic goes out to
+  third-party services.
+- **LAN discovery** with mDNS (see "LAN discovery (mDNS)" below).
+- **Tailscale**: mDNS does not cross the tailnet, so each peer can also have static addresses in the
+  configuration (`EndpointAddr::new(id).with_ip_addr(...)`), for example `100.x.y.z:port` or the
+  resolved MagicDNS hostname. Fixed, configurable listen port.
+- **Allowlist**: only connections from paired `EndpointId`s are accepted, using `EndpointHooks`
+  (see iroh's `auth-hook` example). Everything else is rejected.
+- **iroh features**: `tls-ring` and `fast-apple-datapath`, without the default ones. No `portmapper`
+  (UPnP is not needed on LAN/Tailscale and brings an MPL-2.0 dependency) and no `metrics`. `cargo deny` only
+  checks the targets we publish (so iroh's wasm-only crates do not count) and allows
+  CDLA-Permissive-2.0 only for `webpki-roots`. Advisory RUSTSEC-2024-0436 (`paste` is
+  unmaintained, not a vulnerability) is ignored because iroh needs it through `netwatch`.
 
-### Descubrimiento en la LAN (mDNS)
+### LAN discovery (mDNS)
 
-Cada nodo anuncia por mDNS su `EndpointId` y sus direcciones, y escucha los anuncios de los demás.
-Así un peer emparejado se encuentra aunque su IP en la LAN haya cambiado (DHCP), sin tocar `addrs`.
-Las direcciones estáticas siguen sirviendo para lo que mDNS no alcanza, como Tailscale.
+Each node announces its `EndpointId` and its addresses over mDNS, and listens to the others' announcements.
+That way a paired peer is found even if its LAN IP has changed (DHCP), without touching `addrs`.
+Static addresses are still useful for what mDNS does not reach, such as Tailscale.
 
-- **Crate: `iroh-mdns-address-lookup`** (de n0, los autores de iroh). Se descartó
-  `iroh-mdns-peer-lookup`: su licencia dice "TBD" (no pasa `cargo deny`) y pide iroh con las features
-  por defecto, que traen relays y `portmapper`. El elegido usa la misma versión de iroh que el resto
-  (no hay dos iroh en el `Cargo.lock`), es MIT o Apache-2.0 y no agrega avisos ni licencias nuevas.
-- **Integración:** se registra como *address lookup* del endpoint (el preset `Minimal` no trae
-  ninguno). Al marcar a un peer, iroh le pide a mDNS las direcciones actuales del peer y las
-  prueba con las estáticas. Por eso, con mDNS activo, el nodo marca también a los peers sin `addrs`.
-- **Nombre de servicio propio:** `clipbroad` (registros `<id>._clipbroad._udp.local`) en vez del
-  `irohv1` por defecto, para no mezclarse con otras apps de iroh en la misma red. Todos los nodos
-  deben usar el mismo.
-- **Solo encuentra direcciones, nunca da acceso.** La allowlist no cambia: un nodo que se anuncia en
-  la LAN y no está en la config se rechaza igual después del TLS.
-- **Privacidad:** el anuncio es multicast en la red local, así que cualquiera en la misma LAN ve el id
-  público de este nodo, sus direcciones y que corre clipbroad. El id no es secreto (no sirve para
-  conectarse sin estar emparejado), pero permite reconocer a la máquina en esa red. No se usa ningún
-  servicio de terceros: el tráfico no sale de la LAN.
-- **Config:** `mdns = true` por defecto. Con `mdns = false` no se abre ningún socket multicast ni se
-  envía nada, y solo se marca a los peers con `addrs`.
-- **Si no puede arrancar** (por ejemplo, ninguna interfaz permite multicast), el daemon deja un
-  warning y sigue solo con las direcciones estáticas; no vuelve a intentarlo hasta reiniciarse.
-- **Tests:** el test de dos nodos que se encuentran sin direcciones necesita multicast entre sockets
-  locales, que los runners de CI pueden no permitir, así que está marcado `#[ignore]` y se corre a mano
+- **Crate: `iroh-mdns-address-lookup`** (from n0, the authors of iroh). We discarded
+  `iroh-mdns-peer-lookup`: its license says "TBD" (it does not pass `cargo deny`) and it requires iroh with the default
+  features, which bring relays and `portmapper`. The chosen one uses the same iroh version as the rest
+  (there are not two iroh in `Cargo.lock`), is MIT or Apache-2.0 and adds no new advisories or licenses.
+- **Integration:** it is registered as the endpoint's *address lookup* (the `Minimal` preset has
+  none). When dialing a peer, iroh asks mDNS for the peer's current addresses and
+  tries them along with the static ones. Because of that, with mDNS on, the node also dials peers without `addrs`.
+- **Custom service name:** `clipbroad` (records `<id>._clipbroad._udp.local`) instead of the
+  default `irohv1`, so it does not mix with other iroh apps on the same network. All nodes
+  must use the same one.
+- **It only finds addresses, it never grants access.** The allowlist does not change: a node that announces itself on
+  the LAN and is not in the config is still rejected after TLS.
+- **Privacy:** the announcement is multicast on the local network, so anyone on the same LAN sees this node's public
+  id, its addresses and that it runs clipbroad. The id is not secret (it cannot be used to
+  connect without being paired), but it lets someone recognize the machine on that network. No
+  third-party service is used: the traffic does not leave the LAN.
+- **Config:** `mdns = true` by default. With `mdns = false` no multicast socket is opened and nothing is
+  sent, and only peers with `addrs` are dialed.
+- **If it cannot start** (for example, no interface allows multicast), the daemon logs a
+  warning and continues with the static addresses only; it does not try again until it restarts.
+- **Tests:** the test of two nodes that find each other without addresses needs multicast between local
+  sockets, which CI runners may not allow, so it is marked `#[ignore]` and is run by hand
   (`cargo nextest run -p clipbroad-net --run-ignored only`).
 
-### Conexiones (crate `net`)
+### Connections (`net` crate)
 
-- **Una conexión por peer**, de larga vida. Cada nodo marca a todos los peers que puede encontrar
-  (con mDNS activo, todos; si no, los que tienen direcciones en la config) y acepta las conexiones que
-  le llegan de ellos. Sin mDNS, un peer sin direcciones solo puede conectarse marcando él.
-- **Streams:** cada lado abre un stream unidireccional y escribe frames: primero `Hello`, luego un
-  frame por clip. Lee el stream del otro lado igual. Cada stream bidireccional es la transferencia de
-  un archivo (ver "Transporte de archivos").
-- **Conexiones duplicadas:** si los dos marcan a la vez quedan dos conexiones. Decide solo el nodo con
-  el id menor: se queda con la que terminó el intercambio de `Hello` más recientemente y cierra la
-  otra. El nodo con el id mayor no cierra nada. Así ambos convergen sin acordar nada, y "la más
-  nueva gana" también cubre a un peer que se reinició mientras su conexión vieja parecía viva.
-- **Reconexión:** con backoff exponencial entre 0,5 s y 30 s por peer. Vuelve al mínimo después de una
-  sesión que llegó a intercambiar `Hello`; un handshake que falla (por ejemplo, versión distinta)
-  sigue subiendo el retraso. El `Hello` tiene un límite de 10 s.
-- **Sin reenvío:** la malla es completa, así que un clip debe venir de la máquina que lo copió. Si
-  `Clip.origin` no es el peer que lo manda, se descarta.
-- **API:** `Node::spawn(identidad, config)` devuelve el nodo y un canal de clips recibidos (con el id
-  del peer). `Node::broadcast(clip)` lo manda a los peers conectados; los que no lo están se lo
-  pierden. `Node::broadcast_files(clip, oferta)` hace lo mismo con un clip de archivos y desde ese
-  momento sirve esos archivos; `Node::fetch_files(peer, lista, caché)` los descarga. `Node::links()` es un canal `watch` con el estado de cada peer (conectado o no, y la
-  dirección del camino que usa la conexión más nueva al conectarse), para `clipbroad status`.
+- **One connection per peer**, long-lived. Each node dials all the peers it can find
+  (with mDNS on, all of them; otherwise, the ones that have addresses in the config) and accepts the connections that
+  arrive from them. Without mDNS, a peer without addresses can only connect if it is the one that dials.
+- **Streams:** each side opens a unidirectional stream and writes frames: first `Hello`, then one
+  frame per clip. It reads the other side's stream the same way. Each bidirectional stream is the transfer of
+  one file (see "File transport").
+- **Duplicate connections:** if both dial at the same time, there are two connections. Only the node with the
+  lower id decides: it keeps the one that finished the `Hello` exchange most recently and closes the
+  other. The node with the higher id closes nothing. That way both converge without agreeing on anything, and "the newest
+  wins" also covers a peer that restarted while its old connection seemed alive.
+- **Reconnection:** with exponential backoff between 0.5 s and 30 s per peer. It goes back to the minimum after a
+  session that got to exchange `Hello`; a handshake that fails (for example, a different version)
+  keeps increasing the delay. `Hello` has a 10 s limit.
+- **No forwarding:** the mesh is full, so a clip must come from the machine that copied it. If
+  `Clip.origin` is not the peer that sends it, it is discarded.
+- **API:** `Node::spawn(identity, config)` returns the node and a channel of received clips (with the id
+  of the peer). `Node::broadcast(clip)` sends it to the connected peers; those that are not connected
+  miss it. `Node::broadcast_files(clip, offer)` does the same with a files clip and from that
+  moment serves those files; `Node::fetch_files(peer, list, cache)` downloads them. `Node::links()` is a `watch` channel with the status of each peer (connected or not, and the
+  address of the path that the newest connection uses when connecting), for `clipbroad status`.
 
-### Emparejamiento
+### Pairing
 
-El usuario corre `clipbroad pair` en una máquina (A), que muestra un ticket y espera, y
-`clipbroad pair <ticket>` en la otra (B). Ambas agregan a la otra en su configuración y terminan.
-Código en `crates/net/src/pair.rs` y `crates/daemon/src/pair.rs`.
+The user runs `clipbroad pair` on one machine (A), which shows a ticket and waits, and
+`clipbroad pair <ticket>` on the other (B). Each adds the other to its configuration and exits.
+Code in `crates/net/src/pair.rs` and `crates/daemon/src/pair.rs`.
 
-- **Ticket:** una línea en base32 con un byte de versión, el `EndpointId` de A, sus direcciones (en
-  su puerto de escucha) y un secreto aleatorio de 16 bytes.
-- **Flujo:** B marca a A con un ALPN aparte (`clipbroad-pair/1`), fuera de la allowlist, y le manda el
-  secreto, su hostname y sus direcciones. A compara el secreto en tiempo constante; si coincide, guarda
-  a B y recién entonces le responde con su hostname, y B guarda a A. Así B solo guarda a A si A ya
-  guardó a B.
-- **Puerto:** el emparejamiento escucha en el `listen_port` normal en ambas máquinas, así las
-  direcciones que se intercambian (y la dirección desde la que B se conecta, que A también guarda) son
-  las que usará `clipbroad run`. Por eso hay que detener `clipbroad run` mientras se empareja; si está
-  corriendo, `pair` falla con un mensaje que lo dice. No cuesta nada: el daemon lee la config solo al
-  arrancar, así que igual hay que reiniciarlo para que vea al peer nuevo.
-- **Config:** se agrega un bloque `[[peers]]` como texto al final del archivo (se conservan los
-  comentarios), con `id`, `name` y `addrs`. Se crea el archivo si no existe, se valida el resultado
-  antes de escribir, y un peer que ya estaba no se duplica ni se modifica.
-- **Amenazas:** el TLS de iroh ya autentica los dos `EndpointId`; el secreto solo prueba que B vio el
-  ticket en la pantalla de A. A acepta un único pedido válido y deja de escuchar, o deja de escuchar a
-  los 5 minutos: un ticket filtrado después de usado o vencido no sirve, porque ya nadie responde. Un
-  secreto incorrecto solo cierra esa conexión y la sesión sigue esperando (adivinar 128 bits en 5
-  minutos no es factible), así un intento ajeno no le arruina el emparejamiento al usuario. Si alguien
-  usa un ticket filtrado *antes* que B, queda emparejado con A; el usuario lo nota porque su
-  `clipbroad pair <ticket>` falla, y debe quitar ese peer de la config.
-- **Límite:** las direcciones guardadas son las del momento. Si cambia la IP de una máquina en la LAN,
-  mDNS encuentra la nueva; las guardadas solo quedan desactualizadas. Con `mdns = false` hay que editar
-  `addrs` a mano (o emparejar de nuevo después de borrar el peer).
+- **Ticket:** one base32 line with a version byte, A's `EndpointId`, its addresses (on
+  its listen port) and a random 16-byte secret.
+- **Flow:** B dials A with a separate ALPN (`clipbroad-pair/1`), outside the allowlist, and sends it the
+  secret, its hostname and its addresses. A compares the secret in constant time; if it matches, it saves
+  B and only then replies with its hostname, and B saves A. That way B only saves A if A already
+  saved B.
+- **Port:** pairing listens on the normal `listen_port` on both machines, so the
+  addresses exchanged (and the address B connects from, which A also saves) are
+  the ones `clipbroad run` will use. Because of that, `clipbroad run` must be stopped while pairing; if it is
+  running, `pair` fails with a message that says so. It costs nothing: the daemon reads the config only at
+  startup, so it has to be restarted anyway to see the new peer.
+- **Config:** a `[[peers]]` block is appended as text at the end of the file (comments are
+  kept), with `id`, `name` and `addrs`. The file is created if it does not exist, the result is validated
+  before writing, and a peer that was already there is neither duplicated nor modified.
+- **Threats:** iroh's TLS already authenticates both `EndpointId`s; the secret only proves that B saw the
+  ticket on A's screen. A accepts a single valid request and stops listening, or stops listening after
+  5 minutes: a ticket leaked after it was used or expired is useless, because nobody answers anymore. A
+  wrong secret only closes that connection and the session keeps waiting (guessing 128 bits in 5
+  minutes is not feasible), so a foreign attempt does not ruin the user's pairing. If someone
+  uses a leaked ticket *before* B, they get paired with A; the user notices because their
+  `clipbroad pair <ticket>` fails, and must remove that peer from the config.
+- **Limit:** the saved addresses are the ones from that moment. If a machine's LAN IP changes,
+  mDNS finds the new one; the saved ones just become outdated. With `mdns = false` you have to edit
+  `addrs` by hand (or pair again after deleting the peer).
 
-### Protocolo
+### Protocol
 
-- Un ALPN propio (`clipbroad/1`). Mensajes serializados con `serde` + `postcard`, enmarcados con
-  prefijo de longitud.
-- Mensaje principal `Clip`: id, origen (`EndpointId`), timestamp, tipo de contenido, MIME, tamaño,
-  hash BLAKE3 y payload.
-- El payload va **inline** si es pequeño (umbral configurable; texto e imágenes típicas). Para archivos
-  grandes se anuncia el metadato y el contenido se transfiere aparte (ver "Archivos").
-- `PROTOCOL_VERSION` se intercambia al conectar; versiones incompatibles se rechazan con un error claro.
-- El protocolo se diseña desde el MVP con los campos de tipo/MIME/tamaño/hash, para que agregar imágenes y
-  archivos no lo rompa.
+- A custom ALPN (`clipbroad/1`). Messages serialized with `serde` + `postcard`, framed with a
+  length prefix.
+- Main message `Clip`: id, origin (`EndpointId`), timestamp, content type, MIME, size,
+  BLAKE3 hash and payload.
+- The payload goes **inline** if it is small (configurable threshold; text and typical images). For large
+  files the metadata is announced and the content is transferred separately (see "Files").
+- `PROTOCOL_VERSION` is exchanged on connect; incompatible versions are rejected with a clear error.
+- The protocol is designed from the MVP with the type/MIME/size/hash fields, so adding images and
+  files does not break it.
 
-Detalles (código en `crates/core/src/protocol.rs`):
-- **Frame:** 4 bytes con la longitud (u32 big-endian) y luego el mensaje en `postcard`. `core` solo
-  codifica y decodifica bytes (`encode`, `decode`); `net` hace la lectura y escritura en los streams QUIC.
-  `decode` distingue "faltan bytes" de un error.
-- **Tamaño máximo de frame: 16 MiB**, constante del protocolo (no configurable, porque ambos lados deben
-  coincidir). El receptor lo revisa apenas llegan los 4 bytes de longitud, antes de reservar memoria; el
-  emisor no codifica un frame más grande. Por eso la config rechaza un `inline_max_bytes` mayor que
-  16 MiB menos 64 KiB (margen para los metadatos del clip), y el daemon no sincroniza un texto copiado
-  más grande que `inline_max_bytes`: lo salta con un warning.
-- **Mensajes:** `Hello { protocol_version }`, `Clip`, `FileRequest` y `FileResponse`. Cada lado manda
-  `Hello` primero; `decode` devuelve un error tipado si la versión no coincide, y la conexión se
-  cierra. Los dos últimos solo viajan en los streams bidireccionales de archivos; en el stream de
-  clips son un error de protocolo.
-- **`Hello` es estable entre versiones:** siempre es la variante 0 y `protocol_version` siempre es su
-  primer campo; solo se le pueden agregar campos al final. `decode` ignora los bytes sobrantes dentro de un
-  frame, así un nodo viejo puede leer la versión de un `Hello` nuevo y rechazarlo con un error claro.
-- **`Clip`:** `id` (número que elige el origen), `origin` (los 32 bytes del `EndpointId`, opacos para
-  `core`), `timestamp_ms` (milisegundos Unix según el reloj del origen, adelantado si hace falta para quedar
-  después de lo último que vio; ver "Semántica de sincronización"), `kind`, `mime`, `size`, `hash` y
-  `payload`. El payload es inline (texto e imágenes) o una lista de archivos (ver "Transporte de
-  archivos").
-- **Verificación al recibir:** el contenido solo se obtiene con `Clip::into_content`, que comprueba que el
-  tamaño y el hash BLAKE3 declarados coinciden con el payload, que el texto sea UTF-8 válido, que una
-  imagen empiece como PNG, que una lista de archivos sea válida y que el payload corresponda al tipo.
-- El `Debug` de un `Clip` muestra el largo del payload, nunca su contenido, para no filtrarlo en los logs.
+Details (code in `crates/core/src/protocol.rs`):
+- **Frame:** 4 bytes with the length (big-endian u32) and then the message in `postcard`. `core` only
+  encodes and decodes bytes (`encode`, `decode`); `net` does the reading and writing on the QUIC streams.
+  `decode` distinguishes "missing bytes" from an error.
+- **Maximum frame size: 16 MiB**, a protocol constant (not configurable, because both sides must
+  agree). The receiver checks it as soon as the 4 length bytes arrive, before allocating memory; the
+  sender does not encode a larger frame. Because of that, the config rejects an `inline_max_bytes` greater than
+  16 MiB minus 64 KiB (margin for the clip metadata), and the daemon does not sync copied text
+  larger than `inline_max_bytes`: it skips it with a warning.
+- **Messages:** `Hello { protocol_version }`, `Clip`, `FileRequest` and `FileResponse`. Each side sends
+  `Hello` first; `decode` returns a typed error if the version does not match, and the connection is
+  closed. The last two only travel on the bidirectional file streams; on the
+  clip stream they are a protocol error.
+- **`Hello` is stable across versions:** it is always variant 0 and `protocol_version` is always its
+  first field; fields can only be added at the end. `decode` ignores leftover bytes inside a
+  frame, so an old node can read the version of a new `Hello` and reject it with a clear error.
+- **`Clip`:** `id` (a number the origin chooses), `origin` (the 32 bytes of the `EndpointId`, opaque to
+  `core`), `timestamp_ms` (Unix milliseconds by the origin's clock, moved forward if needed to land
+  after the latest one it saw; see "Sync semantics"), `kind`, `mime`, `size`, `hash` and
+  `payload`. The payload is inline (text and images) or a list of files (see "File
+  transport").
+- **Verification on receipt:** the content can only be obtained with `Clip::into_content`, which checks that the
+  declared size and BLAKE3 hash match the payload, that text is valid UTF-8, that an
+  image starts as PNG, that a file list is valid and that the payload matches the type.
+- The `Debug` of a `Clip` shows the payload length, never its content, so it does not leak into the logs.
 
-### Semántica de sincronización
+### Sync semantics
 
-La lógica vive en `crates/core/src/sync.rs` (`SyncEngine`), sin IO ni reloj: el daemon le pasa la hora.
-Ante un evento local, el daemon lee el texto y llama a `local_changed`; si responde `Send(clip)`, lo envía
-a todos los peers. Ante un clip remoto, llama a `remote_clip`; si responde `Apply(contenido)`, lo escribe
-en el portapapeles local.
+The logic lives in `crates/core/src/sync.rs` (`SyncEngine`), with no IO and no clock: the daemon passes it the time.
+On a local event, the daemon reads the text and calls `local_changed`; if it returns `Send(clip)`, the daemon sends it
+to all peers. On a remote clip, it calls `remote_clip`; if it returns `Apply(content)`, the daemon writes it
+to the local clipboard.
 
-- **Último en escribir gana.** Cada copia local nueva se envía a todos los peers; al recibir, se escribe
-  en el portapapeles local si es más nueva que lo último visto. Los clips se ordenan por
-  `(timestamp_ms, origen)`: el `NodeId` de origen desempata, así todas las máquinas eligen el mismo.
-- **Reloj:** los relojes de las máquinas difieren. Con el timestamp del reloj tal cual, una máquina
-  atrasada 10 s perdería contra una copia hecha 3 s antes en otra máquina, incluso en ella misma. Por eso
-  una copia local lleva `max(ahora, lo más nuevo visto + 1 ms)`: siempre le gana a todo lo que su máquina
-  ya vio, sin importar los relojes. Para una persona que copia en una máquina a la vez, siempre gana su
-  última copia.
-- **Anti-eco:** al escribir contenido remoto en el portapapeles local, el SO dispara un evento de cambio.
-  Se guarda el hash del último contenido enviado o aplicado y se ignora el evento local que coincide.
-  Sin esto, dos máquinas se reenvían el mismo contenido para siempre. Se necesita desde la primera
-  sincronización (fase 2).
-- **Mismo texto copiado dos veces seguidas:** no se reenvía, porque el hash coincide con lo último enviado.
-  Los peers ya lo tienen: si alguno hubiera copiado algo después, ese clip habría llegado y cambiado el
-  hash guardado. Por eso, si A copia X, B copia Y y A vuelve a copiar X, X se envía de nuevo y gana en
-  todas.
-- **Estado acotado:** solo el último hash y la última marca `(timestamp_ms, origen)`, sin historial ni
-  persistencia.
-- **Límites conocidos:**
-  - Dos copias en máquinas distintas, tan seguidas que ninguna vio la otra, son concurrentes: gana la de
-    marca mayor (la máquina con el reloj adelantado). Todas terminan con el mismo contenido.
-  - Un reloj adelantado arrastra las marcas de todos hacia adelante; el orden sigue funcionando, pero
-    `timestamp_ms` deja de ser la hora exacta.
-  - Un daemon recién arrancado no vio nada. Si el reloj de un peer va adelantado, su primera copia puede
-    perder contra el último clip de ese peer, como mucho durante la diferencia de relojes.
-  - No hay puesta al día al reconectar: un peer que se perdió un clip queda con el contenido anterior
-    hasta la próxima copia, y copiar de nuevo el mismo texto no lo reenvía.
-- **Contenido sensible: nunca se sincroniza** (ver la sección siguiente).
+- **Last writer wins.** Each new local copy is sent to all peers; on receipt, it is written
+  to the local clipboard if it is newer than the latest one seen. Clips are ordered by
+  `(timestamp_ms, origin)`: the origin `NodeId` breaks ties, so all machines pick the same one.
+- **Clock:** machine clocks differ. With the clock timestamp as is, a machine
+  10 s behind would lose against a copy made 3 s earlier on another machine, even on itself. Because of that
+  a local copy carries `max(now, newest seen + 1 ms)`: it always beats everything its machine
+  has already seen, regardless of the clocks. For a person who copies on one machine at a time, their
+  latest copy always wins.
+- **Anti-echo:** when remote content is written to the local clipboard, the OS fires a change event.
+  The hash of the last content sent or applied is stored, and the local event that matches it is ignored.
+  Without this, two machines resend the same content to each other forever. It is needed from the first
+  sync (phase 2).
+- **Same text copied twice in a row:** it is not resent, because the hash matches the last one sent.
+  The peers already have it: if any of them had copied something later, that clip would have arrived and changed the
+  stored hash. Because of that, if A copies X, B copies Y and A copies X again, X is sent again and wins on
+  all of them.
+- **Bounded state:** only the last hash and the last `(timestamp_ms, origin)` mark, with no history and no
+  persistence.
+- **Known limits:**
+  - Two copies on different machines, so close together that neither saw the other, are concurrent: the one with the
+    higher mark wins (the machine whose clock is ahead). They all end up with the same content.
+  - A clock that is ahead drags everyone's marks forward; ordering still works, but
+    `timestamp_ms` stops being the exact time.
+  - A freshly started daemon has seen nothing. If a peer's clock is ahead, its first copy can
+    lose against that peer's last clip, at most for the duration of the clock difference.
+  - There is no catch-up on reconnect: a peer that missed a clip keeps the previous content
+    until the next copy, and copying the same text again does not resend it.
+- **Sensitive content: never synced** (see the next section).
 
 ### Daemon (`clipbroad run`)
 
-Un solo bucle une las piezas (`crates/daemon/src/run.rs`), con el mismo flujo que describe el módulo
-`sync`: un cambio local con formatos se lee (fuera del hilo async), y si es contenido nuevo se
-envía a todos (ver "Archivos" e "Imágenes" para cuál gana si una copia trae varios); un clip recibido
-se escribe en el portapapeles si el motor responde `Apply` (los archivos, después de descargarlos;
-ver "Archivos en el portapapeles"). Un error al leer, escribir o procesar un clip se registra y
-el daemon sigue; solo una falla al arrancar o del watcher del portapapeles lo detiene. Se apaga con
-Ctrl+C o SIGTERM.
+A single loop joins the pieces (`crates/daemon/src/run.rs`), with the same flow the `sync`
+module describes: a local change with formats is read (off the async thread), and if it is new content it is
+sent to everyone (see "Files" and "Images" for which one wins if a copy carries several); a received clip
+is written to the clipboard if the engine returns `Apply` (files, after downloading them;
+see "Files on the clipboard"). An error while reading, writing or processing a clip is logged and
+the daemon continues; only a failure at startup or in the clipboard watcher stops it. It shuts down with
+Ctrl+C or SIGTERM.
 
-- Los logs muestran el id del nodo al arrancar, las conexiones y cada clip enviado o recibido con su
-  tamaño y los primeros 8 caracteres del hash, nunca el contenido. `run` registra en nivel info por
-  defecto.
-- `--config <archivo>` (en `run` y `pair`) usa otro archivo de config, y `secret.key` en la misma
-  carpeta como identidad. Sirve para correr dos instancias en una máquina (pruebas).
-- El contenido marcado como sensible no se envía: el daemon lo salta con un log en nivel debug que
-  muestra el marcador, nunca el contenido.
+- The logs show the node id at startup, the connections and each clip sent or received with its
+  size and the first 8 characters of the hash, never the content. `run` logs at info level by
+  default.
+- `--config <file>` (on `run` and `pair`) uses another config file, and `secret.key` in the same
+  folder as the identity. It is useful to run two instances on one machine (testing).
+- Content marked as sensitive is not sent: the daemon skips it with a debug-level log that
+  shows the marker, never the content.
 
-### Estado del daemon (`clipbroad status`)
+### Daemon status (`clipbroad status`)
 
-El daemon escribe su estado en un archivo TOML, `status.toml`, en la misma carpeta que `secret.key`
-(código en `crates/daemon/src/status.rs`). `clipbroad status` lo lee y lo muestra.
+The daemon writes its status to a TOML file, `status.toml`, in the same folder as `secret.key`
+(code in `crates/daemon/src/status.rs`). `clipbroad status` reads it and shows it.
 
-- **Archivo y no socket o named pipe:** el mismo código sirve en los tres SO, el daemon no tiene que
-  atender a nadie y un daemon caído se nota porque el archivo deja de actualizarse. Un socket daría
-  el estado al instante, pero pide un servidor dentro del daemon y código distinto en Windows.
-- **Cuándo se escribe:** después de cada evento (un peer conecta o se va, un clip enviado o
-  recibido) y cada 5 s. Se escribe a un archivo temporal y se renombra, así quien lee nunca ve un
-  archivo a medias. Al detenerse, el daemon lo borra. Recién se escribe con el nodo ya levantado:
-  un segundo daemon con la misma config falla antes (el puerto está ocupado) y no pisa el archivo.
-- **Vivo o no:** sin archivo, el daemon no corre. Si el archivo tiene más de 15 s, el daemon se
-  cortó sin borrarlo (`kill -9`, un crash, un corte de luz) y `status` lo muestra como detenido. No
-  se revisa el PID: haría falta código por SO y la antigüedad ya alcanza.
-- **Ubicación:** junto a la identidad, así dos instancias con su propio `--config` (y por lo tanto
-  su propia `secret.key`) nunca comparten el archivo. `status --config <archivo>` lee el de esa
-  instancia.
-- **Qué muestra:** si el daemon corre (y su PID), su `EndpointId`, el puerto, si mDNS está activo,
-  cada peer con su nombre, id corto y si está conectado (y por qué dirección), y el último clip
-  enviado y recibido con hora, tamaño y hash corto. Nunca el contenido. En macOS 15.4 o más nuevo,
-  también el `accessBehavior` del pasteboard tal como lo ve el daemon, con instrucciones si no está
-  en "Allow".
+- **A file and not a socket or named pipe:** the same code works on all three OSes, the daemon does not have to
+  serve anyone, and a dead daemon shows because the file stops being updated. A socket would give
+  the status instantly, but it needs a server inside the daemon and different code on Windows.
+- **When it is written:** after each event (a peer connects or leaves, a clip sent or
+  received) and every 5 s. It is written to a temporary file and renamed, so a reader never sees a
+  half-written file. When it stops, the daemon deletes it. It is only written once the node is up:
+  a second daemon with the same config fails earlier (the port is taken) and does not overwrite the file.
+- **Alive or not:** with no file, the daemon is not running. If the file is more than 15 s old, the daemon
+  died without deleting it (`kill -9`, a crash, a power outage) and `status` shows it as stopped. The
+  PID is not checked: that would need per-OS code and the age is enough.
+- **Location:** next to the identity, so two instances with their own `--config` (and therefore
+  their own `secret.key`) never share the file. `status --config <file>` reads the one for that
+  instance.
+- **What it shows:** whether the daemon is running (and its PID), its `EndpointId`, the port, whether mDNS is on,
+  each peer with its name, short id and whether it is connected (and through which address), and the last clip
+  sent and received with time, size and short hash. Never the content. On macOS 15.4 or newer,
+  also the pasteboard `accessBehavior` as the daemon sees it, with instructions if it is not
+  set to "Allow".
 
-## Portapapeles por plataforma
+## Clipboard per platform
 
-| Plataforma | Detectar cambios | Leer/escribir |
+| Platform | Detect changes | Read/write |
 |---|---|---|
-| Linux Wayland | `wl-clipboard-rs::watch` (`ext-data-control` o `wlr-data-control`; Hyprland soporta ambos) | `wl-clipboard-rs` |
-| Linux X11 | XFixes (vía `clipboard-master` o `x11-clipboard`) | `arboard` |
-| macOS | Polling de `NSPasteboard.changeCount` (no existe API de notificación) | `arboard` / `objc2` |
-| Windows | `AddClipboardFormatListener` + `WM_CLIPBOARDUPDATE` en una ventana message-only | `windows-sys` directo (`arboard` no expone la lista de formatos) |
+| Linux Wayland | `wl-clipboard-rs::watch` (`ext-data-control` or `wlr-data-control`; Hyprland supports both) | `wl-clipboard-rs` |
+| Linux X11 | XFixes (through `clipboard-master` or `x11-clipboard`) | `arboard` |
+| macOS | Polling of `NSPasteboard.changeCount` (there is no notification API) | `arboard` / `objc2` |
+| Windows | `AddClipboardFormatListener` + `WM_CLIPBOARDUPDATE` in a message-only window | `windows-sys` directly (`arboard` does not expose the format list) |
 
-Todo detrás de un trait `Clipboard` en el crate `clipboard`, con una implementación falsa en memoria
-para tests. X11 tiene prioridad baja (el objetivo es Hyprland).
+Everything sits behind a `Clipboard` trait in the `clipboard` crate, with an in-memory fake implementation
+for tests. X11 has low priority (the target is Hyprland).
 
-Contrato del trait (detalle completo en los doc comments de `crates/clipboard`):
-- `read_text` / `write_text` son síncronos y pueden bloquear un poco; el daemon los llama con
-  `spawn_blocking`. Portapapeles vacío o sin texto es `Ok(None)`, no un error.
-- `read_image` / `write_image` siguen las mismas reglas con imágenes PNG (ver "Imágenes"). Son
-  opcionales: por defecto `read_image` devuelve `Ok(None)` y `write_image` devuelve
-  `ClipboardError::Unsupported`, así un backend sin imágenes compila igual.
-- `read_files` / `write_files` siguen las mismas reglas con rutas locales de archivos (ver "Archivos
-  en el portapapeles"). También son opcionales, con los mismos valores por defecto: hoy solo Wayland
-  los implementa.
-- Ninguna lectura o escritura bloquea más de 2 segundos: si la app dueña del contenido no responde, el
-  backend devuelve error. El límite lo pone el backend porque el daemon no puede cancelar un hilo bloqueado.
-- `watch` devuelve un **canal** (no un callback): el backend empuja eventos desde su propio hilo del SO
-  (Wayland, Windows) o desde un hilo que hace polling (macOS), con un `send` no bloqueante. El canal es
-  sin límite porque los eventos son chicos y a velocidad humana.
-- Un evento no trae el contenido, solo los **formatos ofrecidos** con su nombre nativo (MIME en Linux,
-  UTI en macOS, nombre de formato en Windows).
-- `read_text`, `read_image` y `read_files` nunca leen contenido sensible: revisan los marcadores sobre el mismo
-  contenido que leen y devuelven `ClipboardError::Sensitive` sin leer los datos (ver "Contenido
-  sensible").
-- Se reportan **todos** los cambios, incluidos los que causa el propio daemon al escribir; el anti-eco
-  se hace en el daemon por hash, igual en todas las plataformas.
-- `ContentHash` es BLAKE3 de los bytes del contenido (texto: UTF-8 tal cual, sin normalizar; imagen:
-  los bytes PNG).
+Trait contract (full detail in the doc comments of `crates/clipboard`):
+- `read_text` / `write_text` are synchronous and can block a little; the daemon calls them with
+  `spawn_blocking`. An empty clipboard or one without text is `Ok(None)`, not an error.
+- `read_image` / `write_image` follow the same rules with PNG images (see "Images"). They are
+  optional: by default `read_image` returns `Ok(None)` and `write_image` returns
+  `ClipboardError::Unsupported`, so a backend without images still compiles.
+- `read_files` / `write_files` follow the same rules with local file paths (see "Files
+  on the clipboard"). They are also optional, with the same defaults: today only Wayland
+  implements them.
+- No read or write blocks for more than 2 seconds: if the app that owns the content does not respond, the
+  backend returns an error. The backend sets the limit because the daemon cannot cancel a blocked thread.
+- `watch` returns a **channel** (not a callback): the backend pushes events from its own OS thread
+  (Wayland, Windows) or from a polling thread (macOS), with a non-blocking `send`. The channel is
+  unbounded because the events are small and arrive at human speed.
+- An event does not carry the content, only the **offered formats** with their native name (MIME on Linux,
+  UTI on macOS, format name on Windows).
+- `read_text`, `read_image` and `read_files` never read sensitive content: they check the markers on the same
+  content they read and return `ClipboardError::Sensitive` without reading the data (see "Sensitive
+  content").
+- **All** changes are reported, including the ones the daemon itself causes when writing; anti-echo
+  is done in the daemon by hash, the same on all platforms.
+- `ContentHash` is BLAKE3 of the content bytes (text: UTF-8 as is, not normalized; image:
+  the PNG bytes).
 
-### Contenido sensible
+### Sensitive content
 
-Se detectan y respetan estos marcadores en **todas** las plataformas:
+These markers are detected and respected on **all** platforms:
 
-- **Windows:** formato `ExcludeClipboardContentFromMonitorProcessing` (presente = no sincronizar),
-  `CanUploadToCloudClipboard` = 0 y `CanIncludeInClipboardHistory` = 0.
-- **Linux:** MIME `x-kde-passwordManagerHint` (valor `secret`). Lo usa KeePassXC, entre otros.
+- **Windows:** format `ExcludeClipboardContentFromMonitorProcessing` (present = do not sync),
+  `CanUploadToCloudClipboard` = 0 and `CanIncludeInClipboardHistory` = 0.
+- **Linux:** MIME `x-kde-passwordManagerHint` (value `secret`). KeePassXC uses it, among others.
 - **macOS:** `org.nspasteboard.ConcealedType`, `org.nspasteboard.TransientType`,
-  `org.nspasteboard.AutoGeneratedType` (estándar de nspasteboard.org; 1Password lo usa) y el legado
+  `org.nspasteboard.AutoGeneratedType` (nspasteboard.org standard; 1Password uses it) and the legacy
   `com.agilebits.onepassword`.
 
-Cómo se aplica (código en `crates/core/src/sensitive.rs` y en cada backend):
+How it is applied (code in `crates/core/src/sensitive.rs` and in each backend):
 
-- **Una sola lista en `core`.** `sensitive_marker(formatos)` compara nombres exactos (mayúsculas
-  incluidas). Los dos flags de Windows guardan un DWORD y solo marcan si valen 0, así que el backend
-  de Windows lee el valor y los pasa como `CanUploadToCloudClipboard=0`.
-- **Linux por presencia.** `x-kde-passwordManagerHint` marca aunque no se lea su valor: KeePassXC
-  pone `secret` y ninguna app lo ofrece para decir "no es secreto". Leer el valor sería una
-  transferencia más desde la app dueña.
-- **El filtro está en `read_text`, no en el evento.** Entre el evento y la lectura puede llegar otra
-  copia: si se revisaran los formatos del evento, un secreto copiado justo después se leería con los
-  formatos del contenido anterior. Por eso cada backend lista los formatos y lee el texto del mismo
-  contenido, y si encuentra un marcador devuelve `ClipboardError::Sensitive` sin leer el texto. Que
-  sea un error hace que quien lo olvide manejar igual se quede sin el texto. `read_image` y
-  `read_files` hacen lo mismo con la imagen y la lista de archivos.
-  - **Wayland:** pide al compositor la oferta actual, que trae su lista de MIME fija, y lee el texto
-    de esa misma oferta. Una copia nueva es otra oferta, así que la lista y el texto siempre son del
-    mismo contenido.
-  - **Windows:** con el portapapeles abierto (`OpenClipboard`) nadie más puede cambiarlo. Lista los
-    formatos, lee los DWORD de los flags y el texto antes de cerrarlo.
-  - **macOS:** no hay forma de hacerlo en un paso. Lee `changeCount`, revisa los tipos, lee el texto,
-    revisa los tipos otra vez y compara `changeCount`. Si cambió, empieza de nuevo (hasta 3 veces) y
-    después devuelve error.
-- **Falla cerrado.** Si no se pueden listar los formatos o leer el valor de un flag, `read_text`
-  devuelve error y el daemon no envía nada.
-- `clipbroad watch` muestra los formatos del evento y, si el contenido es sensible, el marcador en
-  vez del texto. Sirve para comprobar qué marca cada gestor de contraseñas.
+- **A single list in `core`.** `sensitive_marker(formats)` compares exact names (case
+  included). The two Windows flags store a DWORD and only mark if they are 0, so the Windows backend
+  reads the value and passes them as `CanUploadToCloudClipboard=0`.
+- **Linux by presence.** `x-kde-passwordManagerHint` marks even if its value is not read: KeePassXC
+  sets `secret` and no app offers it to say "this is not secret". Reading the value would be one more
+  transfer from the owning app.
+- **The filter is in `read_text`, not in the event.** Another copy can arrive between the event and the read:
+  if the event's formats were checked, a secret copied right after would be read with the
+  formats of the previous content. Because of that, each backend lists the formats and reads the text from the same
+  content, and if it finds a marker it returns `ClipboardError::Sensitive` without reading the text. Making it
+  an error means that whoever forgets to handle it still ends up without the text. `read_image` and
+  `read_files` do the same with the image and the file list.
+  - **Wayland:** asks the compositor for the current offer, which carries its fixed MIME list, and reads the text
+    from that same offer. A new copy is another offer, so the list and the text always belong to the
+    same content.
+  - **Windows:** with the clipboard open (`OpenClipboard`) nobody else can change it. It lists the
+    formats, reads the flag DWORDs and the text before closing it.
+  - **macOS:** there is no way to do it in one step. It reads `changeCount`, checks the types, reads the text,
+    checks the types again and compares `changeCount`. If it changed, it starts over (up to 3 times) and
+    then returns an error.
+- **Fail closed.** If the formats cannot be listed or a flag value cannot be read, `read_text`
+  returns an error and the daemon sends nothing.
+- `clipbroad watch` shows the event's formats and, if the content is sensitive, the marker instead
+  of the text. It is useful to check what each password manager marks.
 
-Riesgos que quedan:
+Remaining risks:
 
-- **Apps que no marcan.** Lo que un gestor de contraseñas copie sin ningún marcador (o copiar una
-  contraseña a mano desde otra app) se sincroniza. Pasa también con un gestor que use un marcador
-  que no esté en la lista.
-- **macOS, marcador tardío.** Escribir tipos uno por uno no cambia `changeCount`. Si una app escribe
-  el texto y agrega el marcador después de que el daemon revisó los tipos por segunda vez, el texto
-  se envía. La segunda revisión acorta esa ventana a lo que tarda leer el texto. Las apps que siguen
-  nspasteboard.org declaran todos los tipos antes de escribir datos, y no tienen este problema.
-- **Windows, eventos sin valor.** El evento muestra `CanUploadToCloudClipboard` sin su valor: leerlo
-  en el hilo del watcher podría bloquearlo esperando a la app que copió. El valor solo se lee en
-  `read_text`, que tiene límite de tiempo, y `watch` lo muestra en el marcador (`=0`).
-- **Comportamiento real en macOS y Windows** con 1Password, KeePassXC y Bitwarden: solo se prueba a
-  mano (los tests de CI escriben los marcadores ellos mismos).
+- **Apps that do not mark.** Whatever a password manager copies without any marker (or copying a
+  password by hand from another app) gets synced. This also happens with a manager that uses a marker
+  that is not on the list.
+- **macOS, late marker.** Writing types one by one does not change `changeCount`. If an app writes
+  the text and adds the marker after the daemon checked the types the second time, the text
+  is sent. The second check shrinks that window to the time it takes to read the text. Apps that follow
+  nspasteboard.org declare all types before writing data, and do not have this problem.
+- **Windows, events without a value.** The event shows `CanUploadToCloudClipboard` without its value: reading it
+  on the watcher thread could block it while waiting for the app that copied. The value is only read in
+  `read_text`, which has a time limit, and `watch` shows it in the marker (`=0`).
+- **Real behavior on macOS and Windows** with 1Password, KeePassXC and Bitwarden: only tested by
+  hand (the CI tests write the markers themselves).
 
-### macOS: privacidad del pasteboard (riesgo principal)
+### macOS: pasteboard privacy (main risk)
 
-Desde macOS 15.4, Apple tiene preparado un aviso cuando una app **lee** el pasteboard de forma
-programática. A la fecha no está activo por defecto, pero un daemon que lee en cada cambio es justo el caso
-que dispara el aviso cuando se active. Mitigaciones previstas:
-- Consultar `NSPasteboard.accessBehavior` y reportar el estado en `clipbroad status`. Lo consulta el
-  daemon cada vez que actualiza su estado, porque el permiso es del proceso que lee.
-- Usar los métodos `detect` para saber qué tipos hay **sin leer** antes de decidir leer.
-- Documentar el permiso en Ajustes del Sistema → Privacidad y seguridad → "Pegar desde otras apps"
-  (Allow). No existe un entitlement que lo evite.
-- Resultado de la prueba manual (octubre 2026, `v0.1.0-rc.1`): en el Mac del dueño, `watch` y `run`
-  leyeron texto, imágenes y archivos sin que macOS mostrara ningún aviso. No se probó con la
-  preferencia de desarrollador `EnablePasteboardPrivacyDeveloperPreview` activa.
+Since macOS 15.4, Apple has a prompt ready for when an app **reads** the pasteboard
+programmatically. As of today it is not on by default, but a daemon that reads on every change is exactly the case
+that triggers the prompt once it is turned on. Planned mitigations:
+- Query `NSPasteboard.accessBehavior` and report the state in `clipbroad status`. The daemon queries it
+  every time it updates its status, because the permission belongs to the process that reads.
+- Use the `detect` methods to know which types are there **without reading** before deciding to read.
+- Document the permission in System Settings → Privacy & Security → "Paste from Other Apps"
+  (Allow). There is no entitlement that avoids it.
+- Manual test result (October 2026, `v0.1.0-rc.1`): on the owner's Mac, `watch` and `run`
+  read text, images and files without macOS showing any prompt. It was not tested with the
+  `EnablePasteboardPrivacyDeveloperPreview` developer preference on.
 
-## Imágenes
+## Images
 
-Se normalizan a PNG en la red (macOS usa TIFF/PNG; Windows usa DIB/PNG). Van inline mientras estén bajo
-el umbral de tamaño. Código en `crates/core/src/content.rs` (`Png`) y `protocol.rs`.
+They are normalized to PNG on the wire (macOS uses TIFF/PNG; Windows uses DIB/PNG). They go inline while they are under
+the size threshold. Code in `crates/core/src/content.rs` (`Png`) and `protocol.rs`.
 
-- **En la red siempre PNG.** `ClipContent::Image(Png)` viaja como `ContentKind::Image` con MIME
-  `image/png`. El hash es BLAKE3 de los bytes PNG tal como viajan. Un texto y una imagen nunca tienen
-  los mismos bytes: un PNG empieza con `0x89`, y ningún texto UTF-8 puede empezar así.
-- **La conversión vive en los backends, no en `core`.** Cada backend convierte su formato nativo a PNG
-  al leer (TIFF en macOS, DIB en Windows; Wayland ya ofrece `image/png`). Así `core` no depende de
-  ningún códec. macOS convierte con AppKit, sin dependencias. Windows usa el crate `png` (sin features
-  extra; MIT/Apache) y no el crate `image`, que es mucho más pesado: solo hace falta leer y escribir
-  bitmaps sin comprimir.
-- **`core` solo revisa el encabezado.** `Png::try_from` acepta bytes que empiezan con la firma PNG
-  seguida del chunk `IHDR`, y rechaza el resto con `NotPng`. No decodifica la imagen: un PNG roto más
-  allá del encabezado falla en la app que pega, igual que si se hubiera copiado en la misma máquina.
-  `Clip::into_content` rechaza un clip de imagen que no empieza como PNG (`ClipError::NotPng`), así un
-  peer no puede poner bytes cualquiera en el portapapeles como imagen.
-- **`PROTOCOL_VERSION` pasa a 2.** Un nodo con la versión 1 no puede decodificar `ContentKind::Image`:
-  el frame le resulta malformado y cierra la conexión con cada imagen copiada. Con la versión nueva, dos
-  nodos de versiones distintas se rechazan al conectar con el error claro de `Hello`, y hay que
-  actualizar todas las máquinas. El ALPN sigue siendo `clipbroad/1`: si cambiara, la conexión fallaría
-  en el handshake sin decir por qué.
-- **Una imagen más grande que `inline_max_bytes` no se sincroniza:** el daemon la salta con un warning,
-  igual que al texto. Cuando exista el canal de archivos (ver "Archivos") se puede reconsiderar enviarla
-  por ahí.
-- **Requisito para los backends (anti-eco):** el anti-eco compara hashes. Si un backend escribe un PNG y
-  al leerlo de vuelta entrega otros bytes (por ejemplo, porque lo re-codifica desde TIFF), el daemon lo ve
-  como una copia nueva y la reenvía. Dos máquinas que re-codifican podrían reenviarse la imagen sin fin.
-  Por eso un backend debe devolver los mismos bytes PNG que escribió, por ejemplo escribiendo el tipo PNG
-  y leyéndolo primero cuando está.
-- **Texto e imagen en la misma copia: gana el texto.** El daemon llama a `read_text` y, solo si no hay
-  texto, a `read_image` (`read_content` en `crates/daemon/src/run.rs`; antes de los dos busca
-  archivos, ver "Archivos en el portapapeles"). Las apps que ofrecen ambos en
-  una copia (celdas de una planilla, un documento de oficina) lo hacen sobre todo para que el texto se
-  pueda pegar también como dibujo; lo que la persona quiso copiar es el texto, que además pesa mucho
-  menos. Un clip lleva un solo contenido, así que no se pueden mandar los dos.
-  - **Excepción, "Copiar imagen" del navegador:** Chrome ofrece la imagen y `text/html` con una
-    etiqueta `<img>`, sin texto plano. Por contrato, si la copia trae una imagen legible, `read_text`
-    solo cuenta el texto plano (en Wayland: `text/plain;charset=utf-8`, `UTF8_STRING`, `text/plain`,
-    `STRING`, `TEXT`), así que ahí gana la imagen y no se sincroniza el HTML.
-  - **Límite conocido:** Firefox, al copiar una imagen, ofrece además la URL como texto plano. Ahí
-    gana la URL. Arreglarlo pediría mandar varios formatos en un clip.
-- **Wayland:** lee y escribe solo `image/png`, byte por byte, desde la misma oferta cuya lista de MIME
-  revisó (igual que el texto). Una copia que solo ofrece otros tipos (`image/jpeg`, `image/bmp`)
-  cuenta como sin imagen: convertirla pediría un códec. Las herramientas de captura (`grim`) y los
-  navegadores ofrecen `image/png`.
-- **macOS:** lee `public.png` byte por byte. Si solo hay `public.tiff` (algunas apps, como Preview),
-  AppKit la convierte a PNG (`NSBitmapImageRep`). Escribe solo `public.png`: las apps de macOS actuales
-  pegan PNG. Mismo control de `changeCount` y de marcadores antes y después de leer que con el texto.
-  `read_text` solo lee `public.utf8-plain-text`, así que el HTML junto a una imagen no cuenta como texto.
-- **Windows:** lee primero el formato registrado `PNG` (navegadores, Recortes), byte por byte. Si no
-  está, convierte a PNG el `CF_DIB` o `CF_DIBV5` que puso la app (Imprimir pantalla, Paint; Windows
-  deriva cada uno del otro y de `CF_BITMAP`, y los lista después de los originales). Solo convierte bitmaps sin comprimir de 24 o 32 bits (`BI_RGB`, o
-  `BI_BITFIELDS` con canales de 8 bits), de arriba abajo o de abajo arriba; cualquier otro cuenta como
-  sin imagen. En 32 bits `BI_RGB` el cuarto byte cuenta como transparencia salvo que valga 0 en todos
-  los píxeles (entonces no se usaba). Al escribir pone `PNG` primero y una copia `CF_DIB` de 32 bits
-  para las apps que no pegan PNG; como la lectura prefiere `PNG`, lo escrito se lee con los mismos
-  bytes. Al leer `PNG` corta los bytes al final del chunk `IEND`, porque un bloque de memoria del
-  portapapeles puede ser más grande que lo que se puso en él. La revisión de marcadores y la lectura
-  pasan en la misma apertura del portapapeles, igual que con el texto.
-- `clipbroad watch` muestra una imagen como `(image/png, 12345 bytes)` y `clipbroad status` muestra el
-  tipo del último clip (`text` o `image`) junto al tamaño y el hash. Los archivos se muestran como
-  `(3 files, 41.9 MB)` en `watch` y `3 files, 41.9 MB` en `status`.
+- **Always PNG on the wire.** `ClipContent::Image(Png)` travels as `ContentKind::Image` with MIME
+  `image/png`. The hash is BLAKE3 of the PNG bytes as they travel. A text and an image never have
+  the same bytes: a PNG starts with `0x89`, and no UTF-8 text can start that way.
+- **The conversion lives in the backends, not in `core`.** Each backend converts its native format to PNG
+  on read (TIFF on macOS, DIB on Windows; Wayland already offers `image/png`). That way `core` does not depend on
+  any codec. macOS converts with AppKit, with no dependencies. Windows uses the `png` crate (no extra
+  features; MIT/Apache) and not the `image` crate, which is much heavier: it only needs to read and write
+  uncompressed bitmaps.
+- **`core` only checks the header.** `Png::try_from` accepts bytes that start with the PNG signature
+  followed by the `IHDR` chunk, and rejects the rest with `NotPng`. It does not decode the image: a PNG broken
+  past the header fails in the app that pastes, the same as if it had been copied on the same machine.
+  `Clip::into_content` rejects an image clip that does not start as PNG (`ClipError::NotPng`), so a
+  peer cannot put arbitrary bytes on the clipboard as an image.
+- **`PROTOCOL_VERSION` goes to 2.** A node with version 1 cannot decode `ContentKind::Image`:
+  the frame looks malformed to it and it closes the connection on every copied image. With the new version, two
+  nodes with different versions reject each other on connect with the clear `Hello` error, and all
+  machines have to be updated. The ALPN stays `clipbroad/1`: if it changed, the connection would fail
+  in the handshake without saying why.
+- **An image larger than `inline_max_bytes` is not synced:** the daemon skips it with a warning,
+  the same as text. Once the file channel exists (see "Files"), sending it
+  that way can be reconsidered.
+- **Requirement for the backends (anti-echo):** anti-echo compares hashes. If a backend writes a PNG and
+  reading it back returns other bytes (for example, because it re-encodes it from TIFF), the daemon sees it
+  as a new copy and resends it. Two machines that re-encode could resend the image to each other endlessly.
+  Because of that, a backend must return the same PNG bytes it wrote, for example by writing the PNG type
+  and reading it first when it is there.
+- **Text and image in the same copy: text wins.** The daemon calls `read_text` and, only if there is no
+  text, `read_image` (`read_content` in `crates/daemon/src/run.rs`; before both it looks for
+  files, see "Files on the clipboard"). Apps that offer both in
+  one copy (spreadsheet cells, an office document) do it mostly so the text can
+  also be pasted as a drawing; what the person meant to copy is the text, which is also much
+  smaller. A clip carries a single content, so both cannot be sent.
+  - **Exception, the browser's "Copy image":** Chrome offers the image and `text/html` with an
+    `<img>` tag, without plain text. By contract, if the copy carries a readable image, `read_text`
+    only counts plain text (on Wayland: `text/plain;charset=utf-8`, `UTF8_STRING`, `text/plain`,
+    `STRING`, `TEXT`), so there the image wins and the HTML is not synced.
+  - **Known limit:** Firefox, when copying an image, also offers the URL as plain text. There
+    the URL wins. Fixing it would require sending several formats in one clip.
+- **Wayland:** reads and writes only `image/png`, byte for byte, from the same offer whose MIME list
+  it checked (same as text). A copy that only offers other types (`image/jpeg`, `image/bmp`)
+  counts as having no image: converting it would require a codec. Screenshot tools (`grim`) and
+  browsers offer `image/png`.
+- **macOS:** reads `public.png` byte for byte. If there is only `public.tiff` (some apps, like Preview),
+  AppKit converts it to PNG (`NSBitmapImageRep`). It writes only `public.png`: current macOS apps
+  paste PNG. Same `changeCount` and marker check before and after reading as with text.
+  `read_text` only reads `public.utf8-plain-text`, so the HTML next to an image does not count as text.
+- **Windows:** first reads the registered `PNG` format (browsers, Snipping Tool), byte for byte. If it is not
+  there, it converts to PNG the `CF_DIB` or `CF_DIBV5` the app put there (Print Screen, Paint; Windows
+  derives each one from the other and from `CF_BITMAP`, and lists them after the originals). It only converts uncompressed 24- or 32-bit bitmaps (`BI_RGB`, or
+  `BI_BITFIELDS` with 8-bit channels), top-down or bottom-up; anything else counts as
+  having no image. In 32-bit `BI_RGB` the fourth byte counts as transparency unless it is 0 in all
+  pixels (then it was not used). When writing it puts `PNG` first and a 32-bit `CF_DIB` copy
+  for apps that do not paste PNG; since reading prefers `PNG`, what was written is read back with the same
+  bytes. When reading `PNG` it cuts the bytes at the end of the `IEND` chunk, because a clipboard
+  memory block can be larger than what was put in it. The marker check and the read
+  happen in the same clipboard open, same as with text.
+- `clipbroad watch` shows an image as `(image/png, 12345 bytes)` and `clipbroad status` shows the
+  type of the last clip (`text` or `image`) next to the size and the hash. Files show as
+  `(3 files, 41.9 MB)` in `watch` and `3 files, 41.9 MB` in `status`.
 
-## Archivos
+## Files
 
-El portapapeles del SO guarda **referencias** a archivos (URIs, `CF_HDROP`, URLs de archivo), no su
-contenido. Sincronizar archivos significa transferir el contenido, guardarlo en una caché local
-(`<cache>/clipbroad/files/<hash>/<nombre>`) y poner en el portapapeles las rutas locales.
+The OS clipboard stores **references** to files (URIs, `CF_HDROP`, file URLs), not their
+content. Syncing files means transferring the content, storing it in a local cache
+(`<cache>/clipbroad/files/<hash>/<name>`) and putting the local paths on the clipboard.
 
-- Primera versión: **transferencia inmediata** al copiar, con un límite de tamaño configurable. Por
-  encima del límite, el archivo no se sincroniza.
-- La transferencia perezosa (traer el archivo solo al pegar) existe en cada SO (Wayland es perezoso por
-  diseño; macOS tiene `NSFilePromise`; Windows tiene delayed rendering), pero es compleja. Se pospone.
-### Transporte de archivos
+- First version: **immediate transfer** on copy, with a configurable size limit. Above
+  the limit, the file is not synced.
+- Lazy transfer (fetching the file only on paste) exists on each OS (Wayland is lazy by
+  design; macOS has `NSFilePromise`; Windows has delayed rendering), but it is complex. It is postponed.
+### File transport
 
-**Decisión: transferencia propia, sin `iroh-blobs`.** Cada archivo viaja en un stream bidireccional de
-QUIC dentro de la conexión `clipbroad/1` que ya existe con el peer. El que recibe lo pide por hash y lo
-escribe en un archivo temporal mientras calcula el BLAKE3. Solo lo mueve a la caché si el tamaño y el
-hash coinciden.
+**Decision: custom transfer, without `iroh-blobs`.** Each file travels on a bidirectional QUIC
+stream inside the `clipbroad/1` connection that already exists with the peer. The receiver requests it by hash and
+writes it to a temporary file while computing the BLAKE3. It only moves it to the cache if the size and the
+hash match.
 
-**Medición** (spike 4.3, prototipo descartable). Dos procesos en la misma máquina por localhost, build
-release, disco btrfs, 3 corridas. La memoria es el RSS máximo del proceso entero, iroh incluido.
+**Measurement** (spike 4.3, throwaway prototype). Two processes on the same machine over localhost, release
+build, btrfs disk, 3 runs. Memory is the peak RSS of the whole process, iroh included.
 
-| | 100 MB | 1 GB | RSS emisor | RSS receptor | Disco del receptor |
+| | 100 MB | 1 GB | Sender RSS | Receiver RSS | Receiver disk |
 |---|---|---|---|---|---|
-| Propio | 140–155 ms (650–715 MB/s) | 1,37 s | 17 MiB | 18 MiB (20 con 1 GB) | el archivo |
-| `iroh-blobs` con `fs-store` | 147–155 ms con la exportación (645–680 MB/s) | 1,33 s | 20 MiB | 21–22 MiB (23 con 1 GB) | el archivo en su store y la copia exportada |
+| Custom | 140-155 ms (650-715 MB/s) | 1.37 s | 17 MiB | 18 MiB (20 with 1 GB) | the file |
+| `iroh-blobs` with `fs-store` | 147-155 ms with the export (645-680 MB/s) | 1.33 s | 20 MiB | 21-22 MiB (23 with 1 GB) | the file in its store and the exported copy |
 
-Las dos opciones tienen la misma velocidad y su memoria no crece con el archivo. Los datos no
-favorecen a ninguna, así que deciden la complejidad y el riesgo. Preparar el envío tarda 17 ms por
-100 MB con la propia (solo BLAKE3) y 54 ms con iroh-blobs (importar al store calcula además el árbol
-de verificación). Localhost no mide la red: en una LAN real el límite es el enlace (unos 110 MB/s en
-gigabit, menos en Wi-Fi). No se midió en macOS ni en Windows.
+Both options have the same speed and their memory does not grow with the file. The data does not
+favor either one, so complexity and risk decide. Preparing the send takes 17 ms per
+100 MB with the custom one (BLAKE3 only) and 54 ms with iroh-blobs (importing into the store also computes the verification
+tree). Localhost does not measure the network: on a real LAN the limit is the link (about 110 MB/s on
+gigabit, less on Wi-Fi). It was not measured on macOS or Windows.
 
-Por qué no `iroh-blobs` (0.103.1, la única línea compatible con iroh 1.x):
-- **No está lista para producción, según su README.** Recomienda la 0.35 para producción, pero esa
-  versión exige iroh 0.35 y no convive con nuestro iroh 1.4.
-- **Bug de seguridad recién corregido.** Hasta la 0.103.0, con la configuración por defecto cualquier
-  peer conectado podía escribir blobs en el store del otro (pedidos *push* sin permiso,
-  n0-computer/iroh-blobs#270). Se corrigió en la 0.103.1 (octubre de 2026) y se retiraron de crates.io
-  las versiones 0.97 a 0.103.0.
-- **Bugs abiertos en el store en disco** que nos afectarían: el GC borra blobs que siguen en uso (#247,
-  #256, #314), una falla del GC lo detiene para siempre (#291), corrupción de la base `redb` con I/O
-  pesado (#261), RSS que crece al reimportar (#266). Un SIGKILL a mitad de descarga pierde el progreso
-  (#254), así que la reanudación no sobrevive a un crash.
-- **API inestable.** Publicó 9 versiones menores entre octubre de 2025 y junio de 2026, y en 0.x cada
-  una puede romper la API. No promete estabilidad del formato del store.
-- **Peso.** Con las features mínimas agrega 29 crates, pero así solo trae el store en memoria, que
-  carga el archivo entero en RAM. Con `fs-store` agrega 31 (suma `redb` y `reflink-copy`). Las licencias
-  pasan, pero `cargo deny` falla por RUSTSEC-2024-0370 (`proc-macro-error` sin mantenimiento, vía
-  `genawaiter`) y habría que ignorar otro aviso. También suma `syn` 1.x y otra versión de `spin`.
-- **Encaje.** El store es una base de datos aparte, con tags y GC que administrar además de la caché
-  `<cache>/clipbroad/files/<hash>/<nombre>`. El receptor guarda en el store y después exporta a la
-  caché: en btrfs o APFS es un clon, pero en ext4 o NTFS escribe el archivo dos veces. El proveedor le
-  entrega cualquier blob del store a cualquier peer conectado, y hay que configurar `EventMask` para
-  rechazar los *push*.
-- **Lo que aporta no hace falta aquí:** verificación por rangos, reanudación, descarga desde varios
-  peers y colecciones. En la LAN un archivo de 100 MB tarda alrededor de un segundo, y reintentar desde
-  cero es aceptable.
+Why not `iroh-blobs` (0.103.1, the only line compatible with iroh 1.x):
+- **It is not production-ready, according to its README.** It recommends 0.35 for production, but that
+  version requires iroh 0.35 and cannot coexist with our iroh 1.4.
+- **Security bug fixed only recently.** Up to 0.103.0, with the default configuration any
+  connected peer could write blobs into the other's store (*push* requests without permission,
+  n0-computer/iroh-blobs#270). It was fixed in 0.103.1 (October 2026) and versions 0.97 to 0.103.0
+  were yanked from crates.io.
+- **Open bugs in the on-disk store** that would affect us: GC deletes blobs that are still in use (#247,
+  #256, #314), a GC failure stops it forever (#291), corruption of the `redb` database under heavy
+  I/O (#261), RSS that grows on reimport (#266). A SIGKILL in the middle of a download loses the progress
+  (#254), so resumption does not survive a crash.
+- **Unstable API.** It published 9 minor versions between October 2025 and June 2026, and in 0.x each
+  one can break the API. It does not promise store format stability.
+- **Weight.** With the minimal features it adds 29 crates, but that way it only brings the in-memory store, which
+  loads the whole file into RAM. With `fs-store` it adds 31 (adding `redb` and `reflink-copy`). The licenses
+  pass, but `cargo deny` fails on RUSTSEC-2024-0370 (`proc-macro-error` unmaintained, through
+  `genawaiter`) and we would have to ignore another advisory. It also adds `syn` 1.x and another version of `spin`.
+- **Fit.** The store is a separate database, with tags and GC to manage on top of the
+  `<cache>/clipbroad/files/<hash>/<name>` cache. The receiver saves into the store and then exports to the
+  cache: on btrfs or APFS it is a clone, but on ext4 or NTFS it writes the file twice. The provider
+  hands any blob in the store to any connected peer, and `EventMask` has to be configured to
+  reject *push* requests.
+- **What it provides is not needed here:** range verification, resumption, download from several
+  peers and collections. On the LAN a 100 MB file takes around one second, and retrying from
+  scratch is acceptable.
 
-Por qué la conexión existente y no un ALPN aparte (`clipbroad-file/1`):
-- La conexión ya está autenticada y pasó la allowlist. Con un ALPN aparte, el receptor tendría que
-  marcar al emisor, y sin mDNS un peer sin direcciones solo se conecta si el otro lo marca (ver
-  "Conexiones"). En ese caso el receptor no podría pedir el archivo.
-- QUIC multiplexa los streams, así que un archivo grande no frena los frames de clips. El stream de
-  clips tiene más prioridad (`SendStream::set_priority`) para que un texto copiado no espere detrás de
-  un archivo.
-- Los streams se distinguen por tipo. Cada lado sigue abriendo un solo stream unidireccional para los
-  clips, y cada stream bidireccional es un pedido de archivo.
-- Costo: si la conexión se cae o se reemplaza (ver "Conexiones duplicadas"), la transferencia en curso
-  se corta y se reintenta en la conexión nueva.
+Why the existing connection and not a separate ALPN (`clipbroad-file/1`):
+- The connection is already authenticated and passed the allowlist. With a separate ALPN, the receiver would have to
+  dial the sender, and without mDNS a peer without addresses only connects if the other one dials it (see
+  "Connections"). In that case the receiver could not request the file.
+- QUIC multiplexes the streams, so a large file does not hold back the clip frames. The clip
+  stream has higher priority (`SendStream::set_priority`) so copied text does not wait behind
+  a file.
+- Streams are told apart by type. Each side still opens a single unidirectional stream for
+  clips, and each bidirectional stream is a file request.
+- Cost: if the connection drops or is replaced (see "Duplicate connections"), the transfer in progress
+  is cut and retried on the new connection.
 
-Implementación (código en `crates/core/src/files.rs`, `crates/net/src/files.rs` y
+Implementation (code in `crates/core/src/files.rs`, `crates/net/src/files.rs` and
 `crates/net/src/cache.rs`):
 
-- **Anuncio.** `ContentKind::Files` y `Payload::Files(Vec<FileEntry>)`, con
-  `FileEntry { name, size, hash }`. `kind` es `Files`, `mime` es `text/uri-list` y `size` es la suma
-  de los tamaños. En `core`, `ClipContent::Files(FileList)` es la lista ya revisada: no vacía, con
-  nombres válidos y sin repetir, ordenada por nombre y con una suma de tamaños que no desborda.
-- **Hash del clip.** BLAKE3 en modo de derivación de clave (contexto `"clipbroad 2026-10 file list"`)
-  sobre cada archivo en orden de nombre: el largo del nombre (u64 little-endian), el nombre en UTF-8,
-  el tamaño (u64 little-endian) y los 32 bytes del hash del archivo. La lista se ordena por nombre
-  porque el SO puede devolver los archivos en otro orden al leerlos de vuelta, y el anti-eco necesita
-  el mismo hash. El modo de derivación de clave lo separa
-  del BLAKE3 simple de un texto o una imagen, así nunca chocan. No depende de dónde están los archivos
-  en cada máquina: al poner las rutas de la caché en el portapapeles, el evento local
-  calcula el mismo hash y el motor lo reconoce como eco.
-- **Nombres.** Un nombre válido es un solo componente que los tres SO pueden crear tal cual:
-  no vacío, hasta 255 bytes, sin `/`, `\` ni los otros caracteres que Windows no permite
-  (`: * ? " < > |`), sin caracteres de control (NUL incluido), sin punto ni espacio al final (eso
-  también rechaza `.` y `..`) y sin nombres de dispositivo de Windows (`CON`, `nul.txt`, `COM1`, ...).
-  Las mismas reglas en todos los SO, así un nombre que una máquina acepta lo aceptan todas. El emisor
-  salta con un warning los archivos con un nombre así; el receptor rechaza el clip entero. Los
-  errores nunca incluyen el nombre recibido, que podría meter caracteres de control en los logs.
-- **Pedido.** El receptor abre un stream bidireccional y manda `FileRequest { hash }`. El emisor
-  responde `FileResponse::Ok { size }` seguido de exactamente `size` bytes y cierra el stream, o
-  `FileResponse::NotOffered`. El stream de clips tiene prioridad 1 y los de archivos la 0 por
-  defecto, así un texto copiado no espera detrás de un archivo.
-- **El emisor solo sirve los archivos de su último clip** (`Offer`: hash → ruta y tamaño). Los lee de
-  su ruta original, sin copiarlos. Un hash que no está en la oferta recibe `NotOffered`, y también un
-  archivo cuyo tamaño cambió desde que se copió (si cambió sin cambiar de tamaño, el receptor lo nota
-  por el hash). Cualquier `broadcast` nuevo reemplaza la oferta; uno de texto la vacía. La oferta se
-  publica antes de mandar el clip, así un pedido rápido la encuentra.
-- **El emisor revisa al copiar** (`Offer::read`): salta con un warning las carpetas y todo lo que no
-  sea un archivo regular, los archivos de más de `file_max_bytes`, los nombres inválidos y un segundo
-  archivo con el mismo nombre. Si lo que queda suma más de `file_cache_max_bytes`, no anuncia nada.
-- **El receptor revisa los límites antes de pedir:** cada archivo hasta `file_max_bytes` y todos
-  juntos hasta `file_cache_max_bytes`. Si no, falla sin abrir ningún stream. El `size` de la
-  respuesta debe ser el anunciado.
-- **El receptor verifica antes de exponer.** Escribe en un temporal `.clipbroad-<azar>.part` dentro
-  de `<caché>/<hash>/`, actualiza el BLAKE3 con cada bloque y corta apenas llega un byte de más.
-  Al terminar compara tamaño y hash: si coinciden, renombra el temporal al nombre final, y si no, lo
-  borra. Un stream que no trae nada en 30 s se corta. Solo se devuelven rutas de archivos verificados.
-- **Un archivo que ya está en la caché no se pide.** Antes se vuelve a calcular su hash, por si una
-  app lo editó en el lugar (cuesta unos 17 ms por cada 100 MB); si no coincide, se borra y se pide.
-- **Cancelar es soltar la descarga.** Soltar el future de `fetch_files` cierra el stream (el emisor
-  recibe `STOP_SENDING`) y borra el temporal. El daemon suelta la descarga en curso
-  cuando llega un clip más nuevo.
-- **Reintentos.** Si la conexión se cae o se reemplaza a mitad de un archivo, se pide de nuevo desde
-  cero en la conexión siguiente, hasta 3 intentos, esperando hasta 10 s a que el peer vuelva. Otros
-  errores (hash distinto, `NotOffered`, límites) no se reintentan.
-- **Carpetas:** fuera de la primera versión, se saltan con un warning. Recorrerlas pediría nombres con
-  ruta relativa (y validarlas); comprimirlas, un formato y una dependencia. Se decide cuando haga
-  falta.
-- `PROTOCOL_VERSION` pasa a 3.
+- **Announcement.** `ContentKind::Files` and `Payload::Files(Vec<FileEntry>)`, with
+  `FileEntry { name, size, hash }`. `kind` is `Files`, `mime` is `text/uri-list` and `size` is the sum
+  of the sizes. In `core`, `ClipContent::Files(FileList)` is the already checked list: not empty, with
+  valid and unique names, sorted by name and with a sum of sizes that does not overflow.
+- **Clip hash.** BLAKE3 in key derivation mode (context `"clipbroad 2026-10 file list"`)
+  over each file in name order: the name length (little-endian u64), the name in UTF-8,
+  the size (little-endian u64) and the 32 bytes of the file hash. The list is sorted by name
+  because the OS can return the files in another order when reading them back, and anti-echo needs
+  the same hash. Key derivation mode separates it
+  from the plain BLAKE3 of a text or an image, so they never collide. It does not depend on where the files are
+  on each machine: when the cache paths are put on the clipboard, the local event
+  computes the same hash and the engine recognizes it as an echo.
+- **Names.** A valid name is a single component that all three OSes can create as is:
+  not empty, up to 255 bytes, without `/`, `\` or the other characters Windows does not allow
+  (`: * ? " < > |`), without control characters (NUL included), without a trailing dot or space (that
+  also rejects `.` and `..`) and without Windows device names (`CON`, `nul.txt`, `COM1`, ...).
+  The same rules on all OSes, so a name one machine accepts is accepted by all. The sender
+  skips files with such a name with a warning; the receiver rejects the whole clip. The
+  errors never include the received name, which could put control characters into the logs.
+- **Request.** The receiver opens a bidirectional stream and sends `FileRequest { hash }`. The sender
+  responds `FileResponse::Ok { size }` followed by exactly `size` bytes and closes the stream, or
+  `FileResponse::NotOffered`. The clip stream has priority 1 and the file streams have 0 by
+  default, so copied text does not wait behind a file.
+- **The sender only serves the files of its last clip** (`Offer`: hash → path and size). It reads them from
+  their original path, without copying them. A hash that is not in the offer gets `NotOffered`, and so does a
+  file whose size changed since it was copied (if it changed without changing size, the receiver notices
+  through the hash). Any new `broadcast` replaces the offer; a text one empties it. The offer is
+  published before the clip is sent, so a quick request finds it.
+- **The sender checks on copy** (`Offer::read`): it skips with a warning folders and anything that is not
+  a regular file, files larger than `file_max_bytes`, invalid names and a second
+  file with the same name. If what remains adds up to more than `file_cache_max_bytes`, it announces nothing.
+- **The receiver checks the limits before requesting:** each file up to `file_max_bytes` and all of them
+  together up to `file_cache_max_bytes`. Otherwise, it fails without opening any stream. The `size` of the
+  response must be the announced one.
+- **The receiver verifies before exposing.** It writes to a temporary `.clipbroad-<random>.part` inside
+  `<cache>/<hash>/`, updates the BLAKE3 with each block and cuts off as soon as one extra byte arrives.
+  When done it compares size and hash: if they match, it renames the temporary file to the final name, and if not, it
+  deletes it. A stream that brings nothing for 30 s is cut. Only paths of verified files are returned.
+- **A file that is already in the cache is not requested.** Its hash is recomputed first, in case an
+  app edited it in place (it costs about 17 ms per 100 MB); if it does not match, it is deleted and requested.
+- **Canceling means dropping the download.** Dropping the `fetch_files` future closes the stream (the sender
+  receives `STOP_SENDING`) and deletes the temporary file. The daemon drops the download in progress
+  when a newer clip arrives.
+- **Retries.** If the connection drops or is replaced in the middle of a file, it is requested again from
+  scratch on the next connection, up to 3 attempts, waiting up to 10 s for the peer to come back. Other
+  errors (different hash, `NotOffered`, limits) are not retried.
+- **Folders:** out of the first version, they are skipped with a warning. Walking them would require names with
+  a relative path (and validating them); compressing them, a format and a dependency. It will be decided when
+  needed.
+- `PROTOCOL_VERSION` goes to 3.
 
-Caché (`FileCache`):
+Cache (`FileCache`):
 
-- **Ubicación:** `files/<hash>/<nombre>` dentro de la carpeta de caché de cada SO:
-  `$XDG_CACHE_HOME/clipbroad/files` (`~/.cache/...`) en Linux, `~/Library/Caches/clipbroad/files` en
-  macOS y `%LOCALAPPDATA%\clipbroad\files` en Windows. Con `--config <archivo>` es la carpeta `files`
-  junto a ese archivo, así dos instancias en una máquina nunca comparten la caché. Abrir la caché
-  borra los temporales que dejó un crash, así que solo un proceso puede usar cada carpeta.
-- **Permisos:** en Unix las carpetas se crean `0700` y los archivos quedan `0600`, porque lo copiado
-  puede ser privado. Un archivo pegado desde la caché puede conservar esos permisos.
-- **Limpieza** después de cada descarga: borra los archivos de más de `file_cache_max_days` días y
-  después los más viejos hasta quedar bajo `file_cache_max_bytes`. La antigüedad es la fecha de
-  modificación, que se renueva cuando un archivo se vuelve a usar desde la caché. Nunca borra los
-  archivos del clip que se acaba de descargar, que es lo que el portapapeles tiene; no se sigue qué
-  apunta el portapapeles después. Los temporales de una descarga en curso no se tocan, y solo mira
-  carpetas con nombre de hash, así nada ajeno que termine en la caché se borra.
-- **Config:** `file_max_bytes` (512 MiB por defecto), `file_cache_max_bytes` (2 GiB, también el
-  límite de todos los archivos de una copia) y `file_cache_max_days` (7). `file_max_bytes` no puede
-  ser mayor que `file_cache_max_bytes`.
+- **Location:** `files/<hash>/<name>` inside each OS's cache folder:
+  `$XDG_CACHE_HOME/clipbroad/files` (`~/.cache/...`) on Linux, `~/Library/Caches/clipbroad/files` on
+  macOS and `%LOCALAPPDATA%\clipbroad\files` on Windows. With `--config <file>` it is the `files` folder
+  next to that file, so two instances on one machine never share the cache. Opening the cache
+  deletes the temporary files a crash left behind, so only one process can use each folder.
+- **Permissions:** on Unix the folders are created `0700` and the files end up `0600`, because what is copied
+  can be private. A file pasted from the cache can keep those permissions.
+- **Cleanup** after each download: deletes files older than `file_cache_max_days` days and
+  then the oldest ones until it is under `file_cache_max_bytes`. Age is the modification
+  date, which is renewed when a file is reused from the cache. It never deletes the
+  files of the clip that was just downloaded, which is what the clipboard holds; it does not track what
+  the clipboard points to afterwards. Temporary files of a download in progress are not touched, and it only looks at
+  folders with a hash name, so nothing foreign that ends up in the cache gets deleted.
+- **Config:** `file_max_bytes` (512 MiB by default), `file_cache_max_bytes` (2 GiB, also the
+  limit for all the files of one copy) and `file_cache_max_days` (7). `file_max_bytes` cannot
+  be greater than `file_cache_max_bytes`.
 
-Riesgos y límites:
-- **Código propio que mantener.** Unas 750 líneas en `net` con comentarios y sin tests (el spike
-  estimaba 300). Casi la mitad es la caché y su limpieza.
-- **Sin reanudación.** En una red lenta, un archivo grande que se corta empieza de cero. Si pasa en el
-  uso real, se puede pedir desde un offset (el temporal ya tiene el comienzo) sin cambiar el anuncio.
-- **La verificación es al final.** Un peer emparejado que manda basura nos hace escribir hasta `size`
-  bytes antes de detectarla. Es un peer de confianza y el límite acota el daño.
-- **El motor marca el clip como aplicado antes de tener los archivos.** Si la descarga falla, ese
-  clip no se reintenta hasta la próxima copia, como pasa hoy con una imagen que el SO no puede
-  escribir.
-- Se puede volver a evaluar `iroh-blobs` cuando su línea compatible con iroh 1.x se declare lista para
-  producción.
+Risks and limits:
+- **Custom code to maintain.** About 750 lines in `net` with comments and without tests (the spike
+  estimated 300). Almost half is the cache and its cleanup.
+- **No resumption.** On a slow network, a large file that gets cut starts from scratch. If this happens in
+  real use, it can be requested from an offset (the temporary file already has the beginning) without changing the announcement.
+- **Verification happens at the end.** A paired peer that sends garbage makes us write up to `size`
+  bytes before detecting it. It is a trusted peer and the limit bounds the damage.
+- **The engine marks the clip as applied before it has the files.** If the download fails, that
+  clip is not retried until the next copy, as happens today with an image the OS cannot
+  write.
+- `iroh-blobs` can be evaluated again when its iroh 1.x compatible line is declared ready for
+  production.
 
-### Archivos en el portapapeles
+### Files on the clipboard
 
-Código en `crates/clipboard` (`read_files`, `write_files`) y `crates/daemon/src/run.rs`.
+Code in `crates/clipboard` (`read_files`, `write_files`) and `crates/daemon/src/run.rs`.
 
-- **El trait trabaja con rutas.** `read_files` devuelve las rutas locales de los archivos copiados
-  (`Ok(None)` si no hay) y `write_files` pone rutas locales en el portapapeles. Mismas reglas que el
-  texto y las imágenes: 2 s como máximo, se reportan las escrituras propias y la revisión de
-  marcadores sensibles se hace sobre el mismo contenido que se lee. No revisan el sistema de
-  archivos: una ruta puede ser una carpeta o ya no existir, y eso lo resuelve `Offer::read`.
-- **Cuál gana si una copia trae varios: archivos, después texto, después imagen.** Un file manager
-  ofrece las rutas también como texto, pero lo que la persona copió son los archivos. Entre texto e
-  imagen siguen las reglas de "Imágenes" (gana el texto plano, salvo "Copiar imagen" del
-  navegador). `read_content` llama a `read_files`, `read_text` y `read_image` en ese orden.
-- **Wayland, lectura.** Lee `text/uri-list` (RFC 2483) de la misma oferta cuya lista de MIME revisó.
-  Solo cuentan las URIs `file://` con host vacío, `localhost` o el nombre de esta máquina, y se
-  decodifican los `%XX`. Si una sola URI es de otro tipo (un enlace web copiado), la copia no es de
-  archivos y sigue siendo texto. Las líneas que empiezan con `#` son comentarios. Una URI mal
-  codificada, con un NUL, una query o un fragmento tampoco cuenta.
-- **Wayland, escritura.** Ofrece las mismas rutas de tres formas: `text/uri-list`,
-  `x-special/gnome-copied-files` (`copy` y una URI por línea, lo que lee GNOME Files) y texto plano
-  con una ruta por línea, como hace GNOME Files al copiar, para que pegar en una terminal o un editor
-  dé las rutas. Las URIs codifican con `%XX` todo lo que no sea letra, número, `/`, `-`, `.`, `_` o
-  `~`, así los espacios y los caracteres no ASCII ida y vuelta dan la misma ruta.
-- **Al copiar archivos aquí:** `Offer::read` revisa y calcula el hash de cada archivo fuera del hilo
-  async (salta carpetas y archivos sobre el límite con un warning), el daemon arma el clip de
-  archivos y lo envía con `broadcast_files`. `inline_max_bytes` no aplica a los archivos.
-- **Al recibir un clip de archivos:** la caché (`FileCache`) se abre al arrancar. La descarga es un
-  future que el bucle principal atiende junto con todo lo demás, así una descarga grande no frena
-  los clips ni las copias locales. Hay como mucho una: cualquier clip más nuevo (recibido con
-  `Apply`, o una copia local que se envía) la suelta, y eso la cancela (ver "Cancelar es soltar la
-  descarga"). Cuando termina, sigue siendo la más nueva por construcción, y el daemon escribe las
-  rutas de la caché con `write_files`. No es una tarea aparte de tokio porque tendría que compartir
-  el `Node`, y cancelarla y esperar a que suelte el nodo al apagar es más código.
-- **Anti-eco.** Escribir las rutas de la caché dispara un evento local. El daemon las lee, y
-  `Offer::read` calcula el mismo hash de lista que el clip recibido: el hash depende solo de nombre,
-  tamaño y hash de cada archivo, no de dónde están. El motor responde `Unchanged` y no se reenvía.
-  Cuesta leer los archivos otra vez (unos 17 ms por cada 100 MB).
-- **macOS, lectura.** Finder pone un ítem por archivo en el pasteboard, cada uno con un
-  `public.file-url` (`NSPasteboardTypeFileURL`). Se lee el de cada ítem y `NSURL` lo pasa a ruta;
-  así también se resuelven las URLs de referencia (`file:///.file/id=...`, que nombran el archivo
-  por id) a la ruta actual del archivo. Solo cuentan las URLs `file:` sin host o con `localhost`. Si
-  un ítem no tiene una (un enlace web copiado trae `public.url`, no `public.file-url`), la copia no
-  es de archivos y sigue siendo texto. Mismo control de `changeCount` y de marcadores antes y
-  después de leer que con el texto.
-- **macOS, escritura.** Escribe un `NSURL` de archivo por ruta (`writeObjects`), lo mismo que pega
-  Finder. Las rutas deben ser UTF-8, como las de macOS.
-- **Windows, lectura.** Lee `CF_HDROP`: un encabezado `DROPFILES` y las rutas, cada una terminada
-  en NUL, con un NUL extra al final. Se decodifica a mano (`crates/clipboard/src/hdrop.rs`), sin
-  `DragQueryFileW`, para que el formato se pruebe en los tres SO. Las rutas ANSI (`fWide` = 0, de
-  apps muy viejas) solo se leen si son ASCII, porque el resto depende de la página de códigos del
-  sistema. La revisión de marcadores y la lectura pasan en la misma apertura del portapapeles.
-- **Windows, escritura.** Escribe `CF_HDROP` con rutas UTF-16 (`fWide` = 1) y `Preferred
-  DropEffect` = `DROPEFFECT_COPY`, así el Explorador pega una copia y nunca mueve los archivos fuera
-  de la caché. Las rutas con espacios y no ASCII van tal cual.
+- **The trait works with paths.** `read_files` returns the local paths of the copied files
+  (`Ok(None)` if there are none) and `write_files` puts local paths on the clipboard. Same rules as
+  text and images: 2 s at most, the daemon's own writes are reported and the sensitive marker
+  check is done on the same content that is read. They do not check the file
+  system: a path can be a folder or no longer exist, and `Offer::read` handles that.
+- **Which one wins if a copy carries several: files, then text, then image.** A file manager
+  also offers the paths as text, but what the person copied are the files. Between text and
+  image the rules of "Images" apply (plain text wins, except the browser's "Copy image").
+  `read_content` calls `read_files`, `read_text` and `read_image` in that order.
+- **Wayland, reading.** Reads `text/uri-list` (RFC 2483) from the same offer whose MIME list it checked.
+  Only `file://` URIs with an empty host, `localhost` or this machine's name count, and the
+  `%XX` sequences are decoded. If a single URI is of another kind (a copied web link), the copy is not
+  files and stays text. Lines that start with `#` are comments. A badly
+  encoded URI, or one with a NUL, a query or a fragment, does not count either.
+- **Wayland, writing.** Offers the same paths in three ways: `text/uri-list`,
+  `x-special/gnome-copied-files` (`copy` and one URI per line, which is what GNOME Files reads) and plain text
+  with one path per line, as GNOME Files does when copying, so pasting into a terminal or an editor
+  gives the paths. The URIs encode with `%XX` everything that is not a letter, digit, `/`, `-`, `.`, `_` or
+  `~`, so spaces and non-ASCII characters give the same path on a round trip.
+- **When copying files here:** `Offer::read` checks and hashes each file off the
+  async thread (it skips folders and files over the limit with a warning), the daemon builds the files
+  clip and sends it with `broadcast_files`. `inline_max_bytes` does not apply to files.
+- **When receiving a files clip:** the cache (`FileCache`) is opened at startup. The download is a
+  future that the main loop handles along with everything else, so a large download does not hold back
+  clips or local copies. There is at most one: any newer clip (received with
+  `Apply`, or a local copy that is sent) drops it, and that cancels it (see "Canceling means dropping the
+  download"). When it finishes, it is still the newest one by construction, and the daemon writes the
+  cache paths with `write_files`. It is not a separate tokio task because it would have to share
+  the `Node`, and canceling it and waiting for it to release the node on shutdown is more code.
+- **Anti-echo.** Writing the cache paths fires a local event. The daemon reads them, and
+  `Offer::read` computes the same list hash as the received clip: the hash depends only on the name,
+  size and hash of each file, not on where they are. The engine returns `Unchanged` and nothing is resent.
+  It costs reading the files again (about 17 ms per 100 MB).
+- **macOS, reading.** Finder puts one item per file on the pasteboard, each with a
+  `public.file-url` (`NSPasteboardTypeFileURL`). The one from each item is read and `NSURL` turns it into a path;
+  that way reference URLs (`file:///.file/id=...`, which name the file
+  by id) also resolve to the file's current path. Only `file:` URLs without a host or with `localhost` count. If
+  an item does not have one (a copied web link carries `public.url`, not `public.file-url`), the copy is not
+  files and stays text. Same `changeCount` and marker check before and
+  after reading as with text.
+- **macOS, writing.** Writes one file `NSURL` per path (`writeObjects`), the same thing Finder
+  pastes. Paths must be UTF-8, like macOS paths.
+- **Windows, reading.** Reads `CF_HDROP`: a `DROPFILES` header and the paths, each one terminated
+  by NUL, with an extra NUL at the end. It is decoded by hand (`crates/clipboard/src/hdrop.rs`), without
+  `DragQueryFileW`, so the format is tested on all three OSes. ANSI paths (`fWide` = 0, from
+  very old apps) are only read if they are ASCII, because the rest depends on the system
+  code page. The marker check and the read happen in the same clipboard open.
+- **Windows, writing.** Writes `CF_HDROP` with UTF-16 paths (`fWide` = 1) and `Preferred
+  DropEffect` = `DROPEFFECT_COPY`, so Explorer pastes a copy and never moves the files out
+  of the cache. Paths with spaces and non-ASCII characters go as is.
 
-## Ciclo de vida del daemon
+## Daemon lifecycle
 
-- `clipbroad service install|uninstall|status` instala el arranque al iniciar sesión con el mecanismo
-  de cada SO. El servicio corre la ruta absoluta del ejecutable actual con `run` (y `--config` solo
-  si se pasó a `install`), así que mover el binario requiere volver a instalar. `install` es
-  idempotente: reescribe la definición y reinicia el daemon.
-- Linux: unidad de usuario de systemd en `~/.config/systemd/user/clipbroad.service`, ligada a
-  `graphical-session.target` (`WantedBy`, `After`, `PartOf`) y con `Restart=on-failure` cada 5 s. Los
-  logs van a journald. Necesita que la sesión importe `WAYLAND_DISPLAY` al gestor de usuario de
-  systemd y active `graphical-session.target` (uwsm lo hace); `install` avisa si falta alguno.
-- macOS: LaunchAgent en `~/Library/LaunchAgents/` (dominio `gui/<uid>`), con `KeepAlive` solo ante
-  fallos. Los logs van a `~/Library/Logs/clipbroad.log`, que crece sin rotación.
-- Windows: valor `clipbroad` en `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` en vez de una
-  tarea programada: no pide permisos de administrador (`schtasks /sc onlogon` sí) y no hereda los
-  valores por defecto de las tareas (se detienen con batería y a los 3 días). A cambio, nada lo
-  reinicia si se cae. Se lanza con `conhost.exe --headless` para que no abra una ventana de consola;
-  por eso sus logs no quedan en ningún lado. `install` y `uninstall` detienen cualquier otro
-  `clipbroad.exe` que esté corriendo.
-- Configuración en TOML en el directorio de configuración de cada SO; identidad (`SecretKey`) en un
-  archivo aparte con permisos restringidos. Ejemplo comentado con todas las opciones y rutas:
+- `clipbroad service install|uninstall|status` installs start at login with each OS's
+  mechanism. The service runs the absolute path of the current executable with `run` (and `--config` only
+  if it was passed to `install`), so moving the binary requires installing again. `install` is
+  idempotent: it rewrites the definition and restarts the daemon.
+- Linux: systemd user unit at `~/.config/systemd/user/clipbroad.service`, bound to
+  `graphical-session.target` (`WantedBy`, `After`, `PartOf`) and with `Restart=on-failure` every 5 s. The
+  logs go to journald. It needs the session to import `WAYLAND_DISPLAY` into the systemd user manager
+  and to activate `graphical-session.target` (uwsm does this); `install` warns if either one is missing.
+- macOS: LaunchAgent in `~/Library/LaunchAgents/` (domain `gui/<uid>`), with `KeepAlive` only on
+  failures. The logs go to `~/Library/Logs/clipbroad.log`, which grows without rotation.
+- Windows: `clipbroad` value in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` instead of a
+  scheduled task: it does not ask for administrator permissions (`schtasks /sc onlogon` does) and does not inherit the
+  task defaults (they stop on battery and after 3 days). In exchange, nothing
+  restarts it if it crashes. It is launched with `conhost.exe --headless` so it does not open a console window;
+  because of that its logs do not end up anywhere. `install` and `uninstall` stop any other
+  `clipbroad.exe` that is running.
+- TOML configuration in each OS's configuration directory; identity (`SecretKey`) in a
+  separate file with restricted permissions. Commented example with all the options and paths:
   [`config.example.toml`](config.example.toml).
-- Crate propio `clipbroad-config`: lo usan el daemon, `net` (peers e identidad) y el emparejamiento,
-  que escribe en esta configuración.
-- Identidad: los 32 bytes crudos de la clave Ed25519 (`iroh::SecretKey::from_bytes` los convierte).
-  Se genera la primera vez. En Unix el archivo se crea con permisos `0600` y se rechaza si otros
-  usuarios pueden leerlo; en Windows hereda los permisos de `%LOCALAPPDATA%` (solo el usuario,
-  administradores y SYSTEM).
-- En Windows se usa `%LOCALAPPDATA%` (no la carpeta *roaming*): la identidad y la lista de peers son de
-  una máquina y no deben copiarse a otra con el perfil itinerante.
-- Las rutas se calculan con la biblioteca estándar en vez del crate `directories`, porque este depende
-  de `option-ext` (MPL-2.0), que la política de licencias de `cargo deny` no permite.
+- Dedicated crate `clipbroad-config`, used by the daemon, `net` (peers and identity) and pairing,
+  which writes to this configuration.
+- Identity: the raw 32 bytes of the Ed25519 key (`iroh::SecretKey::from_bytes` converts them).
+  It is generated the first time. On Unix the file is created with `0600` permissions and rejected if other
+  users can read it; on Windows it inherits the permissions of `%LOCALAPPDATA%` (only the user,
+  administrators and SYSTEM).
+- On Windows `%LOCALAPPDATA%` is used (not the *roaming* folder): the identity and the peer list belong to
+  one machine and must not be copied to another with the roaming profile.
+- Paths are computed with the standard library instead of the `directories` crate, because that crate depends
+  on `option-ext` (MPL-2.0), which the `cargo deny` license policy does not allow.
 
-## Distribución
+## Distribution
 
-- Cada tag `v*` publica un GitHub Release con los 3 binarios (`.tar.gz` / `.zip`) y `SHA256SUMS`. El
-  proceso está en [`RELEASE.md`](RELEASE.md).
-- Workflow propio en vez de `cargo-dist`: alcanza con 3 archivos y checksums, y un workflow corto escrito
-  a mano es más fácil de mantener que uno generado. Se revisa si hacen falta instaladores o Homebrew.
-- La versión vive en `[workspace.package]`; el workflow falla si el tag no coincide con
+- Each `v*` tag publishes a GitHub Release with the 3 binaries (`.tar.gz` / `.zip`) and `SHA256SUMS`. The
+  process is in [`RELEASE.md`](RELEASE.md).
+- A custom workflow instead of `cargo-dist`: 3 archives and checksums are enough, and a short hand-written
+  workflow is easier to maintain than a generated one. It will be reviewed if installers or Homebrew are needed.
+- The version lives in `[workspace.package]`; the workflow fails if the tag does not match
   `clipbroad --version`.
-- macOS: sin firma ni notarización por ahora (requiere cuenta de Apple Developer).
+- macOS: no signing or notarization for now (that requires an Apple Developer account).
 
-## Fases
+## Phases
 
-| Fase | Contenido | Lista cuando… |
+| Phase | Content | Done when |
 |---|---|---|
-| 0 | Workspace, CI en 3 SO, AGENTS.md, este documento | El CI está verde en los 3 SO |
-| 1 | Backends de portapapeles (texto) + `clipbroad watch` que imprime los cambios + spike de privacidad en macOS | Imprime lo copiado en cada SO; el comportamiento en macOS está documentado aquí |
-| 2 | Red P2P, emparejamiento, sincronización de texto con anti-eco | Copiar en una máquina y pegar en las otras dos |
-| 3 | Filtro de sensibles, servicio de arranque, `clipbroad status` | Un día de uso real sin problemas |
-| 4 | Imágenes, luego archivos | Captura de pantalla en una máquina, pegar en otra; archivo de 100 MB |
-| 5 | Icono en bandeja, historial (opcional) | — |
+| 0 | Workspace, CI on 3 OSes, AGENTS.md, this document | CI is green on the 3 OSes |
+| 1 | Clipboard backends (text) + `clipbroad watch` that prints the changes + macOS privacy spike | It prints what was copied on each OS; the macOS behavior is documented here |
+| 2 | P2P network, pairing, text sync with anti-echo | Copy on one machine and paste on the other two |
+| 3 | Sensitive content filter, startup service, `clipbroad status` | One day of real use without problems |
+| 4 | Images, then files | Screenshot on one machine, paste on another; 100 MB file |
+| 5 | Tray icon, history (optional) | n/a |
 
-## Estrategia de pruebas
+## Testing strategy
 
-- La lógica (protocolo, anti-eco, filtros) se prueba con el portapapeles falso en memoria.
-- Tests de integración que levantan 2–3 nodos en el mismo proceso y verifican la propagación.
-- El CI corre en Linux, macOS y Windows; es la única forma de validar macOS/Windows desde la devbox.
-- Lo que depende del SO real (eventos del portapapeles, permisos de macOS) se valida con una lista de
-  pruebas manuales por plataforma, que se mantiene en `docs/` a partir de la fase 1.
+- The logic (protocol, anti-echo, filters) is tested with the in-memory fake clipboard.
+- Integration tests that start 2-3 nodes in the same process and verify propagation.
+- CI runs on Linux, macOS and Windows; it is the only way to validate macOS/Windows from the devbox.
+- What depends on the real OS (clipboard events, macOS permissions) is validated with a list of
+  manual tests per platform, kept in `docs/` starting with phase 1.

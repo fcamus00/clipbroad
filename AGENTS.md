@@ -1,86 +1,86 @@
 # AGENTS.md
 
-Instrucciones para agentes de código que trabajan en este repo. `CLAUDE.md` solo importa este archivo;
-editar siempre aquí.
+Instructions for coding agents working in this repo. `CLAUDE.md` only imports this file;
+always edit here.
 
-## Proyecto
+## Project
 
-`clipbroad` sincroniza el portapapeles entre las máquinas propias (Linux/Hyprland, macOS, Windows) con
-un daemon P2P en Rust, sin servidor. **Leer `docs/DESIGN.md` antes de cualquier cambio no trivial**: ahí
-están las decisiones de arquitectura, el plan por fases y los riesgos conocidos.
+`clipbroad` syncs the clipboard across the owner's machines (Linux/Hyprland, macOS, Windows) with
+a P2P daemon in Rust, without a server. **Read `docs/DESIGN.md` before any non-trivial change**: it
+holds the architecture decisions, the phased plan and the known risks.
 
-El dueño del proyecto supervisa por resultados y no lee Rust en detalle. Por eso:
-- Cada cambio debe dejar evidencia verificable: tests nuevos, salida de comandos, o pasos de prueba
-  manual explícitos.
-- Explicar en el PR **qué** cambió y **cómo se verificó**, en lenguaje simple.
-- Si algo no se pudo verificar (por ejemplo, comportamiento real en macOS o Windows), decirlo
-  explícitamente.
+The project owner supervises by results and does not read Rust in detail. Because of that:
+- Every change must leave verifiable evidence: new tests, command output, or explicit manual test
+  steps.
+- Explain in the PR **what** changed and **how it was verified**, in plain language.
+- If something could not be verified (for example, real behavior on macOS or Windows), say so
+  explicitly.
 
-## Estructura
+## Structure
 
 ```
-crates/core       # tipos de contenido, protocolo, anti-eco, filtros. Sin código de SO.
-crates/clipboard  # trait Clipboard + backends por SO + fake en memoria para tests
-crates/net        # transporte iroh, emparejamiento, broadcast
-crates/config     # config TOML, identidad (clave secreta) y rutas por SO
-crates/daemon     # binario `clipbroad` (CLI + orquestación)
-docs/DESIGN.md    # decisiones y plan
+crates/core       # content types, protocol, anti-echo, filters. No OS code.
+crates/clipboard  # Clipboard trait + per-OS backends + in-memory fake for tests
+crates/net        # iroh transport, pairing, broadcast
+crates/config     # TOML config, identity (secret key) and per-OS paths
+crates/daemon     # `clipbroad` binary (CLI + orchestration)
+docs/DESIGN.md    # decisions and plan
 ```
 
-Reglas de capas: `core` no depende de nada del SO ni de la red. Todo lo que toca el SO vive en
-`clipboard` detrás de `#[cfg(target_os = ...)]`. `daemon` solo une piezas.
+Layer rules: `core` depends on nothing from the OS or the network. Everything that touches the OS lives in
+`clipboard` behind `#[cfg(target_os = ...)]`. `daemon` only joins the pieces.
 
-## Comandos
+## Commands
 
-Las herramientas se instalan con `mise install` (ver `mise.toml`).
+Install the tools with `mise install` (see `mise.toml`).
 
 ```sh
-cargo fmt --all                                         # formatear
+cargo fmt --all                                         # format
 cargo clippy --workspace --all-targets -- -D warnings   # lints (warnings = error)
 cargo nextest run --workspace --no-tests=pass           # tests
-cargo test --workspace --doc                            # doctests (nextest no los corre)
-cargo deny check                                        # advisories, licencias, fuentes
-cargo machete                                           # dependencias sin usar
-cargo run -p clipbroad -- --help                        # correr el binario
+cargo test --workspace --doc                            # doctests (nextest does not run them)
+cargo deny check                                        # advisories, licenses, sources
+cargo machete                                           # unused dependencies
+cargo run -p clipbroad -- --help                        # run the binary
 ```
 
-**Antes de dar una tarea por terminada, todos estos comandos deben pasar.** El CI corre lo mismo en
-Linux, macOS y Windows.
+**Before calling a task done, all of these commands must pass.** CI runs the same on
+Linux, macOS and Windows.
 
-## Convenciones de código
+## Code conventions
 
-- Código, identificadores, comentarios, mensajes de commit y PRs: **en inglés**. Documentación en `docs/`:
-  en español.
-- Edición 2024. Lints del workspace en `Cargo.toml` (`clippy::pedantic`, `unwrap_used`, `panic`,
-  `unsafe_code = "deny"`). No silenciar lints con `#[allow]` sin un comentario que explique por qué.
-- Errores: `thiserror` en los crates de librería, `anyhow` en `daemon`. Sin `unwrap()` fuera de tests;
-  `expect()` solo para invariantes que indican un bug, con mensaje que diga cuál.
-- Async con `tokio`. Logging con `tracing`. Nada de `println!` para diagnóstico.
-- `unsafe`: solo si una API del SO no tiene binding seguro, con `#[allow(unsafe_code)]` local y un
-  comentario `// SAFETY:` que justifique cada bloque.
-- Código de plataforma siempre detrás del trait `Clipboard`; la lógica se prueba con el fake.
+- Everything is **in English**: code, identifiers, comments, commit messages, PRs and the documentation
+  in `docs/`.
+- Edition 2024. Workspace lints in `Cargo.toml` (`clippy::pedantic`, `unwrap_used`, `panic`,
+  `unsafe_code = "deny"`). Do not silence lints with `#[allow]` without a comment that explains why.
+- Errors: `thiserror` in the library crates, `anyhow` in `daemon`. No `unwrap()` outside tests;
+  `expect()` only for invariants that indicate a bug, with a message that says which one.
+- Async with `tokio`. Logging with `tracing`. No `println!` for diagnostics.
+- `unsafe`: only if an OS API has no safe binding, with a local `#[allow(unsafe_code)]` and a
+  `// SAFETY:` comment that justifies each block.
+- Platform code always behind the `Clipboard` trait; test the logic with the fake.
 
-## Dependencias
+## Dependencies
 
-- Antes de agregar un crate: verificar la versión actual (`cargo info <crate>`), que esté mantenido y
-  que su licencia pase `cargo deny check`. Justificar la dependencia en el PR.
-- Versiones compartidas en `[workspace.dependencies]`; los crates las heredan con `.workspace = true`.
-- Preferir los crates ya decididos en `docs/DESIGN.md` (iroh, wl-clipboard-rs, arboard, ...).
+- Before adding a crate: check the current version (`cargo info <crate>`), that it is maintained and
+  that its license passes `cargo deny check`. Justify the dependency in the PR.
+- Shared versions go in `[workspace.dependencies]`; crates inherit them with `.workspace = true`.
+- Prefer the crates already chosen in `docs/DESIGN.md` (iroh, wl-clipboard-rs, arboard, ...).
 
-## Guía de Rust
+## Rust guide
 
-La skill `rust-skills` (`.claude/skills/rust-skills/SKILL.md`, reglas en `rules/`) tiene buenas
-prácticas de Rust. Agentes sin soporte de skills pueden leer los archivos directamente. Prioridades:
-1. Corrección y claridad primero: ownership, manejo de errores, async, API.
-2. Las reglas de rendimiento y memoria (`mem-*`, `opt-*`, `perf-*`: SmallVec, arenas, etc.) **solo** en
-   código caliente y medido. No agregar dependencias por sugerencia de esas reglas sin justificarlo.
+The `rust-skills` skill (`.claude/skills/rust-skills/SKILL.md`, rules in `rules/`) has good
+Rust practices. Agents without skill support can read the files directly. Priorities:
+1. Correctness and clarity first: ownership, error handling, async, API.
+2. The performance and memory rules (`mem-*`, `opt-*`, `perf-*`: SmallVec, arenas, etc.) **only** in
+   hot, measured code. Do not add dependencies because those rules suggest it without justifying it.
 
-Referencia para revisiones más profundas: [Microsoft Pragmatic Rust Guidelines](https://microsoft.github.io/rust-guidelines).
+Reference for deeper reviews: [Microsoft Pragmatic Rust Guidelines](https://microsoft.github.io/rust-guidelines).
 
-## Flujo de trabajo
+## Workflow
 
-- Una rama y un PR por unidad de trabajo, idealmente una fase o subfase de `docs/DESIGN.md`.
-- Commits con [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, ...).
-- El PR se mergea solo con el CI verde en los tres SO.
-- Si una decisión de diseño cambia, actualizar `docs/DESIGN.md` en el mismo PR.
-- No hacer push a `main` directamente.
+- One branch and one PR per unit of work, ideally a phase or sub-phase of `docs/DESIGN.md`.
+- Commits with [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, ...).
+- A PR is merged only with green CI on all three OSes.
+- If a design decision changes, update `docs/DESIGN.md` in the same PR.
+- Do not push to `main` directly.
