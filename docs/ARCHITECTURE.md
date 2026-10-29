@@ -662,10 +662,13 @@ Code in `crates/clipboard` (`read_files`, `write_files`) and `crates/daemon/src/
   process is in [`RELEASE.md`](RELEASE.md).
 - A custom workflow instead of `cargo-dist`: 3 archives and checksums are enough, and a short hand-written
   workflow is easier to maintain than a generated one.
-- Package managers instead of our own installers: Homebrew (macOS), Scoop (Windows) and AUR
-  (Arch). Each one installs to a path that survives upgrades, so the login service does not break, and
-  none of them sets the macOS quarantine flag. The `publish` job in `release.yml` updates them on
-  each stable release.
+- Package managers instead of our own installers: Homebrew (macOS) and Scoop (Windows). Each one
+  installs to a path that survives upgrades, so the login service does not break, and Homebrew does not
+  set the macOS quarantine flag. The `publish` job in `release.yml` updates them on each stable release.
+- Linux gets an install script (`packaging/install.sh`, attached to every release) instead of a
+  package manager. The AUR stopped accepting new accounts (2026-10), and distro repositories (APT, RPM)
+  would mean hosting and signing our own. The script works on any distro and always installs to
+  `~/.local/bin`, so the service path survives upgrades.
 - Homebrew only on macOS: on Linux, `current_exe` resolves Homebrew's symlink into the versioned
   folder, which `brew upgrade` deletes, and the service would point to a binary that no longer exists.
 - Scoop without a *shim*: the manifest adds the app folder to `PATH`. The shim is also called

@@ -70,11 +70,14 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           pattern: dist-*
           path: dist
           merge-multiple: true
+      # Attached to every release, so releases/latest/download/install.sh is the latest stable one.
+      - run: cp packaging/install.sh dist/
       - name: Checksums
         working-directory: dist
         run: |
@@ -90,7 +93,7 @@ jobs:
           if [[ "$TAG" == *-* ]]; then prerelease=(--prerelease); fi
           gh release create "$TAG" dist/* --verify-tag --generate-notes "${prerelease[@]}"
 
-  # Updates the Homebrew tap, the Scoop bucket and the AUR package. Pre-releases stay on GitHub only.
+  # Updates the Homebrew tap and the Scoop bucket. Pre-releases stay on GitHub only.
   publish:
     name: publish (${{ matrix.target }})
     needs: release
@@ -107,10 +110,6 @@ jobs:
             repo: git@github.com:fcamus00/scoop-bucket.git
             branch: main
             key: SCOOP_BUCKET_SSH_KEY
-          - target: aur
-            repo: ssh://aur@aur.archlinux.org/clipbroad-bin.git
-            branch: master
-            key: AUR_SSH_KEY
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

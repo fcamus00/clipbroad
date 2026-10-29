@@ -11,14 +11,15 @@ LAN or Tailscale; no server, no third-party services.
 |---|---|
 | macOS (Apple Silicon) | `brew install fcamus00/tap/clipbroad` |
 | Windows | `scoop bucket add fcamus00 https://github.com/fcamus00/scoop-bucket` then `scoop install fcamus00/clipbroad` |
-| Arch Linux | `yay -S clipbroad-bin` (or any AUR helper) |
+| Linux (x86_64) | `curl -fsSL https://github.com/fcamus00/clipbroad/releases/latest/download/install.sh \| sh` |
+
+On Linux, the script checks the archive against `SHA256SUMS` and installs the binary to
+`~/.local/bin`. Run the same command again to upgrade.
 
 Then run `clipbroad service install` to start the daemon at every login (see
 [Start at login](#start-at-login)). After an upgrade, run it again to restart the daemon on the new
 version. On Windows, Scoop cannot replace the binary while the daemon runs: run
 `clipbroad service uninstall` before `scoop update clipbroad`, and `clipbroad service install` after.
-
-On other Linux distributions, download a release.
 
 ## Download a release
 

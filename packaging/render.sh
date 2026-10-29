@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Fills the package manager templates for a release, one folder per target repo:
-# <out-dir>/homebrew-tap, <out-dir>/scoop-bucket and <out-dir>/aur.
+# <out-dir>/homebrew-tap and <out-dir>/scoop-bucket.
 # Usage: packaging/render.sh <version> <SHA256SUMS> <out-dir>
 set -euo pipefail
 
 version=$1 sums=$2 out=$3
 here=$(dirname "$0")
 
-# Stable versions only: pacman versions cannot contain '-'.
+# Stable versions only: pre-releases stay on GitHub.
 if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "version must look like 1.2.3, got '$version'" >&2
   exit 1
@@ -27,4 +27,3 @@ render() { # <template-dir> <platform>
 
 render homebrew-tap macos-aarch64
 render scoop-bucket windows-x86_64
-render aur linux-x86_64
