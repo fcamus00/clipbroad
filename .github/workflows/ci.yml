@@ -91,11 +91,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: packaging/windows/test.ps1 (Get-Item clipbroad-*-setup.exe).FullName
-      # The service hides the daemon's output: run it in the foreground to see why it stopped.
-      - name: Daemon output
+      # The installer logs, the user PATH, and the daemon's output, which the service hides.
+      - name: Installer diagnostics
         if: failure() && runner.os == 'Windows'
         shell: pwsh
         run: |
+          Get-ChildItem $env:TEMP -Filter clipbroad-setup-*.log | ForEach-Object { "--- $($_.Name)"; Get-Content $_ }
+          "--- user PATH"
+          [Environment]::GetEnvironmentVariable('Path', 'User') -split ';'
+          "--- daemon"
           Get-Process clipbroad, conhost -ErrorAction SilentlyContinue | Format-Table Id, ProcessName, StartTime
           Stop-Process -Name clipbroad -Force -ErrorAction SilentlyContinue
           $daemon = Start-Process target/release/clipbroad.exe 'run', '-v' -NoNewWindow -PassThru

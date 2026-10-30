@@ -15,9 +15,13 @@ function Check([bool]$ok, [string]$what) {
     if (-not $ok) { throw "FAILED: $what" }
     Write-Host "ok: $what"
 }
+$script:runs = 0
 function Invoke-Setup([string]$path) {
+    # Logs in %TEMP%\clipbroad-setup-<n>.log; CI prints them when a check fails.
+    $script:runs++
+    $log = "/LOG=$env:TEMP\clipbroad-setup-$script:runs.log"
     # WaitForExit instead of Start-Process -Wait, which would also wait for the daemon it starts.
-    $process = Start-Process $path $silent -PassThru
+    $process = Start-Process $path ($silent + $log) -PassThru
     $process.WaitForExit()
     Check ($process.ExitCode -eq 0) "$(Split-Path $path -Leaf) exits with 0"
 }
