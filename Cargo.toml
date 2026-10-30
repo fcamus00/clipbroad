@@ -32,10 +32,13 @@ tempfile = "3.27"
 thiserror = "2.0"
 tokio = "1.54"
 toml = "1.1"
+# Default features pull GTK and libappindicator on Linux; the daemon turns on `ksni` there instead.
+tray-icon = { version = "0.26.1", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "env-filter", "fmt"] }
 windows-sys = "0.61.2"
 wl-clipboard-rs = "0.9.5"
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

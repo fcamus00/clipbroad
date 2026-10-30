@@ -14,6 +14,11 @@ ignore = [
     # `paste` is archived, not vulnerable: a compile-time macro crate that iroh needs through
     # netwatch -> netdev -> netlink-packet-core, with no maintained alternative upstream yet.
     { id = "RUSTSEC-2024-0436", reason = "unmaintained, not vulnerable; required by iroh (netwatch)" },
+    # Not vulnerable: zbus 6 merged these crates into itself. ksni (the Linux tray icon) is still on
+    # zbus 5; its port to zbus 6 is an open pull request (iovxw/ksni#48). Drop these once it ships.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant merged into zbus 6; ksni still on zbus 5" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names merged into zbus 6; ksni still on zbus 5" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive merged into zbus 6; ksni still on zbus 5" },
 ]
 
 [licenses]
@@ -35,6 +40,12 @@ unused-allowed-license = "allow"
 [[licenses.exceptions]]
 crate = "webpki-roots"
 allow = ["CDLA-Permissive-2.0"]
+
+# ksni (the Linux tray icon, through tray-icon) is released under the Unlicense, a public domain
+# dedication with no conditions. Allowed for this crate only.
+[[licenses.exceptions]]
+crate = "ksni"
+allow = ["Unlicense"]
 
 [licenses.private]
 ignore = true
