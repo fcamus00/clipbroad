@@ -46,8 +46,8 @@ Start-Sleep 2
 Check (Test-Daemon) "daemon running after an upgrade"
 
 Invoke-Setup "$app\unins000.exe"
-# The uninstaller finishes in a copy of itself, so wait for the files to go.
-for ($i = 0; $i -lt 30 -and (Test-Path $exe); $i++) { Start-Sleep 1 }
+# The uninstaller finishes in a temporary copy of itself (_iu*.tmp), which cleans PATH last.
+for ($i = 0; $i -lt 30 -and (Get-Process '_iu*' -ErrorAction SilentlyContinue); $i++) { Start-Sleep 1 }
 Check (-not (Test-Path $exe)) "clipbroad.exe removed"
 Check (-not (Test-Daemon)) "daemon stopped"
 Check ($null -eq (Get-RunValue)) "login registry value removed"
