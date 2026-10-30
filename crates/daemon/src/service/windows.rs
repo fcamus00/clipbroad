@@ -20,9 +20,9 @@ use super::{Status, run_tool, succeeds};
 
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const VALUE_NAME: &str = "clipbroad";
-/// Win32 process creation flag: the new process does not share this terminal's console, so
-/// closing the terminal does not stop it.
-const DETACHED_PROCESS: u32 = 0x0000_0008;
+/// Win32 process creation flag: the new process gets its own console without a window, so it
+/// shows nothing and closing this terminal does not stop it.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub fn install(exe: &str, config: Option<&str>) -> Result<()> {
     let conhost = conhost_path();
@@ -39,15 +39,21 @@ pub fn install(exe: &str, config: Option<&str>) -> Result<()> {
         "/f",
     ]))?;
     stop_daemon()?;
-    // Start it now with the same command Windows runs at login.
-    Command::new(&conhost)
-        .raw_arg(&args)
-        .creation_flags(DETACHED_PROCESS)
+    // Start it now. Not through conhost: started from here, `conhost --headless` stays up but the
+    // daemon under it does not run (seen in CI, packaging/windows/test.ps1). A Run value cannot pass
+    // creation flags, so at login conhost is still the way to hide the console.
+    let mut daemon = Command::new(exe);
+    daemon.arg("run");
+    if let Some(config) = config {
+        daemon.args(["--config", config]);
+    }
+    daemon
+        .creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .with_context(|| format!("cannot start {conhost}"))?;
+        .with_context(|| format!("cannot start {exe}"))?;
     // Give it a moment to show up in `status`.
     thread::sleep(Duration::from_secs(1));
     Ok(())

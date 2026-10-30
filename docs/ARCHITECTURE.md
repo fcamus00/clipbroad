@@ -639,9 +639,11 @@ Code in `crates/clipboard` (`read_files`, `write_files`) and `crates/daemon/src/
 - Windows: `clipbroad` value in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` instead of a
   scheduled task: it does not ask for administrator permissions (`schtasks /sc onlogon` does) and does not inherit the
   task defaults (they stop on battery and after 3 days). In exchange, nothing
-  restarts it if it crashes. It is launched with `conhost.exe --headless` so it does not open a console window;
-  because of that its logs do not end up anywhere. `install` and `uninstall` stop any other
-  `clipbroad.exe` that is running.
+  restarts it if it crashes. At login it is launched with `conhost.exe --headless` so it does not open a
+  console window; because of that its logs do not end up anywhere. `install` starts it right away with
+  the `CREATE_NO_WINDOW` flag instead, because `conhost --headless` started from `install` stays up
+  without running the daemon (seen in CI). `install` and `uninstall` stop any other `clipbroad.exe`
+  that is running.
 - TOML configuration in each OS's configuration directory; identity (`SecretKey`) in a
   separate file with restricted permissions. Commented example with all the options and paths:
   [`config.example.toml`](config.example.toml).
