@@ -56,12 +56,17 @@ jobs:
           else
             tar -czf "$name.tar.gz" "$name"
           fi
+      - name: Installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: packaging/windows/build.ps1 target/release/clipbroad.exe $env:TAG
       - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.target }}
           path: |
             clipbroad-*.tar.gz
             clipbroad-*.zip
+            clipbroad-*-setup.exe
           if-no-files-found: error
 
   release:

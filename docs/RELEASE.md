@@ -28,8 +28,9 @@ A tag with a suffix (`v0.2.0-rc.1`) creates a **pre-release**. The binary versio
   checks that `clipbroad --version` matches the tag. If it does not match, it fails and publishes nothing.
 - Packages the binary with `README.md`, `LICENSE-APACHE` and `LICENSE-MIT` in a
   `clipbroad-<tag>-<platform>/` folder, as `.tar.gz` (Linux, macOS) or `.zip` (Windows).
-- **release**: collects the 3 archives and `packaging/install.sh`, writes `SHA256SUMS` and creates the
-  release with `gh release create` (notes generated from the merged PRs).
+- On Windows, also builds the installer `clipbroad-<tag>-windows-x86_64-setup.exe` (see below).
+- **release**: collects the 3 archives, the Windows installer and `packaging/install.sh`, writes
+  `SHA256SUMS` and creates the release with `gh release create` (notes generated from the merged PRs).
 - **publish**: only on tags without a suffix. Updates the package managers (see below).
 
 ## Package managers
@@ -41,8 +42,8 @@ A tag with a suffix (`v0.2.0-rc.1`) creates a **pre-release**. The binary versio
 
 The templates live in `packaging/`, with `@VERSION@` and `@SHA256@` in place of the version and the checksum.
 The `publish` job downloads the release's `SHA256SUMS`, fills the templates with `packaging/render.sh` and
-commits to each repo with its SSH key. The GitHub host key is pinned in `packaging/known_hosts`. If one target fails, the others continue; "Re-run failed jobs" retries it without
-duplicating commits.
+commits to each repo with its SSH key. The GitHub host key is pinned in `packaging/known_hosts`. If one
+target fails, the others continue; "Re-run failed jobs" retries it without duplicating commits.
 
 - Each key is a *deploy key* with write access to its repo. To rotate one: generate a new key, add the
   public key as a deploy key and store the private key with
@@ -58,6 +59,22 @@ curl -fsSL https://github.com/fcamus00/clipbroad/releases/latest/download/instal
 
 It checks the archive against `SHA256SUMS` and puts the binary in `~/.local/bin`.
 `CLIPBROAD_VERSION=v0.2.0-rc.1` installs a specific tag, pre-releases included.
+
+## Windows installer
+
+`packaging/windows/clipbroad.iss` is an [Inno Setup](https://jrsoftware.org/isinfo.php) script, and
+`packaging/windows/build.ps1` builds it (it installs Inno Setup with Chocolatey if it is missing). The
+installer installs per user, without admin rights, to `%LOCALAPPDATA%\Programs\clipbroad` and adds that
+folder to the user's `PATH`. The "Start clipbroad at login" option runs `clipbroad service install`.
+Before replacing the files, the installer runs `clipbroad service uninstall` to stop the daemon, and
+the uninstaller runs it too.
+
+The CI `build` job on Windows builds the installer and runs `packaging/windows/test.ps1`: it installs,
+reinstalls over the running daemon, uninstalls, and checks files, `PATH`, the login registry value and
+the daemon after each step. Do not run that test on your own machine: it installs and removes clipbroad
+for the current user.
+
+The installer is not signed, so SmartScreen warns on the first run.
 
 `packaging/check.sh` fills the templates with fake checksums, checks that the formula and the manifest
 parse (with `ruby` and `jq`, skipping the ones that are missing), and runs `install.sh` against a fake

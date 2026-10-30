@@ -658,13 +658,18 @@ Code in `crates/clipboard` (`read_files`, `write_files`) and `crates/daemon/src/
 
 ## Distribution
 
-- Each `v*` tag publishes a GitHub Release with the 3 binaries (`.tar.gz` / `.zip`) and `SHA256SUMS`. The
-  process is in [`RELEASE.md`](RELEASE.md).
+- Each `v*` tag publishes a GitHub Release with the 3 binaries (`.tar.gz` / `.zip`), a Windows
+  installer, `install.sh` and `SHA256SUMS`. The process is in [`RELEASE.md`](RELEASE.md).
 - A custom workflow instead of `cargo-dist`: 3 archives and checksums are enough, and a short hand-written
   workflow is easier to maintain than a generated one.
-- Package managers instead of our own installers: Homebrew (macOS) and Scoop (Windows). Each one
+- Package managers: Homebrew (macOS) and Scoop (Windows). Each one
   installs to a path that survives upgrades, so the login service does not break, and Homebrew does not
   set the macOS quarantine flag. The `publish` job in `release.yml` updates them on each stable release.
+- Windows also gets an Inno Setup installer (`packaging/windows/`), because most Windows users do not
+  use Scoop. It installs per user to a fixed folder, so it needs no admin rights and the service path
+  survives upgrades. It drives login startup through `clipbroad service install` / `uninstall` instead
+  of writing the registry itself, so the service logic stays in one place. Inno Setup over WiX (MSI):
+  one short script, and it builds on the CI runner without extra tooling.
 - Linux gets an install script (`packaging/install.sh`, attached to every release) instead of a
   package manager. The AUR stopped accepting new accounts (2026-10), and distro repositories (APT, RPM)
   would mean hosting and signing our own. The script works on any distro and always installs to

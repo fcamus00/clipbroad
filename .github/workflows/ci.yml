@@ -83,6 +83,14 @@ jobs:
       - name: Smoke test
         shell: bash
         run: target/release/${{ matrix.exe }} --version
+      - name: Build installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: packaging/windows/build.ps1 target/release/clipbroad.exe
+      - name: Test installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: packaging/windows/test.ps1 (Get-Item clipbroad-*-setup.exe).FullName
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
