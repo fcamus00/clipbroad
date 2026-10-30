@@ -91,6 +91,16 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: packaging/windows/test.ps1 (Get-Item clipbroad-*-setup.exe).FullName
+      # The service hides the daemon's output: run it in the foreground to see why it stopped.
+      - name: Daemon output
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-Process clipbroad, conhost -ErrorAction SilentlyContinue | Format-Table Id, ProcessName, StartTime
+          Stop-Process -Name clipbroad -Force -ErrorAction SilentlyContinue
+          $daemon = Start-Process target/release/clipbroad.exe 'run', '-v' -NoNewWindow -PassThru
+          Start-Sleep 5
+          if ($daemon.HasExited) { "exited with $($daemon.ExitCode)" } else { 'still running after 5 s'; Stop-Process $daemon }
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}

@@ -1,5 +1,6 @@
-# Smoke test for the Windows installer: installs, reinstalls over the running daemon (an upgrade)
-# and uninstalls, checking files, PATH, the login registry value and the daemon after each step.
+# Smoke test for the Windows installer: installs, starts the daemon the way Windows does at login,
+# reinstalls over the running daemon (an upgrade) and uninstalls. After each step it checks the files,
+# PATH, the login registry value and the daemon.
 # It changes the current user's setup, so CI runs it on a throwaway windows-latest runner.
 # Usage: packaging/windows/test.ps1 <path to setup.exe>
 param([Parameter(Mandatory)][string]$Setup)
@@ -31,6 +32,13 @@ Check ((Get-AppPathEntry).Count -eq 1) "install folder in the user PATH"
 Check ((Get-RunValue) -like "*`"$exe`" run*") "login registry value runs the installed exe"
 Start-Sleep 2
 Check (Test-Daemon) "daemon running"
+
+# At login, Windows runs the Run value's command without a parent console. Start-Process does the same.
+Stop-Process -Name clipbroad -Force
+Check ((Get-RunValue) -match '^"([^"]+)" (.+)$') "login registry value is a quoted program and its arguments"
+Start-Process $Matches[1] $Matches[2]
+Start-Sleep 2
+Check (Test-Daemon) "daemon running from the login registry value"
 
 Invoke-Setup $Setup
 Check ((Get-AppPathEntry).Count -eq 1) "PATH entry not duplicated after an upgrade"
