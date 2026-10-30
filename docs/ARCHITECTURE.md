@@ -223,7 +223,7 @@ sent to everyone (see "Files" and "Images" for which one wins if a copy carries 
 is written to the clipboard if the engine returns `Apply` (files, after downloading them;
 see "Files on the clipboard"). An error while reading, writing or processing a clip is logged and
 the daemon continues; only a failure at startup or in the clipboard watcher stops it. It shuts down with
-Ctrl+C or SIGTERM.
+Ctrl+C, SIGTERM or the tray icon's "Quit" (see "Tray icon").
 
 - The logs show the node id at startup, the connections and each clip sent or received with its
   size and the first 8 characters of the hash, never the content. `run` logs at info level by
@@ -701,6 +701,82 @@ Code in `crates/clipboard` (`read_files`, `write_files`) and `crates/daemon/src/
 - Paths are computed with the standard library instead of the `directories` crate, because that crate depends
   on `option-ext` (MPL-2.0), which the `cargo deny` license policy does not allow.
 
+## Tray icon
+
+**Status: proposal.** The owner approves the technology and tests the prototype on macOS and
+Windows before this is final.
+
+The same icon with the same menu on the 3 OSes: the notification area on Windows, the menu bar on
+macOS, and a StatusNotifierItem on Linux (waybar, swaybar and quickshell on Hyprland/Sway, the panel
+on KDE). GNOME is out of scope, as for the clipboard.
+
+**Technology: `tray-icon` 0.26 + `muda` 0.21** (the Tauri team, MIT or Apache-2.0), with default
+features off and the `ksni` feature on Linux. Compared in October 2026:
+
+| | `tray-icon` + `ksni` (chosen) | `tray-icon` default | Hand-written per OS |
+|---|---|---|---|
+| Linux backend | `ksni`: D-Bus StatusNotifierItem in Rust | GTK3 + libappindicator | `ksni` |
+| Crates added (Linux / macOS / Windows) | 49 / 15 / 6 | 61 / 15 / 6 | 23 / 0 / 0 |
+| System libraries on Linux | none (a session bus at run time) | `gtk3` and `libayatana-appindicator3`, to build and to run | none |
+| `cargo deny` | passes, with the 2 exceptions below | fails: `option-ext` is MPL-2.0, `proc-macro-error` is unmaintained | passes, with the same exceptions |
+| `unsafe` in clipbroad | 4 blocks (Windows message loop) | same | the whole Win32 icon and menu (window class, `Shell_NotifyIconW`, popup menu) and objc2 action targets |
+| Menu code | one `muda` menu for the 3 OSes | same | three menus |
+
+- `tray-icon` default is out: it fails the license policy and needs GTK on every Linux machine.
+- Hand-written adds the fewest crates, but each item of the real menu (status lines, pairing, pause) would
+  be written three times, two of them in `unsafe` FFI. `tray-icon` already handles what a login start
+  needs on Windows: if Explorer is not up yet, it adds the icon when the taskbar appears
+  (`TaskbarCreated`), and again after Explorer restarts.
+- `tray-item` (the other maintained-looking option) has had no commit since April 2024 and uses
+  the deprecated `cocoa`/`objc` crates on macOS.
+- Cost: the Linux release binary grows from 18.8 MB to 22.9 MB, mostly zbus. `tray-icon` forces
+  `ksni`'s `async-io` executor, so the daemon has 2 more threads next to tokio.
+- `ksni` is Unlicense, allowed for that crate only in `deny.toml`. zbus 5 (through `ksni`) has 3
+  "unmaintained" advisories because zbus 6 merged those crates into itself; they are ignored until
+  `ksni` moves to zbus 6 (an open pull request upstream).
+
+**One process.** The icon lives inside `clipbroad run`, so the service managers keep starting a
+single process and the menu needs no IPC to reach the daemon. The main thread runs the GUI event
+loop (macOS requires the main thread) and the daemon runs on a second thread with its own tokio
+runtime (`crates/daemon/src/tray.rs`):
+- Linux: no loop. `tray-icon` serves the D-Bus item from its own thread and the main thread waits
+  for the daemon.
+- macOS: an `NSApplication` with the `Accessory` activation policy (no Dock icon), set at run time
+  because there is no bundle for `LSUIElement`. The main thread pumps its events by hand and checks
+  every 300 ms whether the daemon ended, because `NSApplication::run` can only be stopped from the
+  main thread.
+- Windows: a `GetMessageW` loop on the thread that owns the icon's hidden window. The daemon thread
+  ends it with `WM_QUIT`.
+
+"Quit" takes the same path as Ctrl+C: the node shuts down, the status file is removed and the exit
+code is 0, so `Restart=on-failure` and `KeepAlive` do not start it again. `run --fake` (tests) shows
+no icon.
+
+**Without a tray.** The daemon never stops because of the icon. On Linux it checks once at startup
+whether `org.kde.StatusNotifierWatcher` is on the session bus and warns if not (Hyprland without a
+bar); `ksni` registers the icon if a watcher appears later. Without a session bus, it warns and runs
+without an icon.
+
+**Start at login: unchanged.** `clipbroad service install` already starts `clipbroad run`, so the icon
+comes with it on the 3 OSes and the Windows installer needs no change. The systemd user manager has
+`DBUS_SESSION_BUS_ADDRESS`. The `LaunchAgent` loads into `gui/<uid>`, the Aqua session that can
+reach the window server, so its plist needs no `LimitLoadToSessionType`. On Windows the icon has to
+work under `conhost.exe --headless` (login) and with `CREATE_NO_WINDOW` (`service install`).
+
+**macOS without an app bundle.** Notifications through `UNUserNotificationCenter` need a bundle
+identifier; an unbundled binary gets an exception instead (Apple's requirement, not tried on a Mac
+yet). So the real menu gives feedback in the menu itself (for example, an item's text) and not with
+notifications. A signed `.app` (an Apple Developer
+account) is only needed if that is not enough.
+
+**Known limits.**
+- Windows: `service install` and `uninstall` stop the old daemon with `taskkill /f`, which leaves its
+  icon in the notification area until the mouse goes over it.
+- Linux: a left click sends `Activate`, which does nothing yet; hosts open the menu on a right
+  click. `tray-icon` does not expose `ksni`'s option to open the menu on a left click.
+- Linux: on exit, zbus sometimes logs a `NameLost` warning while the icon's D-Bus connection closes.
+  It is harmless (the exit code is still 0) but shows up in the log.
+
 ## Distribution
 
 - Each `v*` tag publishes a GitHub Release with the 3 binaries (`.tar.gz` / `.zip`), a Windows
@@ -736,7 +812,7 @@ Code in `crates/clipboard` (`read_files`, `write_files`) and `crates/daemon/src/
 | 2 | P2P network, pairing, text sync with anti-echo | Copy on one machine and paste on the other two |
 | 3 | Sensitive content filter, startup service, `clipbroad status` | One day of real use without problems |
 | 4 | Images, then files | Screenshot on one machine, paste on another; 100 MB file |
-| 5 | Tray icon, history (optional) | n/a |
+| 5 | Tray icon (same menu on the 3 OSes), history (optional) | Pair and pause from the icon on the 3 OSes, without a terminal |
 
 ## Testing strategy
 
