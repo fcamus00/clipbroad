@@ -14,13 +14,26 @@ clipbroad-core.workspace = true
 clipbroad-net.workspace = true
 iroh.workspace = true
 serde.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "signal", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "signal", "sync", "time"] }
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tray-icon.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["system"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tray-icon = { workspace = true, features = ["ksni"] }
+zbus.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-app-kit = { workspace = true, features = ["std", "NSApplication", "NSEvent", "NSResponder", "NSRunningApplication"] }
+objc2-foundation = { workspace = true, features = ["std", "NSDate", "NSString"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 tempfile.workspace = true

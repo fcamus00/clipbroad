@@ -3,9 +3,10 @@ mod pair;
 mod run;
 mod service;
 mod status;
+mod tray;
 mod watch;
 
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal};
 
 use clap::{ArgAction, Parser, Subcommand};
 use tracing::level_filters::LevelFilter;
@@ -34,7 +35,8 @@ enum Command {
     /// ticket works once and for 5 minutes. Pairing uses the same port as `clipbroad run`, so stop
     /// it on both machines first and start it again afterwards.
     Pair(pair::Args),
-    /// Sync the clipboard with the peers in the config file until Ctrl+C or SIGTERM.
+    /// Sync the clipboard with the peers in the config file until Ctrl+C, SIGTERM or the tray
+    /// icon's "Quit".
     ///
     /// Each text, image or set of files copied here is sent to every connected peer, and what a
     /// peer copies is written to this clipboard. Files are downloaded into a local cache first,
@@ -65,8 +67,7 @@ enum Command {
     Status(status::Args),
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let default_level = match cli.command {
         Command::Run(_) => LevelFilter::INFO,
@@ -76,12 +77,20 @@ async fn main() -> anyhow::Result<()> {
     };
     init_logging(default_level, cli.verbose);
     match cli.command {
-        Command::Pair(args) => pair::run(args).await,
-        Command::Run(args) => run::run(args).await,
-        Command::Watch(args) => watch::run(args).await,
+        Command::Pair(args) => runtime()?.block_on(pair::run(args)),
+        // It owns the main thread for the tray icon, and starts its own runtime.
+        Command::Run(args) => run::start(args),
+        Command::Watch(args) => runtime()?.block_on(watch::run(args)),
         Command::Service(args) => service::run(args),
         Command::Status(args) => status::run(args),
     }
+}
+
+/// A single-threaded tokio runtime: the daemon's work is mostly waiting on the network.
+fn runtime() -> io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
 }
 
 /// Logs go to stderr so they never mix with a command's output on stdout.
