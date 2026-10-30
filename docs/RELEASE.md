@@ -28,8 +28,57 @@ A tag with a suffix (`v0.2.0-rc.1`) creates a **pre-release**. The binary versio
   checks that `clipbroad --version` matches the tag. If it does not match, it fails and publishes nothing.
 - Packages the binary with `README.md`, `LICENSE-APACHE` and `LICENSE-MIT` in a
   `clipbroad-<tag>-<platform>/` folder, as `.tar.gz` (Linux, macOS) or `.zip` (Windows).
-- **release**: collects the 3 archives, writes `SHA256SUMS` and creates the release with `gh release create`
-  (notes generated from the merged PRs).
+- On Windows, also builds the installer `clipbroad-<tag>-windows-x86_64-setup.exe` (see below).
+- **release**: collects the 3 archives, the Windows installer and `packaging/install.sh`, writes
+  `SHA256SUMS` and creates the release with `gh release create` (notes generated from the merged PRs).
+- **publish**: only on tags without a suffix. Updates the package managers (see below).
+
+## Package managers
+
+| Manager | Platform | Repo it updates | Secret with the SSH key |
+|---|---|---|---|
+| Homebrew | macOS (Apple Silicon) | [`fcamus00/homebrew-tap`](https://github.com/fcamus00/homebrew-tap) | `HOMEBREW_TAP_SSH_KEY` |
+| Scoop | Windows | [`fcamus00/scoop-bucket`](https://github.com/fcamus00/scoop-bucket) | `SCOOP_BUCKET_SSH_KEY` |
+
+The templates live in `packaging/`, with `@VERSION@` and `@SHA256@` in place of the version and the checksum.
+The `publish` job downloads the release's `SHA256SUMS`, fills the templates with `packaging/render.sh` and
+commits to each repo with its SSH key. The GitHub host key is pinned in `packaging/known_hosts`. If one
+target fails, the others continue; "Re-run failed jobs" retries it without duplicating commits.
+
+- Each key is a *deploy key* with write access to its repo. To rotate one: generate a new key, add the
+  public key as a deploy key and store the private key with
+  `gh secret set <SECRET> --repo fcamus00/clipbroad < key`.
+- Pre-releases are not published.
+
+Linux has no package manager here (the AUR stopped accepting new accounts). Instead, every release
+attaches `packaging/install.sh`, so this command installs or upgrades to the latest stable release:
+
+```sh
+curl -fsSL https://github.com/fcamus00/clipbroad/releases/latest/download/install.sh | sh
+```
+
+It checks the archive against `SHA256SUMS` and puts the binary in `~/.local/bin`.
+`CLIPBROAD_VERSION=v0.2.0-rc.1` installs a specific tag, pre-releases included.
+
+## Windows installer
+
+`packaging/windows/clipbroad.iss` is an [Inno Setup](https://jrsoftware.org/isinfo.php) script, and
+`packaging/windows/build.ps1` builds it (it installs Inno Setup with Chocolatey if it is missing). The
+installer installs per user, without admin rights, to `%LOCALAPPDATA%\Programs\clipbroad` and adds that
+folder to the user's `PATH`. The "Start clipbroad at login" option runs `clipbroad service install`.
+Before replacing the files, the installer runs `clipbroad service uninstall` to stop the daemon, and
+the uninstaller runs it too.
+
+The CI `build` job on Windows builds the installer and runs `packaging/windows/test.ps1`: it installs,
+reinstalls over the running daemon, uninstalls, and checks files, `PATH`, the login registry value and
+the daemon after each step. Do not run that test on your own machine: it installs and removes clipbroad
+for the current user.
+
+The installer is not signed, so SmartScreen warns on the first run.
+
+`packaging/check.sh` fills the templates with fake checksums, checks that the formula and the manifest
+parse (with `ruby` and `jq`, skipping the ones that are missing), and runs `install.sh` against a fake
+local release. CI runs it on every PR.
 
 ## If something fails
 
@@ -42,6 +91,8 @@ gh release delete v0.2.0 --yes   # only if the release got created
 ```
 
 ## Install from a release
+
+The usual way is a package manager or `install.sh` (commands in `README.md`). By hand:
 
 ```sh
 gh release download v0.2.0 --repo fcamus00/clipbroad --pattern '*linux-x86_64*' --pattern SHA256SUMS

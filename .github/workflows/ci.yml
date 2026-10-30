@@ -30,6 +30,14 @@ jobs:
           tool: cargo-machete
       - run: cargo machete
 
+  # Package manager templates and install.sh (packaging/check.sh). The runner has ruby, jq and shellcheck.
+  packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: shellcheck packaging/*.sh
+      - run: packaging/check.sh
+
   check:
     name: clippy + test (${{ matrix.os }})
     strategy:
@@ -75,6 +83,28 @@ jobs:
       - name: Smoke test
         shell: bash
         run: target/release/${{ matrix.exe }} --version
+      - name: Build installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: packaging/windows/build.ps1 target/release/clipbroad.exe
+      - name: Test installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: packaging/windows/test.ps1 (Get-Item clipbroad-*-setup.exe).FullName
+      # The installer logs, the user PATH, and the daemon's output, which the service hides.
+      - name: Installer diagnostics
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-ChildItem $env:TEMP -Filter clipbroad-setup-*.log | ForEach-Object { "--- $($_.Name)"; Get-Content $_ }
+          "--- user PATH"
+          [Environment]::GetEnvironmentVariable('Path', 'User') -split ';'
+          "--- daemon"
+          Get-Process clipbroad, conhost -ErrorAction SilentlyContinue | Format-Table Id, ProcessName, StartTime
+          Stop-Process -Name clipbroad -Force -ErrorAction SilentlyContinue
+          $daemon = Start-Process target/release/clipbroad.exe 'run', '-v' -NoNewWindow -PassThru
+          Start-Sleep 5
+          if ($daemon.HasExited) { "exited with $($daemon.ExitCode)" } else { 'still running after 5 s'; Stop-Process $daemon }
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}

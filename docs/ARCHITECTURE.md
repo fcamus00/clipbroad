@@ -639,9 +639,11 @@ Code in `crates/clipboard` (`read_files`, `write_files`) and `crates/daemon/src/
 - Windows: `clipbroad` value in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` instead of a
   scheduled task: it does not ask for administrator permissions (`schtasks /sc onlogon` does) and does not inherit the
   task defaults (they stop on battery and after 3 days). In exchange, nothing
-  restarts it if it crashes. It is launched with `conhost.exe --headless` so it does not open a console window;
-  because of that its logs do not end up anywhere. `install` and `uninstall` stop any other
-  `clipbroad.exe` that is running.
+  restarts it if it crashes. At login it is launched with `conhost.exe --headless` so it does not open a
+  console window; because of that its logs do not end up anywhere. `install` starts it right away with
+  the `CREATE_NO_WINDOW` flag instead, because `conhost --headless` started from `install` stays up
+  without running the daemon (seen in CI). `install` and `uninstall` stop any other `clipbroad.exe`
+  that is running.
 - TOML configuration in each OS's configuration directory; identity (`SecretKey`) in a
   separate file with restricted permissions. Commented example with all the options and paths:
   [`config.example.toml`](config.example.toml).
@@ -658,10 +660,26 @@ Code in `crates/clipboard` (`read_files`, `write_files`) and `crates/daemon/src/
 
 ## Distribution
 
-- Each `v*` tag publishes a GitHub Release with the 3 binaries (`.tar.gz` / `.zip`) and `SHA256SUMS`. The
-  process is in [`RELEASE.md`](RELEASE.md).
+- Each `v*` tag publishes a GitHub Release with the 3 binaries (`.tar.gz` / `.zip`), a Windows
+  installer, `install.sh` and `SHA256SUMS`. The process is in [`RELEASE.md`](RELEASE.md).
 - A custom workflow instead of `cargo-dist`: 3 archives and checksums are enough, and a short hand-written
-  workflow is easier to maintain than a generated one. It will be reviewed if installers or Homebrew are needed.
+  workflow is easier to maintain than a generated one.
+- Package managers: Homebrew (macOS) and Scoop (Windows). Each one
+  installs to a path that survives upgrades, so the login service does not break, and Homebrew does not
+  set the macOS quarantine flag. The `publish` job in `release.yml` updates them on each stable release.
+- Windows also gets an Inno Setup installer (`packaging/windows/`), because most Windows users do not
+  use Scoop. It installs per user to a fixed folder, so it needs no admin rights and the service path
+  survives upgrades. It drives login startup through `clipbroad service install` / `uninstall` instead
+  of writing the registry itself, so the service logic stays in one place. Inno Setup over WiX (MSI):
+  one short script, and it builds on the CI runner without extra tooling.
+- Linux gets an install script (`packaging/install.sh`, attached to every release) instead of a
+  package manager. The AUR stopped accepting new accounts (2026-10), and distro repositories (APT, RPM)
+  would mean hosting and signing our own. The script works on any distro and always installs to
+  `~/.local/bin`, so the service path survives upgrades.
+- Homebrew only on macOS: on Linux, `current_exe` resolves Homebrew's symlink into the versioned
+  folder, which `brew upgrade` deletes, and the service would point to a binary that no longer exists.
+- Scoop without a *shim*: the manifest adds the app folder to `PATH`. The shim is also called
+  `clipbroad.exe`, and `service install` would kill it while stopping the other `clipbroad.exe` processes.
 - The version lives in `[workspace.package]`; the workflow fails if the tag does not match
   `clipbroad --version`.
 - macOS: no signing or notarization for now (that requires an Apple Developer account).
