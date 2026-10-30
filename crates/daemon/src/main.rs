@@ -1,4 +1,5 @@
 mod backend;
+mod control;
 mod pair;
 mod run;
 mod service;
@@ -31,8 +32,8 @@ enum Command {
     ///
     /// Run `clipbroad pair` on one machine: it shows a ticket and waits. Then run
     /// `clipbroad pair <TICKET>` on the other one. Both add each other to their config file. The
-    /// ticket works once and for 5 minutes. Pairing uses the same port as `clipbroad run`, so stop
-    /// it on both machines first and start it again afterwards.
+    /// ticket works once and for 5 minutes. If `clipbroad run` is running, it does the pairing and
+    /// syncs with the new machine right away, without a restart.
     Pair(pair::Args),
     /// Sync the clipboard with the peers in the config file until Ctrl+C or SIGTERM.
     ///

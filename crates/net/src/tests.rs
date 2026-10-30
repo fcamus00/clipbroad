@@ -134,7 +134,7 @@ async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
 
 impl Node {
     fn live_sessions_with(&self, peer: EndpointId) -> usize {
-        self.peers[&peer].live_sessions()
+        lock(&self.peers)[&peer].live_sessions()
     }
 
     /// Whether this node has exactly one working connection to each of `peers`.
@@ -535,4 +535,92 @@ async fn links_follow_the_connection_to_each_peer() {
         .expect("notices in time")
         .expect("node still running");
     node_a.shutdown().await;
+}
+
+/// What a node saves about a paired machine.
+fn as_peer(paired: &pair::PairedPeer) -> Peer {
+    Peer {
+        id: paired.id,
+        name: paired.name.clone(),
+        addrs: paired.addrs.clone(),
+    }
+}
+
+/// The ticket of `host`, pointed at `spec`'s localhost address: a host only advertises its
+/// network addresses.
+fn local_ticket(host: &pair::Host, spec: &Spec) -> pair::Ticket {
+    let mut ticket = host.ticket().clone();
+    ticket.addrs = vec![spec.addr()];
+    ticket
+}
+
+#[tokio::test]
+async fn running_nodes_pair_and_then_exchange_clips() {
+    let (a, b) = (Spec::new(), Spec::new());
+    let (node_a, mut inbox_a) = a.spawn(Vec::new()).await;
+    let (node_b, mut inbox_b) = b.spawn(Vec::new()).await;
+
+    let host = node_a.host_pairing(Some("a".to_owned())).expect("not busy");
+    let ticket = local_ticket(&host, &a);
+    let hosting = async {
+        let pending = host.accept(TIMEOUT).await?;
+        // As the daemon does: add it before confirming, so it is a peer once the joiner knows.
+        assert!(node_a.add_peer(&as_peer(pending.peer())));
+        pending.confirm().await
+    };
+    let (b_seen, a_seen) =
+        tokio::join!(hosting, node_b.join_pairing(&ticket, Some("b".to_owned())));
+    let (b_seen, a_seen) = (b_seen.expect("host pairs"), a_seen.expect("joiner pairs"));
+    assert_eq!((b_seen.id, b_seen.name.as_deref()), (b.id(), Some("b")));
+    // The joiner dialed from its listening port.
+    assert_eq!(b_seen.addrs.first(), Some(&b.addr()));
+    assert_eq!((a_seen.id, a_seen.name.as_deref()), (a.id(), Some("a")));
+
+    assert!(node_b.add_peer(&as_peer(&a_seen)));
+    assert!(!node_b.add_peer(&as_peer(&a_seen)), "already a peer");
+    let mut links = node_a.links();
+    time::timeout(
+        TIMEOUT,
+        links.wait_for(|links| matches!(links.get(&b.id()), Some(Link::Connected { .. }))),
+    )
+    .await
+    .expect("connects in time")
+    .expect("node still running");
+
+    node_a
+        .broadcast(text_clip(a.id(), 1, "from a"))
+        .expect("small clip");
+    assert_eq!(recv_text(&mut inbox_b).await, (a.id(), "from a".to_owned()));
+    node_b
+        .broadcast(text_clip(b.id(), 1, "from b"))
+        .expect("small clip");
+    assert_eq!(recv_text(&mut inbox_a).await, (b.id(), "from b".to_owned()));
+    node_a.shutdown().await;
+    node_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn node_takes_pairing_requests_only_while_hosting() {
+    let (a, b) = (Spec::new(), Spec::new());
+    let (node_a, _inbox_a) = a.spawn(Vec::new()).await;
+    let (node_b, _inbox_b) = b.spawn(Vec::new()).await;
+
+    let host = node_a.host_pairing(None).expect("not busy");
+    assert!(matches!(
+        node_a.host_pairing(None),
+        Err(pair::PairError::Busy)
+    ));
+    let ticket = local_ticket(&host, &a);
+    drop(host);
+
+    let joined = node_b.join_pairing(&ticket, None).await;
+    assert!(joined.is_err(), "nobody hosts anymore: {joined:?}");
+    assert!(node_a.host_pairing(None).is_ok(), "free again");
+    assert!(matches!(
+        node_a.join_pairing(&ticket, None).await,
+        Err(pair::PairError::OwnTicket)
+    ));
+    assert_eq!(node_a.links().borrow().len(), 0, "no peer was added");
+    node_a.shutdown().await;
+    node_b.shutdown().await;
 }
