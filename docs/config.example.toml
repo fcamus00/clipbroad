@@ -60,7 +60,9 @@ file_cache_max_bytes = 2147483648
 # cleanup, except those of the last received clip. Default 7. Must be greater than 0.
 file_cache_max_days = 7
 
-# Paired machines. `clipbroad pair` usually writes them; you can edit them by hand.
+# Paired machines. `clipbroad pair` usually writes them; you can edit them by hand, but
+# `clipbroad run` reads them only when it starts. Peers added by `clipbroad pair` while it runs
+# sync right away.
 # Each one has:
 #   id     public identity of the peer (64 lowercase hexadecimal characters). Required and
 #          unique.

@@ -10,6 +10,9 @@
 //! that connection, and the host keeps waiting until its time runs out. Both sides listen on
 //! their normal port, so the addresses they report, and the one B connects from, are the ones
 //! to save.
+//!
+//! Either side can run on its own endpoint ([`Host::bind`], [`join`]) or on the endpoint of a
+//! running [`Node`] ([`Node::host_pairing`], [`Node::join_pairing`]).
 
 use std::{fmt, net::SocketAddr, num::NonZeroU16, str::FromStr, time::Duration};
 
@@ -24,10 +27,10 @@ use iroh::{
 };
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
-use tokio::time;
+use tokio::{sync::mpsc, time};
 use tracing::warn;
 
-use crate::{Error, close, endpoint_builder};
+use crate::{Error, Node, close, endpoint_builder, lock};
 
 /// ALPN of the pairing protocol. Only a [`Host`] offers it.
 pub const PAIR_ALPN: &[u8] = b"clipbroad-pair/1";
@@ -100,6 +103,8 @@ pub enum PairError {
     Expired,
     #[error("the ticket belongs to this machine; use it on the other one")]
     OwnTicket,
+    #[error("another pairing is already waiting for its ticket; finish or cancel it first")]
+    Busy,
     #[error(
         "the other machine rejected the ticket's secret; check that it was copied whole, or get \
          a new one"
@@ -193,16 +198,64 @@ impl fmt::Debug for Ticket {
 /// The machine that shows the ticket and waits for the other one.
 #[derive(Debug)]
 pub struct Host {
-    endpoint: Endpoint,
+    requests: Requests,
     ticket: Ticket,
     name: Option<String>,
+}
+
+/// Where a host's pairing requests come from.
+#[derive(Debug)]
+enum Requests {
+    /// Its own endpoint, which only offers [`PAIR_ALPN`].
+    Own(Endpoint),
+    /// The endpoint of a running [`Node`], which hands over its pairing connections while this
+    /// receiver exists.
+    Node(mpsc::Receiver<Connection>),
+}
+
+/// A pairing attempt, before or after its handshake.
+enum Request {
+    /// Boxed: it is five times the size of a connection, and attempts come at human speed.
+    Incoming(Box<Incoming>),
+    Connected(Connection),
+}
+
+impl Requests {
+    /// The next attempt, or `None` once the endpoint or the node closed.
+    async fn next(&mut self) -> Option<Request> {
+        match self {
+            Self::Own(endpoint) => endpoint
+                .accept()
+                .await
+                .map(|incoming| Request::Incoming(Box::new(incoming))),
+            Self::Node(connections) => connections.recv().await.map(Request::Connected),
+        }
+    }
+
+    /// Stops taking requests.
+    async fn close(self) {
+        match self {
+            Self::Own(endpoint) => endpoint.close().await,
+            // Dropping the receiver tells the node to refuse pairing connections again.
+            Self::Node(_) => {}
+        }
+    }
+}
+
+impl Request {
+    async fn connection(self) -> Result<Connection, PairError> {
+        match self {
+            Self::Incoming(incoming) => Ok((*incoming).await?),
+            Self::Connected(conn) => Ok(conn),
+        }
+    }
 }
 
 /// A valid pairing request that the host has not answered yet. [`Pending::confirm`] answers it;
 /// dropping it rejects it.
 #[derive(Debug)]
 pub struct Pending {
-    endpoint: Endpoint,
+    requests: Requests,
     conn: Connection,
     send: SendStream,
     peer: PairedPeer,
@@ -230,7 +283,7 @@ impl Host {
         let addrs = endpoint.addr().ip_addrs().copied().collect();
         let ticket = Ticket::new(endpoint.id(), addrs)?;
         Ok(Self {
-            endpoint,
+            requests: Requests::Own(endpoint),
             ticket,
             name,
         })
@@ -248,13 +301,13 @@ impl Host {
     ///
     /// [`PairError::Expired`] if no valid request came in time. The host stops listening either
     /// way: a ticket works once.
-    pub async fn accept(self, ttl: Duration) -> Result<Pending, PairError> {
+    pub async fn accept(mut self, ttl: Duration) -> Result<Pending, PairError> {
         let Ok(Some((conn, send, peer))) = time::timeout(ttl, self.first_valid()).await else {
-            self.endpoint.close().await;
+            self.requests.close().await;
             return Err(PairError::Expired);
         };
         Ok(Pending {
-            endpoint: self.endpoint,
+            requests: self.requests,
             conn,
             send,
             peer,
@@ -262,10 +315,11 @@ impl Host {
         })
     }
 
-    /// Takes attempts one at a time until one has the right secret. `None` if the endpoint closed.
-    async fn first_valid(&self) -> Option<(Connection, SendStream, PairedPeer)> {
-        while let Some(incoming) = self.endpoint.accept().await {
-            match time::timeout(REQUEST_TIMEOUT, self.check(incoming)).await {
+    /// Takes attempts one at a time until one has the right secret. `None` if the endpoint or
+    /// the node closed.
+    async fn first_valid(&mut self) -> Option<(Connection, SendStream, PairedPeer)> {
+        while let Some(request) = self.requests.next().await {
+            match time::timeout(REQUEST_TIMEOUT, self.check(request)).await {
                 Ok(Ok(valid)) => return Some(valid),
                 Ok(Err(PairError::WrongSecret)) => {
                     warn!("rejected a pairing attempt with the wrong secret");
@@ -279,9 +333,9 @@ impl Host {
 
     async fn check(
         &self,
-        incoming: Incoming,
+        request: Request,
     ) -> Result<(Connection, SendStream, PairedPeer), PairError> {
-        let conn = incoming.await?;
+        let conn = request.connection().await?;
         let (send, mut recv) = conn.accept_bi().await?;
         let request: JoinMessage = postcard::from_bytes(&recv.read_to_end(MAX_MESSAGE_LEN).await?)?;
         if !bool::from(request.secret.ct_eq(&self.ticket.secret)) {
@@ -323,8 +377,54 @@ impl Pending {
         self.send.finish()?;
         // The joiner closes once it has the reply; closing first could cut it off.
         let _ = time::timeout(CLOSE_TIMEOUT, self.conn.closed()).await;
-        self.endpoint.close().await;
+        self.requests.close().await;
         Ok(self.peer)
+    }
+}
+
+impl Node {
+    /// Starts pairing as the host on this node's endpoint, so that pairing needs no other
+    /// process on the port. Then use the [`Host`] as one from [`Host::bind`]. Until it is
+    /// dropped, the node passes it every connection to [`PAIR_ALPN`]; without a host, it refuses
+    /// them.
+    ///
+    /// The node does not add the peer by itself: once it is saved, call [`Node::add_peer`].
+    ///
+    /// # Errors
+    ///
+    /// [`PairError::Busy`] if another host of this node is still waiting, and
+    /// [`PairError::Start`] if no secret can be generated.
+    pub fn host_pairing(&self, name: Option<String>) -> Result<Host, PairError> {
+        let mut pairing = lock(&self.routes.pairing);
+        if pairing.as_ref().is_some_and(|host| !host.is_closed()) {
+            return Err(PairError::Busy);
+        }
+        let addrs = self.endpoint.addr().ip_addrs().copied().collect();
+        let ticket = Ticket::new(self.endpoint.id(), addrs)?;
+        let (requests, received) = mpsc::channel(4);
+        *pairing = Some(requests);
+        Ok(Host {
+            requests: Requests::Node(received),
+            ticket,
+            name,
+        })
+    }
+
+    /// Pairs with the host in `ticket` from this node's endpoint, like [`join`] does from its
+    /// own. Then save the peer and call [`Node::add_peer`].
+    ///
+    /// # Errors
+    ///
+    /// As [`join`].
+    pub async fn join_pairing(
+        &self,
+        ticket: &Ticket,
+        name: Option<String>,
+    ) -> Result<PairedPeer, PairError> {
+        if self.endpoint.id() == ticket.id {
+            return Err(PairError::OwnTicket);
+        }
+        join_from(&self.endpoint, ticket, name).await
     }
 }
 
@@ -350,11 +450,19 @@ pub async fn join(
         .bind()
         .await
         .map_err(|source| Error::Bind { port, source })?;
-    let result = time::timeout(JOIN_TIMEOUT, exchange(&endpoint, ticket, name))
-        .await
-        .unwrap_or(Err(PairError::Unreachable));
+    let result = join_from(&endpoint, ticket, name).await;
     endpoint.close().await;
     result
+}
+
+async fn join_from(
+    endpoint: &Endpoint,
+    ticket: &Ticket,
+    name: Option<String>,
+) -> Result<PairedPeer, PairError> {
+    time::timeout(JOIN_TIMEOUT, exchange(endpoint, ticket, name))
+        .await
+        .unwrap_or(Err(PairError::Unreachable))
 }
 
 async fn exchange(

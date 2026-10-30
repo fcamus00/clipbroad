@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use clipbroad_clipboard::fake::FakeClipboard;
 use clipbroad_clipboard::{Clipboard, ClipboardError};
-use clipbroad_config::{Config, IdentityKey, Paths};
+use clipbroad_config::{Config, IdentityKey, Paths, Peer};
 use clipbroad_core::protocol::{ContentKind, NodeId, Payload};
 use clipbroad_core::sync::{LocalAction, RemoteAction, SyncEngine};
 use clipbroad_core::{ClipContent, ContentHash, Png};
@@ -20,6 +20,7 @@ use tokio::time::{self, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 use crate::backend;
+use crate::control;
 use crate::status::{self, ClipEvent, DaemonStatus};
 
 #[derive(Debug, clap::Args)]
@@ -69,6 +70,10 @@ async fn shutdown_signal() -> io::Result<()> {
 /// a big download blocks no clip or local copy; dropping it cancels the download.
 type Download<'a> = Pin<Box<dyn Future<Output = Downloaded> + Send + 'a>>;
 
+/// A `clipbroad pair` being served (see [`control::serve`]). It ends with the peer it added, if
+/// any.
+type Pairing<'a> = Pin<Box<dyn Future<Output = Option<Peer>> + Send + 'a>>;
+
 /// The end of a [`Download`]: the cache paths of the files, or why they could not be fetched.
 struct Downloaded {
     from: EndpointId,
@@ -79,6 +84,8 @@ struct Downloaded {
 
 /// Syncs `clipboard` with the peers in `config` until `shutdown` completes, keeping the status
 /// file up to date for `clipbroad status` (see [`status`]) and received files in the file cache.
+/// It also pairs when `clipbroad pair` asks over the control channel (see [`control`]), and
+/// syncs with the new peer right away.
 ///
 /// Errors from a single read, write or clip are logged and the loop keeps going; only a failed
 /// setup or a failed clipboard watcher end it.
@@ -111,6 +118,10 @@ pub async fn sync(
     // Written only once the node is up: a second daemon on the same config fails before this,
     // and must not take over the first one's file.
     let mut status = DaemonStatus::new(&node, config);
+    // Same as the status file: a second daemon on the same config fails before this.
+    let mut control = control::listen(paths);
+    // At most one: `clipbroad pair` asks one thing at a time, and waits for it.
+    let mut pairing: Option<Pairing<'_>> = None;
     let mut links = node.links();
     let mut heartbeat = time::interval(status::HEARTBEAT);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -138,7 +149,7 @@ pub async fn sync(
                     Err(error) => warn!("{error:#}"),
                 }
             }
-            // `None` once no peer task is left to send clips, as with no peers configured.
+            // The node holds a sender, so this never ends while it runs.
             Some(received) = inbox.recv() => {
                 let files = match &received.clip.payload {
                     Payload::Files(entries) => Some(entries.len()),
@@ -157,6 +168,18 @@ pub async fn sync(
                     warn!("{error:#}");
                 }
             }
+            client = accept(control.as_mut()) => match client {
+                Ok(client) => serve(client, &mut pairing, &node, paths),
+                Err(error) => warn!(%error, "cannot accept a control connection"),
+            },
+            paired = finished(&mut pairing) => {
+                pairing = None;
+                if let Some(peer) = paired {
+                    status.add_peer(&peer);
+                    // It may have connected already.
+                    status.update_links(&links.borrow_and_update());
+                }
+            }
             downloaded = finished(&mut download) => {
                 download = None;
                 if let Err(error) = apply_files(&clipboard, downloaded).await {
@@ -173,17 +196,41 @@ pub async fn sync(
         }
         status.save(&status_file);
     };
-    // It borrows the node.
-    drop(download);
+    // They borrow the node.
+    drop((download, pairing));
+    // Removes the socket, so `clipbroad pair` no longer finds this daemon.
+    drop(control);
     node.shutdown().await;
     status::remove(&status_file);
     result
 }
 
-/// Completes with the end of `download`, or never if there is none.
-async fn finished(download: &mut Option<Download<'_>>) -> Downloaded {
-    match download {
-        Some(download) => download.await,
+/// Completes with the end of `task`, or never if there is none.
+async fn finished<F: Future + Unpin>(task: &mut Option<F>) -> F::Output {
+    match task {
+        Some(task) => task.await,
+        None => future::pending().await,
+    }
+}
+
+/// Serves `client`, or refuses it while another `clipbroad pair` is being served.
+fn serve<'a>(
+    client: control::ServerStream,
+    pairing: &mut Option<Pairing<'a>>,
+    node: &'a Node,
+    paths: &'a Paths,
+) {
+    if pairing.is_some() {
+        tokio::spawn(control::refuse(client));
+    } else {
+        *pairing = Some(Box::pin(control::serve(client, node, paths)));
+    }
+}
+
+/// The next client of the control channel, or never if it could not open.
+async fn accept(control: Option<&mut control::Listener>) -> io::Result<control::ServerStream> {
+    match control {
+        Some(control) => control.accept().await,
         None => future::pending().await,
     }
 }

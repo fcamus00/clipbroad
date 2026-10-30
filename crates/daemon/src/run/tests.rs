@@ -13,6 +13,7 @@ use clipbroad_clipboard::fake::{TEXT_FORMAT, tiny_png};
 use clipbroad_config::Peer;
 use clipbroad_core::protocol::{self, Clip, ClipId, Hello, Message};
 use clipbroad_core::{FileEntry, FileList, Png};
+use clipbroad_net::pair::Ticket;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use tempfile::TempDir;
@@ -76,6 +77,7 @@ impl Spec {
 struct Daemon {
     id: EndpointId,
     clipboard: FakeClipboard,
+    paths: Paths,
     status_file: PathBuf,
     cache_dir: PathBuf,
     stop: oneshot::Sender<()>,
@@ -92,7 +94,9 @@ impl Daemon {
         let dir = tempfile::tempdir().expect("temp dir");
         let paths = Paths::beside_config(dir.path().join("config.toml"));
         let (status_file, cache_dir) = (paths.status_file(), paths.file_cache_dir.clone());
+        let daemon_paths = paths.clone();
         let task = tokio::spawn(async move {
+            let paths = daemon_paths;
             let shutdown = async {
                 // A dropped sender also stops the daemon.
                 let _ = stopped.await;
@@ -103,6 +107,7 @@ impl Daemon {
         Self {
             id: spec.id(),
             clipboard,
+            paths,
             status_file,
             cache_dir,
             stop,
@@ -581,4 +586,102 @@ async fn status_file_follows_peers_and_clips() {
     daemon_a.stop().await;
     // A daemon that stops removes its file.
     assert!(!status_file.exists());
+}
+
+/// What `clipbroad pair` does when the daemon runs: asks it over the control channel. Hosting
+/// passes the ticket, pointed at `spec`'s localhost address, to `ticket`.
+async fn pair_through(
+    daemon: &Daemon,
+    ticket: Option<&Ticket>,
+    host_spec: &Spec,
+    shown: impl FnOnce(Ticket),
+) -> Result<crate::pair::Paired> {
+    let stream = crate::control::connect(&daemon.paths)
+        .await
+        .expect("no error")
+        .expect("the daemon listens");
+    crate::pair::through(stream, ticket, |ticket| {
+        let mut local = ticket.clone();
+        local.addrs = vec![(Ipv4Addr::LOCALHOST, host_spec.port.get()).into()];
+        shown(local);
+    })
+    .await
+}
+
+#[tokio::test]
+async fn running_daemons_pair_and_sync_without_restarting() {
+    let (spec_a, spec_b) = (Spec::new(), Spec::new());
+    let no_peers = |spec: &Spec| spec.config([], Config::DEFAULT_INLINE_MAX_BYTES.get());
+    let a = Daemon::start(&spec_a, no_peers(&spec_a));
+    let b = Daemon::start(&spec_b, no_peers(&spec_b));
+    // The control channel opens before the first status file.
+    assert!(eventually(TIMEOUT, || a.status().is_some() && b.status().is_some()).await);
+
+    // A `clipbroad pair` that quits while it waits leaves nobody waiting on the daemon.
+    let (ticket_tx, ticket_rx) = oneshot::channel();
+    let quitter = pair_through(&a, None, &spec_a, |ticket| {
+        let _ = ticket_tx.send(ticket);
+    });
+    let old_ticket = tokio::select! {
+        result = quitter => panic!("pairing ended on its own: {result:?}"),
+        ticket = ticket_rx => ticket.expect("a shows a ticket"),
+    };
+    // Until the daemon notices, it refuses others as busy. Then the old ticket only reaches a
+    // itself, which tells it apart.
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let error = pair_through(&a, Some(&old_ticket), &spec_a, drop)
+            .await
+            .expect_err("nobody hosts it")
+            .to_string();
+        if !error.contains("already running") {
+            assert!(error.contains("belongs to this machine"), "{error}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "the daemon still waits");
+        time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let (ticket_tx, ticket_rx) = oneshot::channel();
+    let hosting = pair_through(&a, None, &spec_a, |ticket| {
+        ticket_tx.send(ticket).expect("the test waits");
+    });
+    let joining = async {
+        let ticket = ticket_rx.await.expect("a shows a ticket");
+        // One `clipbroad pair` at a time.
+        let busy = pair_through(&a, Some(&ticket), &spec_a, drop).await;
+        assert!(
+            busy.as_ref()
+                .is_err_and(|e| e.to_string().contains("already running")),
+            "{busy:?}"
+        );
+        pair_through(&b, Some(&ticket), &spec_a, drop).await
+    };
+    let (b_as_seen, a_as_seen) = tokio::join!(hosting, joining);
+    let (b_as_seen, a_as_seen) = (b_as_seen.expect("a pairs"), a_as_seen.expect("b pairs"));
+    assert_eq!((b_as_seen.id, b_as_seen.added), (b.id, true));
+    assert_eq!((a_as_seen.id, a_as_seen.added), (a.id, true));
+    for (daemon, other) in [(&a, &b), (&b, &a)] {
+        let config = Config::load_or_default(&daemon.paths.config_file).expect("valid config");
+        let saved: Vec<_> = config.peers.iter().map(|peer| peer.id).collect();
+        assert_eq!(saved, [other.id], "{daemon:?} saved the other one");
+    }
+
+    // Without restarting either daemon. A clip sent before the connection is up is lost, so
+    // wait for it first, as `clipbroad status` shows it.
+    let connected_to = |daemon: &Daemon, other: &Daemon| {
+        daemon.status().is_some_and(|status| {
+            status
+                .peers
+                .iter()
+                .any(|peer| peer.id == other.id && peer.connected)
+        })
+    };
+    assert!(eventually(TIMEOUT, || connected_to(&a, &b) && connected_to(&b, &a)).await);
+    a.clipboard.simulate_copy_text("from a");
+    assert!(eventually(TIMEOUT, || b.text().as_deref() == Some("from a")).await);
+    b.clipboard.simulate_copy_text("from b");
+    assert!(eventually(TIMEOUT, || a.text().as_deref() == Some("from b")).await);
+    a.stop().await;
+    b.stop().await;
 }

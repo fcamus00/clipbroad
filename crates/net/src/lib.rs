@@ -43,6 +43,8 @@
 //! # Pairing
 //!
 //! [`pair`] adds a peer: one machine shows a ticket and the other dials it, on a separate ALPN.
+//! A running node can do either side with its own endpoint ([`Node::host_pairing`],
+//! [`Node::join_pairing`]), and [`Node::add_peer`] starts syncing with the new peer.
 
 mod cache;
 mod files;
@@ -56,11 +58,11 @@ use std::{
     collections::{HashMap, HashSet},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError, RwLock},
 };
 
 pub use cache::{Cleaned, FileCache, StoreError};
-use clipbroad_config::{Config, IdentityKey};
+use clipbroad_config::{Config, IdentityKey, Peer};
 use clipbroad_core::{
     FileList,
     protocol::{self, Clip, FrameError, Message},
@@ -74,7 +76,11 @@ use iroh::{
 };
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use tokio::{
-    sync::{broadcast, mpsc, watch},
+    sync::{
+        broadcast,
+        mpsc::{self, error::TrySendError},
+        watch,
+    },
     task::JoinSet,
 };
 use tracing::{debug, info, warn};
@@ -150,8 +156,22 @@ pub struct Node {
     offer: watch::Sender<Option<Arc<Offer>>>,
     links: watch::Sender<Links>,
     lan_discovery: bool,
-    tasks: JoinSet<()>,
-    peers: HashMap<EndpointId, Arc<peer::PeerState>>,
+    /// Kept to start the task of a peer added later.
+    channels: peer::Channels,
+    /// Shared with the endpoint's hook, so an added peer can connect.
+    allowlist: Arc<RwLock<HashSet<EndpointId>>>,
+    routes: Arc<Routes>,
+    tasks: Mutex<JoinSet<()>>,
+    peers: Mutex<HashMap<EndpointId, Arc<peer::PeerState>>>,
+}
+
+/// Where the accept loop hands each incoming connection.
+#[derive(Debug, Default)]
+struct Routes {
+    /// Each peer's task.
+    peers: Mutex<HashMap<EndpointId, mpsc::Sender<Connection>>>,
+    /// The pairing host waiting for requests, if any (see [`Node::host_pairing`]).
+    pairing: Mutex<Option<mpsc::Sender<Connection>>>,
 }
 
 impl Node {
@@ -177,9 +197,10 @@ impl Node {
     ) -> Result<(Self, mpsc::Receiver<Received>), Error> {
         let port = config.listen_port.get();
         let allowlist = config.peers.iter().map(|peer| peer.id).collect();
+        let allowlist = Arc::new(RwLock::new(allowlist));
         let mut builder = endpoint_builder(identity, port)
-            .alpns(vec![ALPN.to_vec()])
-            .hooks(Allowlist(allowlist));
+            .alpns(vec![ALPN.to_vec(), pair::PAIR_ALPN.to_vec()])
+            .hooks(Allowlist(Arc::clone(&allowlist)));
         let mdns = config.mdns.then(|| start_mdns(identity)).flatten();
         let discovery = mdns.is_some();
         if let Some(mdns) = mdns {
@@ -201,34 +222,57 @@ impl Node {
             offer: offer.subscribe(),
             links: links.clone(),
         };
+        let routes = Arc::new(Routes::default());
         let mut tasks = JoinSet::new();
-        let mut routes = HashMap::new();
-        let mut peers = HashMap::new();
-        for peer in &config.peers {
-            let (conn_tx, conn_rx) = mpsc::channel(4);
-            routes.insert(peer.id, conn_tx);
-            let peer_task = peer::PeerTask::new(
-                endpoint.clone(),
-                peer.id,
-                &peer.addrs,
-                discovery,
-                channels.clone(),
-            );
-            peers.insert(peer.id, peer_task.state());
-            tasks.spawn(peer_task.run(conn_rx));
-        }
-        tasks.spawn(accept_loop(endpoint.clone(), routes));
-
+        tasks.spawn(accept_loop(endpoint.clone(), Arc::clone(&routes)));
         let node = Self {
             endpoint,
             outbox,
             offer,
             links,
             lan_discovery: discovery,
-            tasks,
-            peers,
+            channels,
+            allowlist,
+            routes,
+            tasks: Mutex::new(tasks),
+            peers: Mutex::new(HashMap::new()),
         };
+        for peer in &config.peers {
+            node.start_peer(peer);
+        }
         Ok((node, inbox))
+    }
+
+    /// Starts syncing with `peer`, a machine that was just paired: it may connect from now on,
+    /// and the node dials it like the peers in the config. Returns `false`, and changes nothing,
+    /// if it is a peer already.
+    ///
+    /// The node does not save it: add it to the config file too.
+    pub fn add_peer(&self, peer: &Peer) -> bool {
+        if !lock_write(&self.allowlist).insert(peer.id) {
+            return false;
+        }
+        self.links.send_modify(|links| {
+            links.insert(peer.id, Link::Disconnected);
+        });
+        self.start_peer(peer);
+        info!(peer = %peer.id.fmt_short(), "added peer");
+        true
+    }
+
+    /// Runs the task that keeps `peer` connected. The allowlist and the links must have it.
+    fn start_peer(&self, peer: &Peer) {
+        let (conn_tx, conn_rx) = mpsc::channel(4);
+        let peer_task = peer::PeerTask::new(
+            self.endpoint.clone(),
+            peer.id,
+            &peer.addrs,
+            self.lan_discovery,
+            self.channels.clone(),
+        );
+        lock(&self.peers).insert(peer.id, peer_task.state());
+        lock(&self.routes.peers).insert(peer.id, conn_tx);
+        lock(&self.tasks).spawn(peer_task.run(conn_rx));
     }
 
     /// This node's public identity.
@@ -306,13 +350,20 @@ impl Node {
         files: &FileList,
         cache: &FileCache,
     ) -> Result<Vec<PathBuf>, FetchError> {
-        let peer = self.peers.get(&from).ok_or(FetchError::UnknownPeer)?;
-        files::fetch(peer.live(), files, cache).await
+        let live = lock(&self.peers)
+            .get(&from)
+            .ok_or(FetchError::UnknownPeer)?
+            .live();
+        files::fetch(live, files, cache).await
     }
 
     /// Closes every connection, telling peers right away, and stops the node.
-    pub async fn shutdown(mut self) {
-        self.tasks.shutdown().await;
+    pub async fn shutdown(self) {
+        let mut tasks = self
+            .tasks
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        tasks.shutdown().await;
         self.endpoint.close().await;
     }
 }
@@ -356,9 +407,20 @@ fn start_mdns(identity: &IdentityKey) -> Option<MdnsAddressLookup> {
     }
 }
 
-/// Rejects connections from anyone who is not a configured peer.
+/// Locks a mutex. Nothing panics while holding one of the node's locks, but if it did, the data
+/// would still be consistent: every change is a single insert.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn lock_write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Rejects connections from anyone who is not a configured peer, except to pair: those carry
+/// [`pair::PAIR_ALPN`] and only reach a pairing host (see [`Node::host_pairing`]).
 #[derive(Debug)]
-struct Allowlist(HashSet<EndpointId>);
+struct Allowlist(Arc<RwLock<HashSet<EndpointId>>>);
 
 impl EndpointHooks for Allowlist {
     fn after_handshake<'a>(
@@ -366,7 +428,13 @@ impl EndpointHooks for Allowlist {
         conn: &'a Connection,
     ) -> impl Future<Output = AfterHandshakeOutcome> + Send + 'a {
         let remote = conn.remote_id();
-        let outcome = if self.0.contains(&remote) {
+        let allowed = || {
+            self.0
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&remote)
+        };
+        let outcome = if conn.alpn() == pair::PAIR_ALPN || allowed() {
             AfterHandshakeOutcome::Accept
         } else {
             warn!(remote = %remote, "rejected connection from an unpaired node");
@@ -379,8 +447,9 @@ impl EndpointHooks for Allowlist {
     }
 }
 
-/// Accepts incoming connections and hands each one to its peer's task.
-async fn accept_loop(endpoint: Endpoint, routes: HashMap<EndpointId, mpsc::Sender<Connection>>) {
+/// Accepts incoming connections and hands each one to its peer's task, or to pair to the pairing
+/// host. Without a host, a pairing connection is closed.
+async fn accept_loop(endpoint: Endpoint, routes: Arc<Routes>) {
     let mut handshakes = JoinSet::new();
     loop {
         tokio::select! {
@@ -398,8 +467,21 @@ async fn accept_loop(endpoint: Endpoint, routes: HashMap<EndpointId, mpsc::Sende
                         continue;
                     }
                 };
+                if conn.alpn() == pair::PAIR_ALPN {
+                    let host = lock(&routes.pairing).clone();
+                    // The host checks one request at a time, so a full queue refuses the rest.
+                    let refused = match host {
+                        Some(host) => host.try_send(conn).err().map(TrySendError::into_inner),
+                        None => Some(conn),
+                    };
+                    if let Some(conn) = refused {
+                        conn.close(close::NOT_PAIRED, b"not pairing");
+                    }
+                    continue;
+                }
                 // The allowlist only lets peers through, and every peer has a route.
-                if let Some(route) = routes.get(&conn.remote_id()) {
+                let route = lock(&routes.peers).get(&conn.remote_id()).cloned();
+                if let Some(route) = route {
                     // An error means the node is stopping.
                     let _ = route.send(conn).await;
                 }

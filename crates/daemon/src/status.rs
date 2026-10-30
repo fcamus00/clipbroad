@@ -2,8 +2,8 @@
 //!
 //! `clipbroad run` writes a small TOML file (`status.toml` beside the identity, see
 //! [`Paths::status_file`]) whenever something changes and every [`HEARTBEAT`], and removes it when
-//! it stops. A file instead of a local socket or named pipe: the code is the same on every OS, the
-//! daemon runs no server, and a daemon that died shows up as a file that stopped being updated.
+//! it stops. A file instead of the control channel's socket (see [`crate::control`]): the code is
+//! the same on every OS, and a daemon that died shows up as a file that stopped being updated.
 //! The file is replaced atomically (written aside, then renamed), so a reader never sees half of
 //! it.
 
@@ -15,7 +15,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use std::{fs, process};
 
 use anyhow::{Context, Result};
-use clipbroad_config::{Config, Paths};
+use clipbroad_config::{Config, Paths, Peer};
 use clipbroad_core::protocol::ContentKind;
 use clipbroad_net::{Link, Links, Node};
 use iroh::EndpointId;
@@ -64,7 +64,7 @@ pub struct DaemonStatus {
     pub paste_access: Option<PasteAccess>,
     pub last_sent: Option<ClipEvent>,
     pub last_received: Option<ClipEvent>,
-    /// In config order.
+    /// In config order, then the peers paired while running.
     pub peers: Vec<PeerStatus>,
 }
 
@@ -140,6 +140,18 @@ impl DaemonStatus {
             last_sent: None,
             last_received: None,
             peers: peers.collect(),
+        }
+    }
+
+    /// Lists a peer that was just paired, not connected yet.
+    pub fn add_peer(&mut self, peer: &Peer) {
+        if self.peers.iter().all(|known| known.id != peer.id) {
+            self.peers.push(PeerStatus {
+                id: peer.id,
+                name: peer.name.clone(),
+                connected: false,
+                addr: None,
+            });
         }
     }
 

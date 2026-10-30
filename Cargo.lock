@@ -366,6 +366,7 @@ dependencies = [
  "clipbroad-core",
  "clipbroad-net",
  "iroh",
+ "postcard",
  "rustix",
  "serde",
  "tempfile",

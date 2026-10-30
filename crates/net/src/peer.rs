@@ -27,7 +27,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The node-wide channels every peer task uses.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct Channels {
     /// Clips to send to every peer.
     pub(crate) outbox: broadcast::Sender<Frame>,
