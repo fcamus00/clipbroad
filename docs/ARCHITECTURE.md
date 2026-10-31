@@ -103,7 +103,9 @@ Static addresses are still useful for what mDNS does not reach, such as Tailscal
 
 The user runs `clipbroad pair` on one machine (A), which shows a ticket and waits, and
 `clipbroad pair <ticket>` on the other (B). Each adds the other to its configuration and exits.
-Code in `crates/net/src/pair.rs` and `crates/daemon/src/pair.rs`.
+If `clipbroad run` is running, `pair` asks it to do the pairing (see "Control channel"), and the
+daemon syncs with the new peer right away. Code in `crates/net/src/pair.rs` and
+`crates/daemon/src/pair.rs`.
 
 - **Ticket:** one base32 line with a version byte, A's `EndpointId`, its addresses (on
   its listen port) and a random 16-byte secret.
@@ -113,9 +115,18 @@ Code in `crates/net/src/pair.rs` and `crates/daemon/src/pair.rs`.
   saved B.
 - **Port:** pairing listens on the normal `listen_port` on both machines, so the
   addresses exchanged (and the address B connects from, which A also saves) are
-  the ones `clipbroad run` will use. Because of that, `clipbroad run` must be stopped while pairing; if it is
-  running, `pair` fails with a message that says so. It costs nothing: the daemon reads the config only at
-  startup, so it has to be restarted anyway to see the new peer.
+  the ones `clipbroad run` will use. With the daemon running, it pairs on its own endpoint, which
+  holds that port. Without it, `pair` binds the port itself.
+- **Pairing in the daemon:** the node's endpoint also offers `clipbroad-pair/1`. The allowlist
+  hook lets connections on that ALPN through in both directions (B dials A before either knows the
+  other), and the accept loop hands them to the pairing host, if one is waiting. Without a host,
+  the node closes them right away, so a running daemon answers no pairing attempt unless the user
+  asked for one. One host at a time. The pairing logic (secret, messages, limits) is the same code
+  as without the daemon.
+- **New peer without a restart:** `Node::add_peer` adds the peer to the allowlist, to the links
+  and to the accept loop's routes, and starts its task, which dials it like the peers from the
+  config. The host adds it after saving it and before confirming, so it is a peer by the time B
+  knows the pairing worked. Peers edited by hand in the config still need a restart.
 - **Config:** a `[[peers]]` block is appended as text at the end of the file (comments are
   kept), with `id`, `name` and `addrs`. The file is created if it does not exist, the result is validated
   before writing, and a peer that was already there is neither duplicated nor modified.
@@ -230,6 +241,8 @@ The daemon writes its status to a TOML file, `status.toml`, in the same folder a
 - **A file and not a socket or named pipe:** the same code works on all three OSes, the daemon does not have to
   serve anyone, and a dead daemon shows because the file stops being updated. A socket would give
   the status instantly, but it needs a server inside the daemon and different code on Windows.
+  The daemon now has a socket for pairing (see "Control channel"), but the status stays a file:
+  a dead daemon still shows in it, and `status` works the same with or without the socket.
 - **When it is written:** after each event (a peer connects or leaves, a clip sent or
   received) and every 5 s. It is written to a temporary file and renamed, so a reader never sees a
   half-written file. When it stops, the daemon deletes it. It is only written once the node is up:
@@ -245,6 +258,36 @@ The daemon writes its status to a TOML file, `status.toml`, in the same folder a
   sent and received with time, size and short hash. Never the content. On macOS 15.4 or newer,
   also the pasteboard `accessBehavior` as the daemon sees it, with instructions if it is not
   set to "Allow".
+
+### Control channel
+
+How `clipbroad pair` talks to the running daemon (code in `crates/daemon/src/control.rs`).
+
+- **A local socket:** a Unix socket `control.sock` beside `secret.key` on Linux and macOS, and on
+  Windows a named pipe whose name is `\\.\pipe\clipbroad\` and the path of that same
+  `control.sock`, in lowercase and with `/` for `\`. It follows the identity like
+  `status.toml`, so each `--config` has its own. Tokio supports both, so there are no new
+  dependencies.
+- **Why not a file, like `status.toml`:** pairing is a conversation (ask for a ticket, show it,
+  wait up to 5 minutes for the result), and with files both sides would have to poll and lock.
+  iroh over loopback does not work as is: the CLI has the daemon's identity, and iroh refuses to
+  connect to itself, so it would need another key and a token on disk.
+- **Who can connect:** on Unix the directory is private (`0700`) and the socket is `0600`. On
+  Windows the pipe refuses remote clients, and its default security lets only this user,
+  administrators and SYSTEM open it for writing.
+- **Messages:** a big-endian `u32` length and the message in `postcard`, up to 64 KiB. The client
+  sends one request (`Host`, or `Join` with the ticket); the daemon answers with the ticket to
+  show (`Host` only) and then `Paired` or `Failed` with the error to show. Both sides are the same
+  binary; an old daemon after an upgrade fails to decode, and the error says to restart it.
+- **One at a time:** while one `pair` is served, another one gets "already running". A client that
+  sends no request in 5 s is dropped. While the daemon hosts, it watches the socket: if `pair` quits
+  (Ctrl+C), the daemon stops waiting, so the ticket stops working.
+- **Detecting the daemon:** `pair` connects to the socket. No socket, or one nobody answers on (a
+  daemon killed with `kill -9` leaves the file), means no daemon, and `pair` pairs on its own as
+  before. A daemon that starts and finds a socket nobody answers on replaces it. The daemon opens
+  the socket only after the node is up, like the status file, and removes it when it stops.
+- **If it cannot open,** the daemon logs a warning and syncs anyway; `pair` then fails on the
+  port, with a message that says to stop the daemon while pairing.
 
 ## Clipboard per platform
 

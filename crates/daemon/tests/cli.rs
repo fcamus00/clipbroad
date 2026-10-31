@@ -77,10 +77,7 @@ fn help_describes_commands_and_hides_fake() {
 
     let pair_help = stdout(clipbroad(&["pair", "--help"]));
     assert!(pair_help.contains("[TICKET]"), "{pair_help}");
-    assert!(
-        pair_help.contains("stop it on both machines"),
-        "{pair_help}"
-    );
+    assert!(pair_help.contains("without a restart"), "{pair_help}");
 
     let run_help = stdout(clipbroad(&["run", "--help"]));
     assert!(run_help.contains("--config <FILE>"), "{run_help}");
