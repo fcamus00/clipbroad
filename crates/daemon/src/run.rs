@@ -19,9 +19,8 @@ use iroh::EndpointId;
 use tokio::time::{self, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
-use crate::backend;
-use crate::control;
 use crate::status::{self, ClipEvent, DaemonStatus};
+use crate::{backend, control, tray};
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -35,7 +34,16 @@ pub struct Args {
     fake: bool,
 }
 
-pub async fn run(args: Args) -> Result<()> {
+/// Runs the daemon with the tray icon, or without it for `--fake` (tests).
+pub fn start(args: Args) -> Result<()> {
+    if args.fake {
+        return crate::runtime()?.block_on(run(args, future::pending()));
+    }
+    tray::run(|quit| crate::runtime()?.block_on(run(args, quit.chosen())))
+}
+
+/// The daemon, until a shutdown signal or `quit` completes.
+async fn run(args: Args, quit: impl Future<Output = ()>) -> Result<()> {
     let paths = match args.config {
         Some(config_file) => Paths::beside_config(config_file),
         None => Paths::discover()?,
@@ -48,7 +56,16 @@ pub async fn run(args: Args) -> Result<()> {
         backend::system_clipboard()?
     };
     info!(config = %paths.config_file.display(), peers = config.peers.len(), "starting");
-    sync(clipboard, &config, &identity, &paths, shutdown_signal()).await
+    let shutdown = async {
+        tokio::select! {
+            result = shutdown_signal() => result,
+            () = quit => {
+                info!("quit chosen in the tray menu");
+                Ok(())
+            }
+        }
+    };
+    sync(clipboard, &config, &identity, &paths, shutdown).await
 }
 
 /// Ctrl+C, or SIGTERM on Unix (what systemd and `kill` send).
