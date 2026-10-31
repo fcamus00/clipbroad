@@ -48,7 +48,8 @@ if [ "$(uname -sm)" = "Linux x86_64" ]; then
   # Running it again upgrades in place.
   install > /dev/null
 
-  sed -i 's/^./f/' "$release/SHA256SUMS"
+  # All zeros: changing a single digit does nothing if the hash already has that value.
+  sed -i "s/^[0-9a-f]*/$(printf '%064d' 0)/" "$release/SHA256SUMS"
   if install > /dev/null 2>&1; then
     echo "install.sh accepted a bad checksum" >&2
     exit 1
