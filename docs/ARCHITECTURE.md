@@ -703,8 +703,9 @@ Code in `crates/clipboard` (`read_files`, `write_files`) and `crates/daemon/src/
 
 ## Tray icon
 
-**Status: proposal.** The owner approves the technology and tests the prototype on macOS and
-Windows before this is final.
+**Status: chosen, verified by hand only on Linux.** The owner approved the technology. On macOS and
+Windows CI only builds it and runs the tests, so nobody has seen the icon there yet. The owner tests
+it from a release. If it fails on either OS, this decision is reopened.
 
 The same icon with the same menu on the 3 OSes: the notification area on Windows, the menu bar on
 macOS, and a StatusNotifierItem on Linux (waybar, swaybar and quickshell on Hyprland/Sway, the panel
