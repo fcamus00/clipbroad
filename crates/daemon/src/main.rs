@@ -6,6 +6,7 @@ mod run;
 mod service;
 mod status;
 mod tray;
+mod update;
 mod watch;
 
 use std::io::{self, IsTerminal};
@@ -46,8 +47,8 @@ enum Command {
     /// meanwhile. Logs show this
     /// node's id (peers need it in their config), connections, and each clip's size and short
     /// hash, never its content. Content a password manager marks as sensitive is never read or
-    /// sent. The tray icon shows the peers and the last clip, and its menu pairs a machine and pauses
-    /// sync.
+    /// sent. The tray icon shows the peers and the last clip, and its menu pairs a machine, pauses sync
+    /// and installs updates.
     Run(run::Args),
     /// Print every change of the local clipboard, one line per change, until Ctrl+C.
     ///
@@ -68,15 +69,23 @@ enum Command {
     /// identity file), so it shows the daemon started with the same `--config`. Clips appear as
     /// time, size and short hash, never their content.
     Status(status::Args),
+    /// Install the latest release, if it is newer, and restart the running daemon.
+    ///
+    /// A Homebrew install updates through Homebrew. Any other install downloads the release
+    /// archive, checks its signature and checksum, and replaces this executable. The tray menu
+    /// does the same.
+    Update(update::Args),
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let default_level = match cli.command {
         Command::Run(_) => LevelFilter::INFO,
-        Command::Pair(_) | Command::Watch(_) | Command::Service(_) | Command::Status(_) => {
-            LevelFilter::WARN
-        }
+        Command::Pair(_)
+        | Command::Watch(_)
+        | Command::Service(_)
+        | Command::Status(_)
+        | Command::Update(_) => LevelFilter::WARN,
     };
     init_logging(default_level, cli.verbose);
     match cli.command {
@@ -86,6 +95,7 @@ fn main() -> anyhow::Result<()> {
         Command::Watch(args) => runtime()?.block_on(watch::run(args)),
         Command::Service(args) => service::run(args),
         Command::Status(args) => status::run(args),
+        Command::Update(args) => runtime()?.block_on(update::run(args)),
     }
 }
 

@@ -20,6 +20,9 @@ use anyhow::{Context, Result, ensure};
 #[cfg_attr(windows, path = "service/windows.rs")]
 mod platform;
 
+#[cfg(windows)]
+pub use platform::start_hidden;
+
 #[derive(Debug, clap::Args)]
 pub struct Args {
     #[command(subcommand)]

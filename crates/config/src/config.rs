@@ -37,6 +37,9 @@ pub struct Config {
     pub file_cache_max_bytes: NonZeroU64,
     /// Received files older than this many days are deleted from the cache.
     pub file_cache_max_days: NonZeroU32,
+    /// Ask GitHub once a day whether there is a new version. When off, clipbroad only asks when a
+    /// person does, from the tray menu or with `clipbroad update`.
+    pub update_check: bool,
     /// Paired machines.
     pub peers: Vec<Peer>,
 }
@@ -77,6 +80,7 @@ impl Default for Config {
             file_max_bytes: Self::DEFAULT_FILE_MAX_BYTES,
             file_cache_max_bytes: Self::DEFAULT_FILE_CACHE_MAX_BYTES,
             file_cache_max_days: Self::DEFAULT_FILE_CACHE_MAX_DAYS,
+            update_check: true,
             peers: Vec::new(),
         }
     }
@@ -239,6 +243,7 @@ mod tests {
         assert_eq!(config.file_max_bytes.get(), 512 * 1024 * 1024);
         assert_eq!(config.file_cache_max_bytes.get(), 2 * 1024 * 1024 * 1024);
         assert_eq!(config.file_cache_max_days.get(), 7);
+        assert!(config.update_check);
         assert_eq!(config.peers, []);
     }
 

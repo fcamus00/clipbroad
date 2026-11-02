@@ -10,6 +10,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::pair::TICKET_TTL;
 use crate::status::DaemonStatus;
+use crate::update::{State, VERSION};
 
 /// How long a note stays in the menu, so a result is still there when the person looks. A ticket
 /// expires by then too, so the note about it never outlives it.
@@ -23,6 +24,8 @@ pub enum Action {
     /// Pair with the ticket on the clipboard.
     PairCopied,
     TogglePause,
+    /// Check for updates, or install the one a check found.
+    Update,
     Quit,
 }
 
@@ -38,6 +41,14 @@ pub struct View {
     pub paused: bool,
     /// Whether clips are flowing, which picks the icon.
     pub syncing: bool,
+    pub update: UpdateItem,
+}
+
+/// The menu item that checks for updates and installs them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateItem {
+    pub text: String,
+    pub enabled: bool,
 }
 
 impl View {
@@ -49,15 +60,33 @@ impl View {
             can_pair: false,
             paused: false,
             syncing: false,
+            update: UpdateItem {
+                text: format!("Check for updates ({VERSION})"),
+                enabled: false,
+            },
         }
     }
 
-    fn new(status: &DaemonStatus, note: Option<&str>, pairing: bool, now_ms: u64) -> Self {
+    fn new(
+        status: &DaemonStatus,
+        note: Option<&str>,
+        pairing: bool,
+        update: State,
+        now_ms: u64,
+    ) -> Self {
         let connected = status.peers.iter().filter(|peer| peer.connected).count();
         let peers = match status.peers.len() {
             0 => "No machines paired yet".to_owned(),
             1 => format!("{connected} of 1 machine connected"),
             total => format!("{connected} of {total} machines connected"),
+        };
+        let (text, enabled) = match update {
+            State::Idle => (format!("Check for updates ({VERSION})"), true),
+            State::Checking => ("Checking for updates...".to_owned(), false),
+            // A restart would resume sync, and pairing would be cut off.
+            State::Available(_) if status.paused => ("Resume sync to update".to_owned(), false),
+            State::Available(version) => (format!("Update to {version} and restart"), !pairing),
+            State::Installing(version) => (format!("Updating to {version}..."), false),
         };
         Self {
             status: if status.paused {
@@ -76,6 +105,7 @@ impl View {
             can_pair: !pairing,
             paused: status.paused,
             syncing: connected > 0 && !status.paused,
+            update: UpdateItem { text, enabled },
         }
     }
 }
@@ -125,10 +155,10 @@ impl Menu {
     }
 
     /// Sends what the menu should show, if it changed.
-    pub fn show(&mut self, status: &DaemonStatus, pairing: bool, now_ms: u64) {
+    pub fn show(&mut self, status: &DaemonStatus, pairing: bool, update: State, now_ms: u64) {
         self.note.take_if(|(_, until_ms)| *until_ms <= now_ms);
         let note = self.note.as_ref().map(|(text, _)| text.as_str());
-        let view = View::new(status, note, pairing, now_ms);
+        let view = View::new(status, note, pairing, update, now_ms);
         if self.shown.as_ref() != Some(&view) {
             // Fails if there is no icon, and then nobody is looking.
             let _ = self.views.send(view.clone());

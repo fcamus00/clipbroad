@@ -39,6 +39,7 @@ cargo fmt --all                                         # format
 cargo clippy --workspace --all-targets -- -D warnings   # lints (warnings = error)
 cargo nextest run --workspace --no-tests=pass           # tests
 cargo test --workspace --doc                            # doctests (nextest does not run them)
+cargo nextest run -p clipbroad --features update-smoke --test update_smoke  # update, end to end
 cargo deny check                                        # advisories, licenses, sources
 cargo machete                                           # unused dependencies
 cargo run -p clipbroad -- --help                        # run the binary

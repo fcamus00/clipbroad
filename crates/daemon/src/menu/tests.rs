@@ -3,6 +3,7 @@ use iroh::{EndpointId, SecretKey};
 
 use super::*;
 use crate::status::{ClipEvent, Mdns, PeerStatus};
+use crate::update::Version;
 
 const NOW_MS: u64 = 1_000_000_000;
 
@@ -28,6 +29,7 @@ fn status(peers: Vec<PeerStatus>) -> DaemonStatus {
         mdns: Mdns::On,
         paste_access: None,
         paused: false,
+        update: None,
         last_sent: None,
         last_received: None,
         peers,
@@ -51,6 +53,7 @@ fn counts_connected_machines() {
         &status(vec![peer(2, "laptop", true), peer(3, "mac", false)]),
         None,
         false,
+        State::Idle,
         NOW_MS,
     );
     assert_eq!(view.status, "1 of 2 machines connected");
@@ -60,10 +63,16 @@ fn counts_connected_machines() {
 
 #[test]
 fn does_not_count_as_syncing_without_a_connected_peer() {
-    let alone = View::new(&status(vec![]), None, false, NOW_MS);
+    let alone = View::new(&status(vec![]), None, false, State::Idle, NOW_MS);
     assert_eq!(alone.status, "No machines paired yet");
     assert!(!alone.syncing);
-    let offline = View::new(&status(vec![peer(2, "laptop", false)]), None, false, NOW_MS);
+    let offline = View::new(
+        &status(vec![peer(2, "laptop", false)]),
+        None,
+        false,
+        State::Idle,
+        NOW_MS,
+    );
     assert_eq!(offline.status, "0 of 1 machine connected");
     assert!(!offline.syncing);
 }
@@ -74,7 +83,7 @@ fn does_not_count_as_syncing_while_paused() {
         paused: true,
         ..status(vec![peer(2, "laptop", true)])
     };
-    let view = View::new(&paused, None, false, NOW_MS);
+    let view = View::new(&paused, None, false, State::Idle, NOW_MS);
     assert_eq!(view.status, "Sync paused. 1 of 1 machine connected");
     assert!(view.paused);
     assert!(!view.syncing);
@@ -88,7 +97,7 @@ fn shows_the_newest_clip() {
         ..status(vec![peer(2, "laptop", true)])
     };
     assert_eq!(
-        View::new(&clips, None, false, NOW_MS).activity,
+        View::new(&clips, None, false, State::Idle, NOW_MS).activity,
         "Last received from laptop: text, 120 bytes, 5 s ago"
     );
     let older_received = DaemonStatus {
@@ -97,11 +106,11 @@ fn shows_the_newest_clip() {
         ..clips
     };
     assert_eq!(
-        View::new(&older_received, None, false, NOW_MS).activity,
+        View::new(&older_received, None, false, State::Idle, NOW_MS).activity,
         "Last sent: text, 120 bytes, 5 s ago"
     );
     assert_eq!(
-        View::new(&status(vec![]), None, false, NOW_MS).activity,
+        View::new(&status(vec![]), None, false, State::Idle, NOW_MS).activity,
         "No clips yet"
     );
 }
@@ -114,9 +123,9 @@ fn a_note_replaces_the_last_clip_until_it_expires() {
     };
     let (mut menu, gui) = channel();
     menu.note("Paired", NOW_MS);
-    menu.show(&status, false, NOW_MS);
+    menu.show(&status, false, State::Idle, NOW_MS);
     assert_eq!(gui.views.try_recv().expect("sent").activity, "Paired");
-    menu.show(&status, false, NOW_MS + NOTE_TTL_MS);
+    menu.show(&status, false, State::Idle, NOW_MS + NOTE_TTL_MS);
     assert_eq!(
         gui.views.try_recv().expect("sent").activity,
         format!("Last sent: text, 120 bytes, {} min ago", 5)
@@ -127,11 +136,11 @@ fn a_note_replaces_the_last_clip_until_it_expires() {
 fn sends_a_view_only_when_it_changes() {
     let status = status(vec![]);
     let (mut menu, gui) = channel();
-    menu.show(&status, false, NOW_MS);
-    menu.show(&status, false, NOW_MS + 1);
+    menu.show(&status, false, State::Idle, NOW_MS);
+    menu.show(&status, false, State::Idle, NOW_MS + 1);
     assert!(gui.views.try_recv().is_ok());
     assert!(gui.views.try_recv().is_err());
-    menu.show(&status, true, NOW_MS + 2);
+    menu.show(&status, true, State::Idle, NOW_MS + 2);
     assert!(!gui.views.try_recv().expect("changed").can_pair);
 }
 
@@ -139,5 +148,51 @@ fn sends_a_view_only_when_it_changes() {
 fn works_without_an_icon() {
     let (mut menu, gui) = channel();
     drop(gui);
-    menu.show(&status(vec![]), false, NOW_MS);
+    menu.show(&status(vec![]), false, State::Idle, NOW_MS);
+}
+
+fn update_item(state: State, paused: bool, pairing: bool) -> (String, bool) {
+    let status = DaemonStatus {
+        paused,
+        ..status(vec![])
+    };
+    let UpdateItem { text, enabled } = View::new(&status, None, pairing, state, NOW_MS).update;
+    (text, enabled)
+}
+
+#[test]
+fn update_item_follows_the_update() {
+    let version: Version = "9.8.7".parse().expect("a version");
+    assert_eq!(
+        update_item(State::Idle, false, false),
+        (format!("Check for updates ({VERSION})"), true)
+    );
+    assert_eq!(
+        update_item(State::Checking, false, false),
+        ("Checking for updates...".to_owned(), false)
+    );
+    assert_eq!(
+        update_item(State::Available(version), false, false),
+        ("Update to 9.8.7 and restart".to_owned(), true)
+    );
+    assert_eq!(
+        update_item(State::Installing(version), false, false),
+        ("Updating to 9.8.7...".to_owned(), false)
+    );
+}
+
+#[test]
+fn nothing_installs_while_a_restart_would_get_in_the_way() {
+    let available = State::Available("9.8.7".parse().expect("a version"));
+    // A restart resumes sync, which would undo the pause.
+    assert_eq!(
+        update_item(available, true, false),
+        ("Resume sync to update".to_owned(), false)
+    );
+    assert_eq!(
+        update_item(available, false, true),
+        ("Update to 9.8.7 and restart".to_owned(), false)
+    );
+    // Only installing is blocked: looking for a version restarts nothing.
+    assert!(update_item(State::Idle, true, true).1);
 }

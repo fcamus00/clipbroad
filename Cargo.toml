@@ -20,13 +20,19 @@ data-encoding = "2.11"
 getrandom = "0.4"
 iroh = { version = "1.4.1", default-features = false, features = ["tls-ring", "fast-apple-datapath"] }
 iroh-mdns-address-lookup = "0.6.1"
+minisign = "0.10"
+minisign-verify = "0.3"
 objc2 = "0.6.5"
 objc2-app-kit = { version = "0.3.2", default-features = false }
 objc2-foundation = { version = "0.3.2", default-features = false }
 png = "0.18.1"
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+# iroh already brings these two; the updater uses the same builds.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring"] }
 rustix = "1.1"
 serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.11"
 subtle = "2.6"
 tempfile = "3.27"
 thiserror = "2.0"

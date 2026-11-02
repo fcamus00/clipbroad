@@ -74,6 +74,7 @@ fn help_describes_commands_and_hides_fake() {
         "{help}"
     );
     assert!(help.contains("pair Pair with another machine"), "{help}");
+    assert!(help.contains("update Install the latest release"), "{help}");
 
     let pair_help = stdout(clipbroad(&["pair", "--help"]));
     assert!(pair_help.contains("[TICKET]"), "{pair_help}");

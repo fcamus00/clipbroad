@@ -82,7 +82,7 @@ struct Daemon {
     status_file: PathBuf,
     cache_dir: PathBuf,
     stop: oneshot::Sender<()>,
-    task: JoinHandle<Result<()>>,
+    task: JoinHandle<Result<Exit>>,
     gui: Gui,
     /// The newest view from the menu.
     view: Mutex<View>,
@@ -107,7 +107,7 @@ impl Daemon {
                 let _ = stopped.await;
                 Ok(())
             };
-            sync(shared, &config, &key, &paths, shutdown, menu).await
+            sync(shared, &config, &key, &paths, shutdown, menu, None).await
         });
         Self {
             id: spec.id(),
@@ -818,14 +818,15 @@ async fn pause_stops_both_directions_and_sends_nothing_later() {
     b.stop().await;
 }
 
-/// Waits for a daemon asked to quit, and checks that it cleaned up.
-async fn stopped_cleanly(daemon: Daemon) {
-    time::timeout(TIMEOUT, daemon.task)
+/// Waits for a daemon asked to stop, checks that it cleaned up and returns how it ended.
+async fn stopped_cleanly(daemon: Daemon) -> Exit {
+    let exit = time::timeout(TIMEOUT, daemon.task)
         .await
         .expect("daemon stops")
         .expect("daemon does not panic")
         .expect("daemon stops cleanly");
     assert!(!daemon.status_file.exists(), "the status file is gone");
+    exit
 }
 
 #[tokio::test]
@@ -837,7 +838,7 @@ async fn menu_quit_stops_the_daemon() {
     );
     assert!(eventually(TIMEOUT, || daemon.status().is_some()).await);
     daemon.click(Action::Quit);
-    stopped_cleanly(daemon).await;
+    assert_eq!(stopped_cleanly(daemon).await, Exit::Quit);
 }
 
 #[tokio::test]
@@ -849,5 +850,38 @@ async fn quit_request_stops_the_daemon() {
     );
     assert!(eventually(TIMEOUT, || daemon.status().is_some()).await);
     assert!(crate::control::quit(&daemon.paths).await, "it agrees");
-    stopped_cleanly(daemon).await;
+    assert_eq!(stopped_cleanly(daemon).await, Exit::Quit);
+}
+
+#[tokio::test]
+async fn control_channel_asks_the_daemon_to_restart() {
+    let spec = Spec::new();
+    let daemon = Daemon::start(
+        &spec,
+        spec.config([], Config::DEFAULT_INLINE_MAX_BYTES.get()),
+    );
+    assert!(eventually(TIMEOUT, || daemon.status().is_some()).await);
+    assert_eq!(
+        crate::control::restart(&daemon.paths).await,
+        crate::control::Asked::Agreed
+    );
+    assert_eq!(stopped_cleanly(daemon).await, Exit::Restart);
+}
+
+#[tokio::test]
+async fn the_update_item_says_so_without_an_updater() {
+    let spec = Spec::new();
+    let daemon = Daemon::start(
+        &spec,
+        spec.config([], Config::DEFAULT_INLINE_MAX_BYTES.get()),
+    );
+    assert!(eventually(TIMEOUT, || daemon.status().is_some()).await);
+    assert!(eventually(TIMEOUT, || daemon.view().update.enabled).await);
+    daemon.click(Action::Update);
+    assert!(
+        eventually(TIMEOUT, || daemon.view().activity.contains("not available")).await,
+        "{:?}",
+        daemon.view()
+    );
+    daemon.stop().await;
 }

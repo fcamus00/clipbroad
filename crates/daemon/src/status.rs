@@ -65,6 +65,8 @@ pub struct DaemonStatus {
     /// Paused from the tray menu: no clip is sent or applied.
     #[serde(default)]
     pub paused: bool,
+    /// A newer version the daemon found.
+    pub update: Option<String>,
     pub last_sent: Option<ClipEvent>,
     pub last_received: Option<ClipEvent>,
     /// In config order, then the peers paired while running.
@@ -141,6 +143,7 @@ impl DaemonStatus {
             mdns,
             paste_access: None,
             paused: false,
+            update: None,
             last_sent: None,
             last_received: None,
             peers: peers.collect(),
@@ -301,6 +304,12 @@ pub fn render(status: Option<&DaemonStatus>, now_ms: u64) -> String {
         line(
             "sync",
             "paused from the tray menu: nothing is sent or received",
+        );
+    }
+    if let Some(version) = &status.update {
+        line(
+            "update",
+            &format!("{version} is available, run `clipbroad update`"),
         );
     }
     line("last sent", &clip(status.last_sent.as_ref()));

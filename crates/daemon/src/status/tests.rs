@@ -20,6 +20,7 @@ fn sample() -> DaemonStatus {
         mdns: Mdns::On,
         paste_access: None,
         paused: false,
+        update: None,
         last_sent: Some(ClipEvent {
             at_ms: NOW_MS - 3 * 60_000,
             kind: ContentKind::Text,
@@ -176,4 +177,13 @@ fn save_replaces_the_file_and_remove_deletes_it() {
 
     remove(&path);
     assert_eq!(read(&path).expect("no file is fine"), None);
+}
+
+#[test]
+fn shows_a_new_version_only_when_there_is_one() {
+    let mut status = sample();
+    let now = status.updated_ms;
+    assert!(!render(Some(&status), now).contains("update"));
+    status.update = Some("9.9.9".to_owned());
+    assert!(render(Some(&status), now).contains("9.9.9 is available, run `clipbroad update`"));
 }
