@@ -115,6 +115,7 @@ pub async fn through<S: control::Stream>(
             }
             Reply::Paired(paired) => return Ok(paired),
             Reply::Failed(error) => anyhow::bail!(error),
+            Reply::Quitting => anyhow::bail!("the daemon is shutting down"),
         }
     }
 }

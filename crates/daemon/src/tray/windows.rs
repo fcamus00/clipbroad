@@ -1,41 +1,38 @@
 //! Windows: `tray-icon` adds the icon through a hidden window, whose messages (clicks, the menu,
-//! Explorer restarting) arrive through the message loop of the thread that created it.
+//! Explorer restarting) arrive through the message loop of the thread that created it. A timer
+//! wakes that loop, so it gets to run its update at least every [`POLL_INTERVAL`]. A message from
+//! another thread would not do: an open menu runs its own loop, which throws those away.
 
 use std::ptr;
 
 use anyhow::Result;
-use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MSG, PostThreadMessageW, TranslateMessage, WM_QUIT,
+    DispatchMessageW, GetMessageW, MSG, SetTimer, TranslateMessage,
 };
 
-pub struct EventLoop {
-    thread: u32,
-}
+use super::POLL_INTERVAL;
+
+pub struct EventLoop;
 
 impl EventLoop {
-    // Win32 FFI. It never fails here, but keeps the signature every platform shares (it can fail
-    // on macOS).
-    #[allow(unsafe_code, clippy::unnecessary_wraps)]
+    // It cannot fail here, but can on macOS.
+    #[allow(clippy::unnecessary_wraps)]
     pub fn new() -> Result<Self> {
-        // SAFETY: takes nothing and cannot fail.
-        let thread = unsafe { GetCurrentThreadId() };
-        Ok(Self { thread })
+        Ok(Self)
     }
 
-    pub fn waker(&self) -> Waker {
-        Waker {
-            thread: self.thread,
-        }
-    }
-
-    /// Dispatches this thread's messages until [`Waker::wake`] posts `WM_QUIT`.
-    // Win32 FFI. It takes `self` like on the other platforms, though the loop is just this
+    /// Dispatches this thread's messages and calls `update` after each one, and at least every
+    /// [`POLL_INTERVAL`], until it returns false.
+    // Win32 FFI. It keeps `self` like on the other platforms, though the loop is just this
     // thread's.
     #[allow(unsafe_code, clippy::unused_self)]
-    pub fn run(&self) {
+    pub fn run(&self, mut update: impl FnMut() -> bool) {
+        let interval = u32::try_from(POLL_INTERVAL.as_millis()).unwrap_or(u32::MAX);
+        // SAFETY: plain values. No window and no callback mean it posts WM_TIMER to this thread,
+        // and the process ends soon after this loop, so the timer needs no cleanup.
+        unsafe { SetTimer(ptr::null_mut(), 0, interval, None) };
         let mut message = MSG::default();
-        loop {
+        while update() {
             // SAFETY: `message` is a valid MSG to write to. A null window means every message of
             // this thread. Returns 0 for WM_QUIT and -1 on an error (invalid arguments, none here).
             let got = unsafe { GetMessageW(&raw mut message, ptr::null_mut(), 0, 0) };
@@ -48,20 +45,6 @@ impl EventLoop {
                 DispatchMessageW(&raw const message);
             }
         }
-    }
-}
-
-pub struct Waker {
-    thread: u32,
-}
-
-impl Waker {
-    /// Ends [`EventLoop::run`] from any thread.
-    #[allow(unsafe_code)] // Win32 FFI.
-    pub fn wake(&self) {
-        // SAFETY: plain values. It fails only if the thread is gone or has no message queue, and
-        // then there is no loop to end.
-        unsafe { PostThreadMessageW(self.thread, WM_QUIT, 0, 0) };
     }
 }
 

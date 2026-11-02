@@ -1,4 +1,5 @@
-//! The control channel: how `clipbroad pair` asks the running daemon to pair.
+//! The control channel: how `clipbroad pair` asks the running daemon to pair, and how `clipbroad
+//! service` on Windows asks it to quit.
 //!
 //! The daemon listens on a local socket: a Unix socket `control.sock` beside the identity file
 //! on Linux and macOS, and a named pipe on Windows whose name comes from the same path. Either
@@ -9,9 +10,9 @@
 //! need polling and locking for.
 //!
 //! Each message is a big-endian `u32` length and the message in `postcard`. The client sends one
-//! [`Request`]; the daemon answers with [`Reply`]s until a [`Reply::Paired`] or a
-//! [`Reply::Failed`]. While it hosts, the daemon watches the stream: if the client quits, the
-//! daemon stops waiting for the other machine.
+//! [`Request`]; the daemon answers with [`Reply`]s until a [`Reply::Paired`], a [`Reply::Failed`]
+//! or a [`Reply::Quitting`]. While it hosts, the daemon watches the stream: if the client quits,
+//! the daemon stops waiting for the other machine.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -19,7 +20,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use clipbroad_config::{Paths, Peer};
 use clipbroad_net::Node;
-use clipbroad_net::pair::Ticket;
+use clipbroad_net::pair::{Host, Ticket};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
@@ -52,6 +53,9 @@ pub enum Request {
     Host,
     /// Pair with the machine that showed this ticket.
     Join(String),
+    /// Shut down, as the tray menu's "Quit" does. A new variant goes last: a daemon from before
+    /// it closes the channel, which tells the client to stop it some other way.
+    Quit,
 }
 
 /// What the daemon answers.
@@ -62,6 +66,19 @@ pub enum Reply {
     Paired(Paired),
     /// Why pairing failed, ready to show.
     Failed(String),
+    /// The daemon got [`Request::Quit`] and is shutting down.
+    Quitting,
+}
+
+/// How serving a client ended.
+#[derive(Debug)]
+pub enum Served {
+    /// The client asked for nothing.
+    Nothing,
+    /// A pairing ended, with the peer and whether it was new.
+    Paired(Result<(Peer, bool)>),
+    /// The daemon should shut down.
+    Quit,
 }
 
 /// Where the daemon listens: `control.sock` beside the identity file. On Windows, the pipe name
@@ -111,61 +128,85 @@ pub fn listen(paths: &Paths) -> Option<Listener> {
         .ok()
 }
 
-/// Serves one client: pairs as it asks, saving the peer to the config and adding it to `node`.
-/// Returns the peer if it was new, so the daemon can list it in its status.
-pub async fn serve(stream: impl Stream, node: &Node, paths: &Paths) -> Option<Peer> {
+/// Serves one client: pairs as it asks, saving the peer to the config and adding it to `node`, or
+/// tells the daemon to quit.
+pub async fn serve(stream: impl Stream, node: &Node, paths: &Paths) -> Served {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let request = match time::timeout(REQUEST_TIMEOUT, read(&mut reader)).await {
         Ok(Ok(request)) => request,
         // Such as a second daemon checking whether this one is alive.
         Ok(Err(error)) => {
             debug!("control client sent no request: {error:#}");
-            return None;
+            return Served::Nothing;
         }
         Err(_) => {
             debug!("control client sent no request in time");
-            return None;
+            return Served::Nothing;
         }
     };
-    let outcome = async {
-        match request {
-            Request::Host => {
+    let outcome = match request {
+        Request::Quit => {
+            let _ = write(&mut writer, &Reply::Quitting).await;
+            return Served::Quit;
+        }
+        Request::Host => {
+            async {
                 let host = pair::host_on(node)?;
                 write(&mut writer, &Reply::Ticket(host.ticket().to_string())).await?;
-                info!("waiting for the other machine to use the pairing ticket");
-                tokio::select! {
-                    paired = pair::finish_host(host, paths, TICKET_TTL, Some(node)) => paired,
-                    // The client sends nothing more, so this only ends when it quits.
-                    _ = reader.read_u8() => anyhow::bail!("`clipbroad pair` quit"),
-                }
+                finish_hosting(host, &mut reader, node, paths).await
             }
-            Request::Join(ticket) => {
+            .await
+        }
+        Request::Join(ticket) => {
+            async {
                 let ticket: Ticket = ticket.parse()?;
                 pair::join_on(node, paths, &ticket).await
             }
+            .await
         }
-    }
-    .await;
+    };
     let reply = match &outcome {
-        Ok((peer, added)) => {
-            let name = peer.name.as_deref().unwrap_or("(no name)");
-            info!(peer = %peer.id.fmt_short(), name, added, "paired");
-            Reply::Paired(Paired::new((peer.clone(), *added)))
-        }
-        Err(error) => {
-            warn!("pairing failed: {error:#}");
-            Reply::Failed(format!("{error:#}"))
-        }
+        Ok((peer, added)) => Reply::Paired(Paired::new((peer.clone(), *added))),
+        Err(error) => Reply::Failed(format!("{error:#}")),
     };
     // The client may be gone already.
     let _ = write(&mut writer, &reply).await;
-    outcome.ok().and_then(|(peer, added)| added.then_some(peer))
+    Served::Paired(outcome)
+}
+
+/// Waits for the other machine, or until the client quits.
+async fn finish_hosting(
+    host: Host,
+    client: &mut (impl AsyncRead + Unpin),
+    node: &Node,
+    paths: &Paths,
+) -> Result<(Peer, bool)> {
+    info!("waiting for the other machine to use the pairing ticket");
+    tokio::select! {
+        paired = pair::finish_host(host, paths, TICKET_TTL, Some(node)) => paired,
+        // The client sends nothing more, so this only ends when it quits.
+        _ = client.read_u8() => anyhow::bail!("`clipbroad pair` quit"),
+    }
 }
 
 /// Answers a client while another one is pairing.
 pub async fn refuse(mut stream: impl Stream) {
     let reply = Reply::Failed("another `clipbroad pair` is already running".to_owned());
     let _ = write(&mut stream, &reply).await;
+}
+
+/// Asks the daemon that uses `paths` to shut down. Returns whether it agreed: there may be no
+/// daemon, or one that cannot do it yet (from before [`Request::Quit`], or busy pairing).
+#[cfg(any(windows, test))]
+pub async fn quit(paths: &Paths) -> bool {
+    let Ok(Some(mut daemon)) = connect(paths).await else {
+        return false;
+    };
+    if write(&mut daemon, &Request::Quit).await.is_err() {
+        return false;
+    }
+    let reply = time::timeout(REQUEST_TIMEOUT, read(&mut daemon)).await;
+    matches!(reply, Ok(Ok(Reply::Quitting)))
 }
 
 #[cfg(test)]

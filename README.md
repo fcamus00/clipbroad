@@ -76,6 +76,29 @@ xattr -d com.apple.quarantine clipbroad
 (`gh run download` usually does not set the flag; it is needed when the file was downloaded with a
 browser. If `xattr` says "No such xattr", there is nothing to do.)
 
+## Tray icon
+
+`clipbroad run` shows an icon in the notification area on Windows, the menu bar on macOS, and the
+tray of your bar on Linux (waybar and quickshell on Hyprland, swaybar on Sway, the panel on KDE). A
+blue circle means that at least one machine is connected and sync is on. A grey ring means that none
+is connected, or that sync is paused. On Linux, open the menu with a right click.
+
+The menu shows how many machines are connected and the last clip sent or received, and has these
+items:
+
+- **Pair a machine** copies a pairing ticket to the clipboard and waits 5 minutes for the other
+  machine. Send the ticket to that machine your own way, for example by mail. The ticket works once,
+  and clipbroad never sends it to the machines already paired.
+- **Pair with the copied ticket** pairs with the ticket on the clipboard. Use it on the other machine
+  after copying the ticket there. Both machines start syncing right away. The first line under the
+  status says how it went.
+- **Pause sync** stops sending and applying clips, until **Resume sync** or a restart. What you copy
+  during a pause is not sent later.
+- **Quit clipbroad** stops the daemon. It starts again at the next login if the service is installed.
+
+Without a tray, as on GNOME or Hyprland without a bar, the daemon syncs the same and logs a warning.
+Use `clipbroad pair` and `clipbroad status` instead.
+
 ## Start at login
 
 `clipbroad service install` makes the daemon (`clipbroad run`) start at every login, and starts it

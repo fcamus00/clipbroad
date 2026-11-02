@@ -19,6 +19,7 @@ fn sample() -> DaemonStatus {
         port: 4747,
         mdns: Mdns::On,
         paste_access: None,
+        paused: false,
         last_sent: Some(ClipEvent {
             at_ms: NOW_MS - 3 * 60_000,
             kind: ContentKind::Text,

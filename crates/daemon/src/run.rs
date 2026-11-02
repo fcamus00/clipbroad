@@ -14,13 +14,16 @@ use clipbroad_config::{Config, IdentityKey, Paths, Peer};
 use clipbroad_core::protocol::{ContentKind, NodeId, Payload};
 use clipbroad_core::sync::{LocalAction, RemoteAction, SyncEngine};
 use clipbroad_core::{ClipContent, ContentHash, Png};
+use clipbroad_net::pair::Ticket;
 use clipbroad_net::{FetchError, FileCache, Node, Offer, Received};
 use iroh::EndpointId;
 use tokio::time::{self, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
+use crate::control::Served;
+use crate::menu::{self, Action, Menu};
 use crate::status::{self, ClipEvent, DaemonStatus};
-use crate::{backend, control, tray};
+use crate::{backend, control, pair, tray};
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -37,13 +40,14 @@ pub struct Args {
 /// Runs the daemon with the tray icon, or without it for `--fake` (tests).
 pub fn start(args: Args) -> Result<()> {
     if args.fake {
-        return crate::runtime()?.block_on(run(args, future::pending()));
+        let (menu, _no_icon) = menu::channel();
+        return crate::runtime()?.block_on(run(args, menu));
     }
-    tray::run(|quit| crate::runtime()?.block_on(run(args, quit.chosen())))
+    tray::run(|menu| crate::runtime()?.block_on(run(args, menu)))
 }
 
-/// The daemon, until a shutdown signal or `quit` completes.
-async fn run(args: Args, quit: impl Future<Output = ()>) -> Result<()> {
+/// The daemon, until a shutdown signal or `menu`'s "Quit".
+async fn run(args: Args, menu: Menu) -> Result<()> {
     let paths = match args.config {
         Some(config_file) => Paths::beside_config(config_file),
         None => Paths::discover()?,
@@ -56,16 +60,15 @@ async fn run(args: Args, quit: impl Future<Output = ()>) -> Result<()> {
         backend::system_clipboard()?
     };
     info!(config = %paths.config_file.display(), peers = config.peers.len(), "starting");
-    let shutdown = async {
-        tokio::select! {
-            result = shutdown_signal() => result,
-            () = quit => {
-                info!("quit chosen in the tray menu");
-                Ok(())
-            }
-        }
-    };
-    sync(clipboard, &config, &identity, &paths, shutdown).await
+    sync(
+        clipboard,
+        &config,
+        &identity,
+        &paths,
+        shutdown_signal(),
+        menu,
+    )
+    .await
 }
 
 /// Ctrl+C, or SIGTERM on Unix (what systemd and `kill` send).
@@ -87,9 +90,8 @@ async fn shutdown_signal() -> io::Result<()> {
 /// a big download blocks no clip or local copy; dropping it cancels the download.
 type Download<'a> = Pin<Box<dyn Future<Output = Downloaded> + Send + 'a>>;
 
-/// A `clipbroad pair` being served (see [`control::serve`]). It ends with the peer it added, if
-/// any.
-type Pairing<'a> = Pin<Box<dyn Future<Output = Option<Peer>> + Send + 'a>>;
+/// A control client being served (see [`control::serve`]), or a pairing from the tray menu.
+type Pairing<'a> = Pin<Box<dyn Future<Output = Served> + Send + 'a>>;
 
 /// The end of a [`Download`]: the cache paths of the files, or why they could not be fetched.
 struct Downloaded {
@@ -101,17 +103,21 @@ struct Downloaded {
 
 /// Syncs `clipboard` with the peers in `config` until `shutdown` completes, keeping the status
 /// file up to date for `clipbroad status` (see [`status`]) and received files in the file cache.
-/// It also pairs when `clipbroad pair` asks over the control channel (see [`control`]), and
-/// syncs with the new peer right away.
+/// It also pairs when `clipbroad pair` asks over the control channel (see [`control`]) or the
+/// tray menu does, and syncs with the new peer right away. `menu` also pauses sync and quits.
 ///
 /// Errors from a single read, write or clip are logged and the loop keeps going; only a failed
 /// setup or a failed clipboard watcher end it.
+// One `select!` with a branch per event source. The branches share most of these locals, so
+// moving them out takes functions with all of those as arguments.
+#[allow(clippy::too_many_lines)]
 pub async fn sync(
     clipboard: Arc<dyn Clipboard>,
     config: &Config,
     identity: &IdentityKey,
     paths: &Paths,
     shutdown: impl Future<Output = io::Result<()>>,
+    mut menu: Menu,
 ) -> Result<()> {
     let mut changes = clipboard.watch().context("cannot watch the clipboard")?;
     let cache = FileCache::open(paths.file_cache_dir.clone(), config).with_context(|| {
@@ -152,8 +158,9 @@ pub async fn sync(
                     Some(Err(error)) => break Err(error).context("the clipboard watcher failed"),
                     None => break Err(anyhow!("the clipboard watcher stopped")),
                 };
-                // No formats means nothing to sync (empty clipboard, or formats unknown).
-                if change.formats.is_empty() {
+                // No formats means nothing to sync (empty clipboard, or formats unknown). What
+                // is copied during a pause is not sent later either.
+                if change.formats.is_empty() || status.paused {
                     continue;
                 }
                 match local_change(&clipboard, &mut engine, &node, config).await {
@@ -168,18 +175,11 @@ pub async fn sync(
             }
             // The node holds a sender, so this never ends while it runs.
             Some(received) = inbox.recv() => {
-                let files = match &received.clip.payload {
-                    Payload::Files(entries) => Some(entries.len()),
-                    Payload::Inline(_) => None,
-                };
-                status.last_received = Some(ClipEvent {
-                    at_ms: now_ms(),
-                    kind: received.clip.kind,
-                    size: received.clip.size,
-                    files,
-                    hash: short_hash(received.clip.hash),
-                    from: Some(received.from),
-                });
+                if status.paused {
+                    debug!(from = %received.from.fmt_short(), "sync is paused, clip ignored");
+                    continue;
+                }
+                status.last_received = Some(received_event(&received));
                 let remote = remote_clip(&clipboard, &mut engine, &node, &cache, received, &mut download);
                 if let Err(error) = remote.await {
                     warn!("{error:#}");
@@ -189,14 +189,43 @@ pub async fn sync(
                 Ok(client) => serve(client, &mut pairing, &node, paths),
                 Err(error) => warn!(%error, "cannot accept a control connection"),
             },
-            paired = finished(&mut pairing) => {
+            served = finished(&mut pairing) => {
                 pairing = None;
-                if let Some(peer) = paired {
-                    status.add_peer(&peer);
-                    // It may have connected already.
-                    status.update_links(&links.borrow_and_update());
+                match served {
+                    Served::Nothing => {}
+                    Served::Quit => {
+                        info!("quit requested over the control channel");
+                        break Ok(());
+                    }
+                    Served::Paired(outcome) => {
+                        menu.note(pairing_result(&outcome), now_ms());
+                        if let Ok((peer, true)) = outcome {
+                            status.add_peer(&peer);
+                        }
+                        // It may have connected already.
+                        status.update_links(&links.borrow_and_update());
+                    }
                 }
             }
+            Some(action) = menu.next_action() => match action {
+                Action::Quit => {
+                    info!("quit chosen in the tray menu");
+                    break Ok(());
+                }
+                Action::TogglePause => {
+                    status.paused = !status.paused;
+                    info!(paused = status.paused, "sync toggled in the tray menu");
+                    if status.paused {
+                        // It would land on the clipboard during the pause.
+                        download = None;
+                    }
+                }
+                Action::Pair | Action::PairCopied => {
+                    let copied = action == Action::PairCopied;
+                    let text = start_pairing(copied, &mut pairing, &clipboard, &node, paths).await;
+                    menu.note(text, now_ms());
+                }
+            },
             downloaded = finished(&mut download) => {
                 download = None;
                 if let Err(error) = apply_files(&clipboard, downloaded).await {
@@ -212,6 +241,7 @@ pub async fn sync(
             }
         }
         status.save(&status_file);
+        menu.show(&status, pairing.is_some(), now_ms());
     };
     // They borrow the node.
     drop((download, pairing));
@@ -228,6 +258,83 @@ async fn finished<F: Future + Unpin>(task: &mut Option<F>) -> F::Output {
         Some(task) => task.await,
         None => future::pending().await,
     }
+}
+
+/// Logs how a pairing ended and returns it as a note for the menu.
+fn pairing_result(outcome: &Result<(Peer, bool)>) -> String {
+    match outcome {
+        Ok((peer, added)) => {
+            let name = peer.name.as_deref().unwrap_or("(no name)");
+            info!(peer = %peer.id.fmt_short(), name, added, "paired");
+            format!("Paired with {name}")
+        }
+        Err(error) => {
+            warn!("pairing failed: {error:#}");
+            format!("Pairing failed: {error:#}")
+        }
+    }
+}
+
+/// Starts pairing from the menu, unless one is running: with the ticket on the clipboard if
+/// `copied`, or else by copying a new one there and waiting. Returns the note to show meanwhile.
+async fn start_pairing<'a>(
+    copied: bool,
+    pairing: &mut Option<Pairing<'a>>,
+    clipboard: &Arc<dyn Clipboard>,
+    node: &'a Node,
+    paths: &'a Paths,
+) -> String {
+    if pairing.is_some() {
+        return "Another pairing is running".to_owned();
+    }
+    let begun = if copied {
+        join_copied(clipboard, node, paths).await
+    } else {
+        host_copied(clipboard, node, paths).await
+    };
+    match begun {
+        Ok((task, text)) => {
+            *pairing = Some(task);
+            text.to_owned()
+        }
+        Err(error) => pairing_result(&Err(error)),
+    }
+}
+
+async fn host_copied<'a>(
+    clipboard: &Arc<dyn Clipboard>,
+    node: &'a Node,
+    paths: &'a Paths,
+) -> Result<(Pairing<'a>, &'static str)> {
+    let host = pair::host_on(node)?;
+    let ticket = host.ticket().to_string();
+    let clipboard = Arc::clone(clipboard);
+    tokio::task::spawn_blocking(move || clipboard.write_text(&ticket))
+        .await?
+        .context("cannot copy the ticket")?;
+    info!("waiting for the other machine to use the pairing ticket");
+    let task = async move {
+        Served::Paired(pair::finish_host(host, paths, pair::TICKET_TTL, Some(node)).await)
+    };
+    let text = "Ticket copied. Send it to the other machine, copy it there and choose \
+                \"Pair with the copied ticket\"";
+    Ok((Box::pin(task), text))
+}
+
+async fn join_copied<'a>(
+    clipboard: &Arc<dyn Clipboard>,
+    node: &'a Node,
+    paths: &'a Paths,
+) -> Result<(Pairing<'a>, &'static str)> {
+    let clipboard = Arc::clone(clipboard);
+    let text = tokio::task::spawn_blocking(move || clipboard.read_text())
+        .await?
+        .context("cannot read the clipboard")?;
+    let ticket: Ticket = text
+        .and_then(|text| text.parse().ok())
+        .context("the clipboard holds no pairing ticket")?;
+    let task = async move { Served::Paired(pair::join_on(node, paths, &ticket).await) };
+    Ok((Box::pin(task), "Pairing..."))
 }
 
 /// Serves `client`, or refuses it while another `clipbroad pair` is being served.
@@ -249,6 +356,21 @@ async fn accept(control: Option<&mut control::Listener>) -> io::Result<control::
     match control {
         Some(control) => control.accept().await,
         None => future::pending().await,
+    }
+}
+
+fn received_event(received: &Received) -> ClipEvent {
+    let files = match &received.clip.payload {
+        Payload::Files(entries) => Some(entries.len()),
+        Payload::Inline(_) => None,
+    };
+    ClipEvent {
+        at_ms: now_ms(),
+        kind: received.clip.kind,
+        size: received.clip.size,
+        files,
+        hash: short_hash(received.clip.hash),
+        from: Some(received.from),
     }
 }
 
@@ -290,6 +412,11 @@ async fn local_change(
                 return Ok(None);
             };
             (ClipContent::Files(offer.list().clone()), Some(offer))
+        }
+        // A ticket is meant for a machine that is not paired yet, and it is a secret for 5 minutes.
+        Copied::Text(text) if text.parse::<Ticket>().is_ok() => {
+            debug!("clipboard holds a pairing ticket, not synced");
+            return Ok(None);
         }
         Copied::Text(text) => (ClipContent::Text(text), None),
         Copied::Image(png) => (ClipContent::Image(png), None),
