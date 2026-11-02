@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Smoke test for packaging/: renders the package manager templates with fake checksums and checks
-# that the output parses (with ruby and jq, skipping each one that is missing). On Linux x86_64 it
-# also runs install.sh against a fake local release.
+# Smoke test for packaging/: renders the Homebrew template with a fake checksum and checks that the
+# formula parses (with ruby, skipped if it is missing). On Linux x86_64 it also runs install.sh
+# against a fake local release.
 # Usage: packaging/check.sh
 set -euo pipefail
 
@@ -9,9 +9,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-for platform in macos-aarch64.tar.gz windows-x86_64.zip; do
-  echo "$(printf '%064d' 0)  clipbroad-v1.2.3-$platform"
-done > "$tmp/SHA256SUMS"
+printf '%064d  clipbroad-v1.2.3-macos-aarch64.tar.gz\n' 0 > "$tmp/SHA256SUMS"
 "$here/render.sh" 1.2.3 "$tmp/SHA256SUMS" "$tmp/out"
 
 if grep -rn '@[A-Z0-9]*@' "$tmp/out"; then
@@ -24,11 +22,6 @@ if command -v ruby > /dev/null; then
   ruby -c "$tmp/out/homebrew-tap/Formula/clipbroad.rb"
 else
   skip "ruby not installed"
-fi
-if command -v jq > /dev/null; then
-  jq -e . "$tmp/out/scoop-bucket/bucket/clipbroad.json" > /dev/null
-else
-  skip "jq not installed"
 fi
 
 if [ "$(uname -sm)" = "Linux x86_64" ]; then

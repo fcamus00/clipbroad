@@ -11,7 +11,6 @@ LAN or Tailscale; no server, no third-party services.
 |---|---|
 | macOS (Apple Silicon) | `brew install fcamus00/tap/clipbroad` |
 | Windows | Download and open `clipbroad-<version>-windows-x86_64-setup.exe` from the [latest release](https://github.com/fcamus00/clipbroad/releases/latest) |
-| Windows (Scoop) | `scoop bucket add fcamus00 https://github.com/fcamus00/scoop-bucket` then `scoop install fcamus00/clipbroad` |
 | Linux (x86_64) | `curl -fsSL https://github.com/fcamus00/clipbroad/releases/latest/download/install.sh \| sh` |
 
 The Windows installer needs no admin rights. It installs to `%LOCALAPPDATA%\Programs\clipbroad`, adds
@@ -22,10 +21,9 @@ yet, so Windows SmartScreen shows "Windows protected your PC": click "More info"
 On Linux, the script checks the archive against `SHA256SUMS` and installs the binary to
 `~/.local/bin`. Run the same command again to upgrade.
 
-On macOS, Linux and with Scoop, run `clipbroad service install` to start the daemon at every login (see
+On macOS and Linux, run `clipbroad service install` to start the daemon at every login (see
 [Start at login](#start-at-login)). After an upgrade, run it again to restart the daemon on the new
-version. On Windows, Scoop cannot replace the binary while the daemon runs: run
-`clipbroad service uninstall` before `scoop update clipbroad`, and `clipbroad service install` after.
+version.
 
 ## Download a release
 

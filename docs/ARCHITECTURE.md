@@ -806,22 +806,23 @@ account) is only needed if that is not enough.
   installer, `install.sh` and `SHA256SUMS`. The process is in [`RELEASE.md`](RELEASE.md).
 - A custom workflow instead of `cargo-dist`: 3 archives and checksums are enough, and a short hand-written
   workflow is easier to maintain than a generated one.
-- Package managers: Homebrew (macOS) and Scoop (Windows). Each one
-  installs to a path that survives upgrades, so the login service does not break, and Homebrew does not
-  set the macOS quarantine flag. The `publish` job in `release.yml` updates them on each stable release.
-- Windows also gets an Inno Setup installer (`packaging/windows/`), because most Windows users do not
-  use Scoop. It installs per user to a fixed folder, so it needs no admin rights and the service path
-  survives upgrades. It drives login startup through `clipbroad service install` / `uninstall` instead
-  of writing the registry itself, so the service logic stays in one place. Inno Setup over WiX (MSI):
-  one short script, and it builds on the CI runner without extra tooling.
+- Package manager: Homebrew (macOS). It installs to a path that survives upgrades, so the login service
+  does not break, and it does not set the macOS quarantine flag. The `publish` job in `release.yml`
+  updates it on each stable release.
+- Windows gets an Inno Setup installer (`packaging/windows/`). It installs per user to a fixed folder,
+  so it needs no admin rights and the service path survives upgrades. It drives login startup through
+  `clipbroad service install` / `uninstall` instead of writing the registry itself, so the service logic
+  stays in one place. Inno Setup over WiX (MSI): one short script, and it builds on the CI runner
+  without extra tooling.
+- No Scoop (dropped 2026-11): the installer already covers Windows, most Windows users use neither a
+  terminal nor a package manager, and Scoop cannot update while the daemon runs. The `.zip` stays in
+  each release for installing by hand.
 - Linux gets an install script (`packaging/install.sh`, attached to every release) instead of a
   package manager. The AUR stopped accepting new accounts (2026-10), and distro repositories (APT, RPM)
   would mean hosting and signing our own. The script works on any distro and always installs to
   `~/.local/bin`, so the service path survives upgrades.
 - Homebrew only on macOS: on Linux, `current_exe` resolves Homebrew's symlink into the versioned
   folder, which `brew upgrade` deletes, and the service would point to a binary that no longer exists.
-- Scoop without a *shim*: the manifest adds the app folder to `PATH`. The shim is also called
-  `clipbroad.exe`, and `service install` would kill it while stopping the other `clipbroad.exe` processes.
 - The version lives in `[workspace.package]`; the workflow fails if the tag does not match
   `clipbroad --version`.
 - macOS: no signing or notarization for now (that requires an Apple Developer account).
