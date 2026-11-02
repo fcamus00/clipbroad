@@ -289,6 +289,10 @@ How `clipbroad pair` talks to the running daemon (code in `crates/daemon/src/con
 - **If it cannot open,** the daemon logs a warning and syncs anyway; `pair` then fails on the
   port, with a message that says to stop the daemon while pairing.
 
+On Windows, `clipbroad service` also uses it to ask the daemon to quit (`Request::Quit`), because
+there is no SIGTERM there. A daemon from before that request closes the channel, and `service` then
+kills it.
+
 ## Clipboard per platform
 
 | Platform | Detect changes | Read/write |
@@ -703,9 +707,7 @@ Code in `crates/clipboard` (`read_files`, `write_files`) and `crates/daemon/src/
 
 ## Tray icon
 
-**Status: chosen, verified by hand only on Linux.** The owner approved the technology. On macOS and
-Windows CI only builds it and runs the tests, so nobody has seen the icon there yet. The owner tests
-it from a release. If it fails on either OS, this decision is reopened.
+**Status: chosen.** The owner tested the first icon from v0.1.0 on Linux, macOS and Windows.
 
 The same icon with the same menu on the 3 OSes: the notification area on Windows, the menu bar on
 macOS, and a StatusNotifierItem on Linux (waybar, swaybar and quickshell on Hyprland/Sway, the panel
@@ -740,14 +742,33 @@ features off and the `ksni` feature on Linux. Compared in October 2026:
 single process and the menu needs no IPC to reach the daemon. The main thread runs the GUI event
 loop (macOS requires the main thread) and the daemon runs on a second thread with its own tokio
 runtime (`crates/daemon/src/tray.rs`):
-- Linux: no loop. `tray-icon` serves the D-Bus item from its own thread and the main thread waits
-  for the daemon.
+- Linux: no GUI events. `tray-icon` serves the D-Bus item from its own thread and the main thread
+  only polls for updates.
 - macOS: an `NSApplication` with the `Accessory` activation policy (no Dock icon), set at run time
-  because there is no bundle for `LSUIElement`. The main thread pumps its events by hand and checks
-  every 300 ms whether the daemon ended, because `NSApplication::run` can only be stopped from the
-  main thread.
-- Windows: a `GetMessageW` loop on the thread that owns the icon's hidden window. The daemon thread
-  ends it with `WM_QUIT`.
+  because there is no bundle for `LSUIElement`. The main thread pumps its events by hand, because
+  `NSApplication::run` can only be stopped from the main thread.
+- Windows: a `GetMessageW` loop on the thread that owns the icon's hidden window, woken by a timer.
+
+**The menu.** The GUI only draws, and the logic stays where tests reach it (`crates/daemon/src/menu.rs`).
+A click sends an `Action` down a channel to the daemon's loop, which handles it like any other event.
+After each event the loop sends a `View`, the texts and flags to show, if it changed. GUI objects must
+stay on their thread, so the main thread looks for new views every 300 ms. A wake-up per view would be
+one mechanism per OS, and on Windows it would get lost: an open menu runs its own loop, which discards
+thread messages. The menu shows nothing live while it is open on Windows and macOS, for the same
+reason.
+
+- Items: the peers connected and the last clip (disabled, they only show text), "Pair a machine",
+  "Pair with the copied ticket", "Pause sync", "Quit clipbroad". The icon is a blue circle while
+  clips flow and a grey ring otherwise, different in shape so color is not needed to tell them apart.
+- Pairing uses the same functions and the same slot as `clipbroad pair`, so there is one pairing at a
+  time from either place, and its items stay disabled meanwhile. The ticket goes through the clipboard
+  so the feature needs no window to show text. A note in place of the last clip says how it went, and
+  stays for 5 minutes, because a notification would need an app bundle on macOS.
+- A pairing ticket is never synced, whoever copied it: the ticket is for a machine that is not paired
+  yet, and it is a secret until it is used. `local_change` drops text that parses as a ticket.
+- Pause drops clips in both directions and cancels a running download. What is copied during a pause
+  is not sent on resume, so a pause also works as privacy. It is not saved: a restart resumes sync.
+  `clipbroad status` shows it.
 
 "Quit" takes the same path as Ctrl+C: the node shuts down, the status file is removed and the exit
 code is 0, so `Restart=on-failure` and `KeepAlive` do not start it again. `run --fake` (tests) shows
@@ -771,8 +792,9 @@ notifications. A signed `.app` (an Apple Developer
 account) is only needed if that is not enough.
 
 **Known limits.**
-- Windows: `service install` and `uninstall` stop the old daemon with `taskkill /f`, which leaves its
-  icon in the notification area until the mouse goes over it.
+- Windows: `service install` and `uninstall` ask the daemon to quit over the control channel, because
+  `taskkill /f` leaves its icon in the notification area until the mouse goes over it. They still use
+  `taskkill /f` for a daemon on another config, one from an older version, or one busy pairing.
 - Linux: a left click sends `Activate`, which does nothing yet; hosts open the menu on a right
   click. `tray-icon` does not expose `ksni`'s option to open the menu on a left click.
 - Linux: on exit, zbus sometimes logs a `NameLost` warning while the icon's D-Bus connection closes.

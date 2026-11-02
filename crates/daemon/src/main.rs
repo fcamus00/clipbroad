@@ -1,5 +1,6 @@
 mod backend;
 mod control;
+mod menu;
 mod pair;
 mod run;
 mod service;
@@ -45,7 +46,8 @@ enum Command {
     /// meanwhile. Logs show this
     /// node's id (peers need it in their config), connections, and each clip's size and short
     /// hash, never its content. Content a password manager marks as sensitive is never read or
-    /// sent.
+    /// sent. The tray icon shows the peers and the last clip, and its menu pairs a machine and pauses
+    /// sync.
     Run(run::Args),
     /// Print every change of the local clipboard, one line per change, until Ctrl+C.
     ///

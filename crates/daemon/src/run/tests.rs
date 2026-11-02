@@ -22,6 +22,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{self, Instant};
 
 use super::*;
+use crate::menu::{Gui, View};
 
 /// Upper bound for anything a test waits on. Localhost takes milliseconds; this only stops a
 /// broken test from hanging CI.
@@ -82,6 +83,9 @@ struct Daemon {
     cache_dir: PathBuf,
     stop: oneshot::Sender<()>,
     task: JoinHandle<Result<()>>,
+    gui: Gui,
+    /// The newest view from the menu.
+    view: Mutex<View>,
     _dir: TempDir,
 }
 
@@ -95,6 +99,7 @@ impl Daemon {
         let paths = Paths::beside_config(dir.path().join("config.toml"));
         let (status_file, cache_dir) = (paths.status_file(), paths.file_cache_dir.clone());
         let daemon_paths = paths.clone();
+        let (menu, gui) = menu::channel();
         let task = tokio::spawn(async move {
             let paths = daemon_paths;
             let shutdown = async {
@@ -102,7 +107,7 @@ impl Daemon {
                 let _ = stopped.await;
                 Ok(())
             };
-            sync(shared, &config, &key, &paths, shutdown).await
+            sync(shared, &config, &key, &paths, shutdown, menu).await
         });
         Self {
             id: spec.id(),
@@ -112,8 +117,33 @@ impl Daemon {
             cache_dir,
             stop,
             task,
+            gui,
+            view: Mutex::new(View::starting()),
             _dir: dir,
         }
+    }
+
+    /// Chooses a menu item, as a click does.
+    fn click(&self, action: Action) {
+        self.gui.actions.send(action).expect("the daemon runs");
+    }
+
+    /// What the menu shows now.
+    fn view(&self) -> View {
+        let mut view = lock(&self.view);
+        while let Ok(newer) = self.gui.views.try_recv() {
+            *view = newer;
+        }
+        view.clone()
+    }
+
+    fn connected_to(&self, other: &Self) -> bool {
+        self.status().is_some_and(|status| {
+            status
+                .peers
+                .iter()
+                .any(|peer| peer.id == other.id && peer.connected)
+        })
     }
 
     /// What `clipbroad status` would read. `None` also while the file cannot be read, as on
@@ -669,19 +699,155 @@ async fn running_daemons_pair_and_sync_without_restarting() {
 
     // Without restarting either daemon. A clip sent before the connection is up is lost, so
     // wait for it first, as `clipbroad status` shows it.
-    let connected_to = |daemon: &Daemon, other: &Daemon| {
-        daemon.status().is_some_and(|status| {
-            status
-                .peers
-                .iter()
-                .any(|peer| peer.id == other.id && peer.connected)
-        })
-    };
-    assert!(eventually(TIMEOUT, || connected_to(&a, &b) && connected_to(&b, &a)).await);
+    assert!(eventually(TIMEOUT, || a.connected_to(&b) && b.connected_to(&a)).await);
     a.clipboard.simulate_copy_text("from a");
     assert!(eventually(TIMEOUT, || b.text().as_deref() == Some("from a")).await);
     b.clipboard.simulate_copy_text("from b");
     assert!(eventually(TIMEOUT, || a.text().as_deref() == Some("from b")).await);
     a.stop().await;
     b.stop().await;
+}
+
+/// `ticket`, pointed at `spec`'s localhost address.
+fn local_ticket(ticket: &str, spec: &Spec) -> String {
+    let mut ticket: Ticket = ticket.parse().expect("a valid ticket");
+    ticket.addrs = vec![(Ipv4Addr::LOCALHOST, spec.port.get()).into()];
+    ticket.to_string()
+}
+
+#[tokio::test]
+async fn menu_pairs_two_daemons_through_the_clipboard_and_never_sends_the_ticket() {
+    let (spec_a, spec_b, observer_spec) = (Spec::new(), Spec::new(), Spec::new());
+    let observer = Observer::start(&observer_spec, std::slice::from_ref(&spec_a)).await;
+    let max = Config::DEFAULT_INLINE_MAX_BYTES.get();
+    let a = Daemon::start(&spec_a, spec_a.config([&observer_spec], max));
+    let b = Daemon::start(&spec_b, spec_b.config([], max));
+    connect_all(std::slice::from_ref(&a), &observer).await;
+
+    a.click(Action::Pair);
+    let holds_ticket = || a.text().is_some_and(|text| text.parse::<Ticket>().is_ok());
+    assert!(eventually(TIMEOUT, holds_ticket).await);
+    let copied = a.text().expect("the ticket is on the clipboard");
+    assert!(eventually(TIMEOUT, || a.view().activity.contains("Ticket copied")).await);
+    assert!(!a.view().can_pair, "one pairing at a time");
+
+    // What the person does by hand: moves the ticket to the other machine and copies it there.
+    b.clipboard
+        .simulate_copy_text(local_ticket(&copied, &spec_a));
+    b.click(Action::PairCopied);
+    assert!(eventually(TIMEOUT, || a.connected_to(&b) && b.connected_to(&a)).await);
+    let paired = |daemon: &Daemon| daemon.view().activity.starts_with("Paired with ");
+    assert!(eventually(TIMEOUT, || paired(&a) && paired(&b)).await);
+    assert!(eventually(TIMEOUT, || a.view().can_pair && b.view().can_pair).await);
+    assert_eq!(a.view().status, "2 of 2 machines connected");
+    assert!(a.view().syncing);
+    assert!(
+        Config::load_or_default(&a.paths.config_file)
+            .expect("valid config")
+            .peers
+            .iter()
+            .any(|peer| peer.id == b.id),
+        "a saved b"
+    );
+
+    // Changes are handled in order, so once this one arrives the ticket was handled.
+    a.clipboard.simulate_copy_text("after the ticket");
+    let next_arrived = || observer.senders("after the ticket").contains(&a.id);
+    assert!(eventually(TIMEOUT, next_arrived).await);
+    assert_eq!(observer.senders(copied.as_str()), HashSet::new());
+    assert!(eventually(TIMEOUT, || b.text().as_deref() == Some("after the ticket")).await);
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test]
+async fn menu_says_when_the_clipboard_holds_no_ticket() {
+    let spec = Spec::new();
+    let daemon = Daemon::start(
+        &spec,
+        spec.config([], Config::DEFAULT_INLINE_MAX_BYTES.get()),
+    );
+    daemon.clipboard.simulate_copy_text("not a ticket");
+    daemon.click(Action::PairCopied);
+    let refused = || {
+        daemon
+            .view()
+            .activity
+            .contains("the clipboard holds no pairing ticket")
+    };
+    assert!(eventually(TIMEOUT, refused).await);
+    assert!(daemon.view().can_pair);
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn pause_stops_both_directions_and_sends_nothing_later() {
+    let (spec_a, spec_b, observer_spec) = (Spec::new(), Spec::new(), Spec::new());
+    let observer = Observer::start(&observer_spec, std::slice::from_ref(&spec_a)).await;
+    let max = Config::DEFAULT_INLINE_MAX_BYTES.get();
+    let a = Daemon::start(&spec_a, spec_a.config([&spec_b, &observer_spec], max));
+    let b = Daemon::start(&spec_b, spec_b.config([&spec_a], max));
+    connect_all(std::slice::from_ref(&a), &observer).await;
+    assert!(eventually(TIMEOUT, || a.connected_to(&b) && b.connected_to(&a)).await);
+
+    a.click(Action::TogglePause);
+    assert!(eventually(TIMEOUT, || a.view().paused).await);
+    assert!(!a.view().syncing);
+    assert!(eventually(TIMEOUT, || a.status().is_some_and(|s| s.paused)).await);
+
+    a.clipboard.simulate_copy_text("private");
+    b.clipboard.simulate_copy_text("from b during the pause");
+    time::sleep(QUIET).await;
+    assert_eq!(a.text().as_deref(), Some("private"), "nothing was applied");
+    assert_eq!(
+        b.text().as_deref(),
+        Some("from b during the pause"),
+        "nothing was sent"
+    );
+
+    a.click(Action::TogglePause);
+    assert!(eventually(TIMEOUT, || !a.view().paused && a.view().syncing).await);
+    b.clipboard.simulate_copy_text("from b after");
+    assert!(eventually(TIMEOUT, || a.text().as_deref() == Some("from b after")).await);
+    a.clipboard.simulate_copy_text("from a after");
+    assert!(eventually(TIMEOUT, || b.text().as_deref() == Some("from a after")).await);
+    let next_arrived = || observer.senders("from a after").contains(&a.id);
+    assert!(eventually(TIMEOUT, next_arrived).await);
+    assert_eq!(observer.senders("private"), HashSet::new());
+    a.stop().await;
+    b.stop().await;
+}
+
+/// Waits for a daemon asked to quit, and checks that it cleaned up.
+async fn stopped_cleanly(daemon: Daemon) {
+    time::timeout(TIMEOUT, daemon.task)
+        .await
+        .expect("daemon stops")
+        .expect("daemon does not panic")
+        .expect("daemon stops cleanly");
+    assert!(!daemon.status_file.exists(), "the status file is gone");
+}
+
+#[tokio::test]
+async fn menu_quit_stops_the_daemon() {
+    let spec = Spec::new();
+    let daemon = Daemon::start(
+        &spec,
+        spec.config([], Config::DEFAULT_INLINE_MAX_BYTES.get()),
+    );
+    assert!(eventually(TIMEOUT, || daemon.status().is_some()).await);
+    daemon.click(Action::Quit);
+    stopped_cleanly(daemon).await;
+}
+
+#[tokio::test]
+async fn quit_request_stops_the_daemon() {
+    let spec = Spec::new();
+    let daemon = Daemon::start(
+        &spec,
+        spec.config([], Config::DEFAULT_INLINE_MAX_BYTES.get()),
+    );
+    assert!(eventually(TIMEOUT, || daemon.status().is_some()).await);
+    assert!(crate::control::quit(&daemon.paths).await, "it agrees");
+    stopped_cleanly(daemon).await;
 }

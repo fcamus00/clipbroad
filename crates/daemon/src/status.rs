@@ -62,6 +62,9 @@ pub struct DaemonStatus {
     pub mdns: Mdns,
     /// Only on macOS 15.4 and later.
     pub paste_access: Option<PasteAccess>,
+    /// Paused from the tray menu: no clip is sent or applied.
+    #[serde(default)]
+    pub paused: bool,
     pub last_sent: Option<ClipEvent>,
     pub last_received: Option<ClipEvent>,
     /// In config order, then the peers paired while running.
@@ -137,6 +140,7 @@ impl DaemonStatus {
             port: config.listen_port.get(),
             mdns,
             paste_access: None,
+            paused: false,
             last_sent: None,
             last_received: None,
             peers: peers.collect(),
@@ -153,6 +157,24 @@ impl DaemonStatus {
                 addr: None,
             });
         }
+    }
+
+    /// The newest clip, sent or received, for the tray menu.
+    pub fn last_clip(&self, now_ms: u64) -> Option<String> {
+        let sent = self.last_sent.as_ref();
+        let received = self.last_received.as_ref();
+        let event = sent.into_iter().chain(received).max_by_key(|e| e.at_ms)?;
+        let label = match event.from {
+            Some(id) => format!("Last received from {}", self.peer_label(id)),
+            None => "Last sent".to_owned(),
+        };
+        let (what, ago) = (clip_summary(event), ago(event.at_ms, now_ms));
+        Some(format!("{label}: {what}, {ago} ago"))
+    }
+
+    fn peer_label(&self, id: EndpointId) -> &str {
+        let peer = self.peers.iter().find(|peer| peer.id == id);
+        peer.map_or("an unknown peer", peer_name)
     }
 
     pub fn update_links(&mut self, links: &Links) {
@@ -266,20 +288,21 @@ pub fn render(status: Option<&DaemonStatus>, now_ms: u64) -> String {
             return "nothing yet".to_owned();
         };
         let from = event.from.map_or(String::new(), |id| {
-            let peer = status.peers.iter().find(|p| p.id == id);
-            format!(", from {}", peer.map_or("an unknown peer", peer_name))
+            format!(", from {}", status.peer_label(id))
         });
-        let what = match event.kind {
-            ContentKind::Text => format!("text, {} bytes", event.size),
-            ContentKind::Image => format!("image, {} bytes", event.size),
-            ContentKind::Files => files_summary(event.files.unwrap_or(0), event.size),
-        };
         format!(
-            "{}, {what}, hash {}{from}",
+            "{}, {}, hash {}{from}",
             time(event.at_ms, now_ms),
+            clip_summary(event),
             event.hash
         )
     };
+    if status.paused {
+        line(
+            "sync",
+            "paused from the tray menu: nothing is sent or received",
+        );
+    }
     line("last sent", &clip(status.last_sent.as_ref()));
     line("last received", &clip(status.last_received.as_ref()));
     if let Some(access) = status.paste_access {
@@ -306,17 +329,30 @@ fn peer_name(peer: &PeerStatus) -> &str {
     peer.name.as_deref().unwrap_or("(no name)")
 }
 
+/// `text, 120 bytes`, `2 files, 41.9 MB`.
+fn clip_summary(event: &ClipEvent) -> String {
+    match event.kind {
+        ContentKind::Text => format!("text, {} bytes", event.size),
+        ContentKind::Image => format!("image, {} bytes", event.size),
+        ContentKind::Files => files_summary(event.files.unwrap_or(0), event.size),
+    }
+}
+
 /// `HH:MM:SS UTC (5 min ago)`.
 fn time(at_ms: u64, now_ms: u64) -> String {
+    let at = UNIX_EPOCH + Duration::from_millis(at_ms);
+    format!("{} ({} ago)", utc_time(at), ago(at_ms, now_ms))
+}
+
+/// `5 s`, `5 min`, `5 h`, `5 days`.
+fn ago(at_ms: u64, now_ms: u64) -> String {
     let secs = now_ms.saturating_sub(at_ms) / 1000;
-    let ago = match secs {
+    match secs {
         0..60 => format!("{secs} s"),
         60..3600 => format!("{} min", secs / 60),
         3600..86_400 => format!("{} h", secs / 3600),
         _ => format!("{} days", secs / 86_400),
-    };
-    let at = UNIX_EPOCH + Duration::from_millis(at_ms);
-    format!("{} ({ago} ago)", utc_time(at))
+    }
 }
 
 #[cfg(test)]

@@ -1,10 +1,12 @@
 //! Linux: `tray-icon` serves the icon over D-Bus (`StatusNotifierItem`) from its own thread, so
-//! there is no event loop to run here.
+//! there are no GUI events to handle here. [`EventLoop::run`] only polls for updates.
 //!
 //! The icon shows only while a tray host (a bar such as waybar, or KDE's panel) owns
 //! `org.kde.StatusNotifierWatcher` on the session bus. `tray-icon` registers the icon whenever
 //! a watcher appears, even after the daemon started, but it says nothing while there is none. So
 //! [`check_host`] looks once at startup and logs it.
+
+use std::thread;
 
 use anyhow::Result;
 use tracing::{debug, info, warn};
@@ -12,31 +14,27 @@ use zbus::blocking::Connection;
 use zbus::blocking::fdo::DBusProxy;
 use zbus::names::BusName;
 
+use super::POLL_INTERVAL;
+
 const WATCHER: &str = "org.kde.StatusNotifierWatcher";
 
 pub struct EventLoop;
 
-// Does nothing here, but keeps the API every platform shares.
-#[allow(clippy::unused_self, clippy::unnecessary_wraps)]
 impl EventLoop {
+    // It cannot fail here, but can on macOS.
+    #[allow(clippy::unnecessary_wraps)]
     pub fn new() -> Result<Self> {
         Ok(Self)
     }
 
-    pub fn waker(&self) -> Waker {
-        Waker
+    /// Calls `update` every [`POLL_INTERVAL`] until it returns false.
+    // It keeps `self` like on the other platforms.
+    #[allow(clippy::unused_self)]
+    pub fn run(&self, mut update: impl FnMut() -> bool) {
+        while update() {
+            thread::sleep(POLL_INTERVAL);
+        }
     }
-
-    /// Nothing to run: the caller then waits for the daemon thread.
-    pub fn run(&self) {}
-}
-
-pub struct Waker;
-
-// Does nothing here, but keeps the API every platform shares.
-#[allow(clippy::unused_self)]
-impl Waker {
-    pub fn wake(&self) {}
 }
 
 /// Logs whether a tray host is running, and what happens if there is none.

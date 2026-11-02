@@ -12,17 +12,21 @@ use std::fmt::Write as _;
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use clipbroad_config::Paths;
 
 use super::{Status, run_tool, succeeds};
+use crate::control;
 
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const VALUE_NAME: &str = "clipbroad";
 /// Win32 process creation flag: the new process gets its own console without a window, so it
 /// shows nothing and closing this terminal does not stop it.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// How long a daemon that agreed to quit gets before it is killed.
+const QUIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn install(exe: &str, config: Option<&str>) -> Result<()> {
     let conhost = conhost_path();
@@ -38,7 +42,11 @@ pub fn install(exe: &str, config: Option<&str>) -> Result<()> {
         &format!("\"{conhost}\" {args}"),
         "/f",
     ]))?;
-    stop_daemon()?;
+    let paths = match config {
+        Some(config) => Paths::beside_config(config.into()),
+        None => Paths::discover()?,
+    };
+    stop_daemon(&paths)?;
     // Start it now. Not through conhost: started from here, `conhost --headless` stays up but the
     // daemon under it does not run (seen in CI, packaging/windows/test.ps1). A Run value cannot pass
     // creation flags, so at login conhost is still the way to hide the console.
@@ -62,10 +70,22 @@ pub fn install(exe: &str, config: Option<&str>) -> Result<()> {
 pub fn uninstall() -> Result<()> {
     // Fails if the value does not exist: then there is nothing to remove.
     succeeds(Command::new("reg").args(["delete", RUN_KEY, "/v", VALUE_NAME, "/f"]))?;
-    stop_daemon()
+    stop_daemon(&Paths::discover()?)
 }
 
 pub fn status() -> Result<Status> {
+    Ok(Status {
+        installed: succeeds(Command::new("reg").args(["query", RUN_KEY, "/v", VALUE_NAME]))?,
+        running: running()?,
+        location: format!(r"registry value {RUN_KEY}\{VALUE_NAME}"),
+        logs: "not kept on Windows. To see them, run `clipbroad service uninstall`, then \
+               `clipbroad run` in a terminal"
+            .to_owned(),
+    })
+}
+
+/// Whether another process of this executable runs.
+fn running() -> Result<bool> {
     let exe_name = exe_name()?;
     let tasks = run_tool(Command::new("tasklist").args([
         "/fo",
@@ -76,20 +96,22 @@ pub fn status() -> Result<Status> {
         "/fi",
         &format!("pid ne {}", std::process::id()),
     ]))?;
-    Ok(Status {
-        installed: succeeds(Command::new("reg").args(["query", RUN_KEY, "/v", VALUE_NAME]))?,
-        // One CSV line per process, starting with its quoted image name. With no match, tasklist
-        // prints a (translated) message instead.
-        running: tasks.to_lowercase().contains(&format!("\"{exe_name}\"")),
-        location: format!(r"registry value {RUN_KEY}\{VALUE_NAME}"),
-        logs: "not kept on Windows. To see them, run `clipbroad service uninstall`, then \
-               `clipbroad run` in a terminal"
-            .to_owned(),
-    })
+    // One CSV line per process, starting with its quoted image name. With no match, tasklist
+    // prints a (translated) message instead.
+    Ok(tasks.to_lowercase().contains(&format!("\"{exe_name}\"")))
 }
 
-/// Stops every other process of this executable, including a `clipbroad run` started by hand.
-fn stop_daemon() -> Result<()> {
+/// Stops the daemon on `paths`, then every other process of this executable, including a
+/// `clipbroad run` started by hand.
+fn stop_daemon(paths: &Paths) -> Result<()> {
+    // Killing it would leave its icon in the notification area until the mouse goes over it, so
+    // ask first. A daemon on another config, or from an older version, does not get asked.
+    if crate::runtime()?.block_on(control::quit(paths)) {
+        let deadline = Instant::now() + QUIT_TIMEOUT;
+        while running()? && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
     // Fails if none is running, which is fine.
     succeeds(Command::new("taskkill").args([
         "/f",
