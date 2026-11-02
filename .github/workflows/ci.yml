@@ -30,7 +30,7 @@ jobs:
           tool: cargo-machete
       - run: cargo machete
 
-  # Package manager templates and install.sh (packaging/check.sh). The runner has ruby, jq and shellcheck.
+  # Homebrew template and install.sh (packaging/check.sh). The runner has ruby and shellcheck.
   packaging:
     runs-on: ubuntu-latest
     steps:

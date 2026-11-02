@@ -31,26 +31,27 @@ A tag with a suffix (`v0.2.0-rc.1`) creates a **pre-release**. The binary versio
 - On Windows, also builds the installer `clipbroad-<tag>-windows-x86_64-setup.exe` (see below).
 - **release**: collects the 3 archives, the Windows installer and `packaging/install.sh`, writes
   `SHA256SUMS` and creates the release with `gh release create` (notes generated from the merged PRs).
-- **publish**: only on tags without a suffix. Updates the package managers (see below).
+- **publish**: only on tags without a suffix. Updates the Homebrew tap (see below).
 
-## Package managers
+## Package manager
 
 | Manager | Platform | Repo it updates | Secret with the SSH key |
 |---|---|---|---|
 | Homebrew | macOS (Apple Silicon) | [`fcamus00/homebrew-tap`](https://github.com/fcamus00/homebrew-tap) | `HOMEBREW_TAP_SSH_KEY` |
-| Scoop | Windows | [`fcamus00/scoop-bucket`](https://github.com/fcamus00/scoop-bucket) | `SCOOP_BUCKET_SSH_KEY` |
 
-The templates live in `packaging/`, with `@VERSION@` and `@SHA256@` in place of the version and the checksum.
-The `publish` job downloads the release's `SHA256SUMS`, fills the templates with `packaging/render.sh` and
-commits to each repo with its SSH key. The GitHub host key is pinned in `packaging/known_hosts`. If one
-target fails, the others continue; "Re-run failed jobs" retries it without duplicating commits.
+The template lives in `packaging/homebrew-tap/`, with `@VERSION@` and `@SHA256@` in place of the version and
+the checksum. The `publish` job downloads the release's `SHA256SUMS`, fills the template with
+`packaging/render.sh` and commits to the tap with its SSH key. The GitHub host key is pinned in
+`packaging/known_hosts`. If the job fails, "Re-run failed jobs" retries it without duplicating commits.
 
-- Each key is a *deploy key* with write access to its repo. To rotate one: generate a new key, add the
+- The key is a *deploy key* with write access to the tap. To rotate it: generate a new key, add the
   public key as a deploy key and store the private key with
-  `gh secret set <SECRET> --repo fcamus00/clipbroad < key`.
+  `gh secret set HOMEBREW_TAP_SSH_KEY --repo fcamus00/clipbroad < key`.
 - Pre-releases are not published.
 
-Linux has no package manager here (the AUR stopped accepting new accounts). Instead, every release
+Windows has no package manager here: the [installer](#windows-installer) is the channel.
+
+Linux has none either (the AUR stopped accepting new accounts). Instead, every release
 attaches `packaging/install.sh`, so this command installs or upgrades to the latest stable release:
 
 ```sh
@@ -76,9 +77,9 @@ for the current user.
 
 The installer is not signed, so SmartScreen warns on the first run.
 
-`packaging/check.sh` fills the templates with fake checksums, checks that the formula and the manifest
-parse (with `ruby` and `jq`, skipping the ones that are missing), and runs `install.sh` against a fake
-local release. CI runs it on every PR.
+`packaging/check.sh` fills the Homebrew template with a fake checksum, checks that the formula parses
+(with `ruby`, skipped if it is missing), and runs `install.sh` against a fake local release. CI runs it
+on every PR.
 
 ## If something fails
 
@@ -92,7 +93,7 @@ gh release delete v0.2.0 --yes   # only if the release got created
 
 ## Install from a release
 
-The usual way is a package manager or `install.sh` (commands in `README.md`). By hand:
+The usual way is Homebrew, the Windows installer or `install.sh` (commands in `README.md`). By hand:
 
 ```sh
 gh release download v0.2.0 --repo fcamus00/clipbroad --pattern '*linux-x86_64*' --pattern SHA256SUMS

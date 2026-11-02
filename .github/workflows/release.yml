@@ -98,7 +98,7 @@ jobs:
           if [[ "$TAG" == *-* ]]; then prerelease=(--prerelease); fi
           gh release create "$TAG" dist/* --verify-tag --generate-notes "${prerelease[@]}"
 
-  # Updates the Homebrew tap and the Scoop bucket. Pre-releases stay on GitHub only.
+  # Updates the Homebrew tap. Pre-releases stay on GitHub only.
   publish:
     name: publish (${{ matrix.target }})
     needs: release
@@ -111,10 +111,6 @@ jobs:
             repo: git@github.com:fcamus00/homebrew-tap.git
             branch: main
             key: HOMEBREW_TAP_SSH_KEY
-          - target: scoop-bucket
-            repo: git@github.com:fcamus00/scoop-bucket.git
-            branch: main
-            key: SCOOP_BUCKET_SSH_KEY
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Fills the package manager templates for a release, one folder per target repo:
-# <out-dir>/homebrew-tap and <out-dir>/scoop-bucket.
+# Fills the Homebrew template for a release into <out-dir>/homebrew-tap.
 # Usage: packaging/render.sh <version> <SHA256SUMS> <out-dir>
 set -euo pipefail
 
@@ -15,7 +14,7 @@ fi
 
 render() { # <template-dir> <platform>
   local name="clipbroad-v$version-$2" sha
-  sha=$(awk -v name="$name" '$2 == name ".tar.gz" || $2 == name ".zip" { print $1 }' "$sums")
+  sha=$(awk -v name="$name" '$2 == name ".tar.gz" { print $1 }' "$sums")
   if [[ ! $sha =~ ^[0-9a-f]{64}$ ]]; then
     echo "no checksum for $name in $sums" >&2
     exit 1
@@ -26,4 +25,3 @@ render() { # <template-dir> <platform>
 }
 
 render homebrew-tap macos-aarch64
-render scoop-bucket windows-x86_64
