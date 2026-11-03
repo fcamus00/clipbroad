@@ -5,6 +5,15 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Lets the environment replace the release URL, signing key and current version. Only for
+# tests/update_smoke.rs: a release build never turns it on.
+update-smoke = []
+
+[[test]]
+name = "update_smoke"
+required-features = ["update-smoke"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
@@ -13,9 +22,14 @@ clipbroad-config.workspace = true
 clipbroad-core.workspace = true
 clipbroad-net.workspace = true
 iroh.workspace = true
+minisign-verify.workspace = true
 postcard.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
 serde.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
+sha2.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -37,7 +51,7 @@ objc2-foundation = { workspace = true, features = ["std", "NSDate", "NSString"] 
 windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
-tempfile.workspace = true
+minisign.workspace = true
 
 [lints]
 workspace = true

@@ -40,9 +40,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(300);
 /// Shows the tray icon and runs `daemon` on a new thread until it returns.
 ///
 /// Call it from the main thread. It returns the daemon's result once the icon is gone.
-pub fn run<D>(daemon: D) -> Result<()>
+pub fn run<D, T>(daemon: D) -> Result<T>
 where
-    D: FnOnce(Menu) -> Result<()> + Send + 'static,
+    D: FnOnce(Menu) -> Result<T> + Send + 'static,
+    T: Send + 'static,
 {
     let event_loop = platform::EventLoop::new()?;
     let (menu, Gui { actions, views }) = menu::channel();
@@ -75,6 +76,7 @@ struct Tray {
     pair: MenuItem,
     pair_copied: MenuItem,
     pause: MenuItem,
+    update: MenuItem,
     syncing: Cell<bool>,
 }
 
@@ -88,6 +90,7 @@ impl Tray {
         let pair = MenuItem::new("Pair a machine", view.can_pair, None);
         let pair_copied = MenuItem::new("Pair with the copied ticket", view.can_pair, None);
         let pause = MenuItem::new(pause_label(view.paused), true, None);
+        let update = MenuItem::new(&view.update.text, view.update.enabled, None);
         let quit = MenuItem::new("Quit clipbroad", true, None);
         let menu = NativeMenu::with_items(&[
             &status,
@@ -97,6 +100,7 @@ impl Tray {
             &pair_copied,
             &pause,
             &PredefinedMenuItem::separator(),
+            &update,
             &quit,
         ])
         .context("cannot build the tray menu")?;
@@ -104,6 +108,7 @@ impl Tray {
             (pair.id().clone(), Action::Pair),
             (pair_copied.id().clone(), Action::PairCopied),
             (pause.id().clone(), Action::TogglePause),
+            (update.id().clone(), Action::Update),
             (quit.id().clone(), Action::Quit),
         ];
         // Called on the main thread (macOS, Windows) or on the D-Bus thread (Linux).
@@ -127,6 +132,7 @@ impl Tray {
             pair,
             pair_copied,
             pause,
+            update,
             syncing: Cell::new(view.syncing),
         })
     }
@@ -148,6 +154,8 @@ impl Tray {
         self.pair.set_enabled(view.can_pair);
         self.pair_copied.set_enabled(view.can_pair);
         self.pause.set_text(pause_label(view.paused));
+        self.update.set_text(&view.update.text);
+        self.update.set_enabled(view.update.enabled);
         if let Err(error) = self.icon.set_tooltip(Some(&view.status)) {
             warn!("cannot update the tray tooltip: {error}");
         }

@@ -7,12 +7,12 @@
 //! clipbroad is a console program, so Windows would open a console window for it at login.
 //! `conhost.exe --headless` runs it with a hidden console instead. Its log output goes nowhere.
 
-use std::env;
 use std::fmt::Write as _;
 use std::os::windows::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::{env, io};
 
 use anyhow::{Context, Result};
 use clipbroad_config::Paths;
@@ -55,16 +55,20 @@ pub fn install(exe: &str, config: Option<&str>) -> Result<()> {
     if let Some(config) = config {
         daemon.args(["--config", config]);
     }
+    start_hidden(&mut daemon).with_context(|| format!("cannot start {exe}"))?;
+    // Give it a moment to show up in `status`.
+    thread::sleep(Duration::from_secs(1));
+    Ok(())
+}
+
+/// Starts `daemon` without a window, apart from this process and its console.
+pub fn start_hidden(daemon: &mut Command) -> io::Result<Child> {
     daemon
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .with_context(|| format!("cannot start {exe}"))?;
-    // Give it a moment to show up in `status`.
-    thread::sleep(Duration::from_secs(1));
-    Ok(())
 }
 
 pub fn uninstall() -> Result<()> {

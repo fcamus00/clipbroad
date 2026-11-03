@@ -1,7 +1,8 @@
 # clipbroad
 
 Share the clipboard between your own machines (Linux/Wayland, macOS, Windows). Peer-to-peer over your
-LAN or Tailscale; no server, no third-party services.
+LAN or Tailscale, with no server. Your clips never leave your machines. The only outside connection is
+a daily check for new versions, which [you can turn off](#updates).
 
 > Status: early development. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and roadmap.
 
@@ -14,16 +15,18 @@ LAN or Tailscale; no server, no third-party services.
 | Linux (x86_64) | `curl -fsSL https://github.com/fcamus00/clipbroad/releases/latest/download/install.sh \| sh` |
 
 The Windows installer needs no admin rights. It installs to `%LOCALAPPDATA%\Programs\clipbroad`, adds
-that folder to `PATH`, and by default starts the daemon at every login. To upgrade, open the installer
-of the new version. To remove clipbroad, uninstall it from Settings > Apps. The installer is not signed
+that folder to `PATH`, and by default starts the daemon at every login. To remove clipbroad, uninstall it from Settings > Apps. The installer is not signed
 yet, so Windows SmartScreen shows "Windows protected your PC": click "More info", then "Run anyway".
 
 On Linux, the script checks the archive against `SHA256SUMS` and installs the binary to
-`~/.local/bin`. Run the same command again to upgrade.
+`~/.local/bin`.
 
 On macOS and Linux, run `clipbroad service install` to start the daemon at every login (see
-[Start at login](#start-at-login)). After an upgrade, run it again to restart the daemon on the new
-version.
+[Start at login](#start-at-login)).
+
+Upgrade from the tray menu or with `clipbroad update` (see [Updates](#updates)). The channels still work:
+`brew upgrade`, the installer of the new version, or the same `install.sh` command. After those, run
+`clipbroad service install` on macOS and Linux to restart the daemon on the new version.
 
 ## Download a release
 
@@ -92,10 +95,30 @@ items:
   status says how it went.
 - **Pause sync** stops sending and applying clips, until **Resume sync** or a restart. What you copy
   during a pause is not sent later.
+- **Check for updates** looks for a new version, and turns into **Update to 0.3.1 and restart** when
+  there is one (see [Updates](#updates)). The first line under the status says how it went.
 - **Quit clipbroad** stops the daemon. It starts again at the next login if the service is installed.
 
 Without a tray, as on GNOME or Hyprland without a bar, the daemon syncs the same and logs a warning.
-Use `clipbroad pair` and `clipbroad status` instead.
+Use `clipbroad pair`, `clipbroad status` and `clipbroad update` instead.
+
+## Updates
+
+clipbroad looks for a new version one minute after it starts and then once a day, and shows it in
+the tray menu and in `clipbroad status`. Nothing installs until you choose **Update to ... and restart**
+or run `clipbroad update`. The daemon then restarts on the new version, by itself.
+
+- With Homebrew, it runs `brew update` and `brew upgrade`, so Homebrew keeps track of the version.
+- Any other install downloads the release, checks a signature made outside GitHub and the
+  checksum, and replaces the binary.
+- A pause does not survive a restart, so the menu asks you to resume sync first.
+- If a new version changes the protocol, machines on different versions stop syncing until all of
+  them are updated.
+
+Looking for a version is the only connection clipbroad makes outside your machines. It is one
+request to `github.com` that sends your public IP and a fixed `clipbroad` user agent, with no version,
+machine id or clipboard data. Installing also downloads from GitHub. To stop looking on its own, set
+`update_check = false` in the config: the menu item and `clipbroad update` still work.
 
 ## Start at login
 

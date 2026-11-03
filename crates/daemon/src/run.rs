@@ -17,12 +17,13 @@ use clipbroad_core::{ClipContent, ContentHash, Png};
 use clipbroad_net::pair::Ticket;
 use clipbroad_net::{FetchError, FileCache, Node, Offer, Received};
 use iroh::EndpointId;
-use tokio::time::{self, MissedTickBehavior};
+use tokio::time::{self, Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 use crate::control::Served;
 use crate::menu::{self, Action, Menu};
 use crate::status::{self, ClipEvent, DaemonStatus};
+use crate::update::{self, Installation, Updater, Updates};
 use crate::{backend, control, pair, tray};
 
 #[derive(Debug, clap::Args)]
@@ -37,17 +38,44 @@ pub struct Args {
     fake: bool,
 }
 
-/// Runs the daemon with the tray icon, or without it for `--fake` (tests).
-pub fn start(args: Args) -> Result<()> {
-    if args.fake {
-        let (menu, _no_icon) = menu::channel();
-        return crate::runtime()?.block_on(run(args, menu));
-    }
-    tray::run(|menu| crate::runtime()?.block_on(run(args, menu)))
+/// How the daemon ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exit {
+    Quit,
+    /// The binary changed: it should run again.
+    Restart,
 }
 
-/// The daemon, until a shutdown signal or `menu`'s "Quit".
-async fn run(args: Args, menu: Menu) -> Result<()> {
+/// Runs the daemon with the tray icon, or without it for `--fake` (tests).
+pub fn start(args: Args) -> Result<()> {
+    // Here, because an update changes what the OS reports. An error matters only for updates.
+    let installation = Installation::current()
+        .inspect_err(|error| warn!("updates are off: {error:#}"))
+        .ok();
+    if let Some(installation) = &installation {
+        installation.remove_replaced();
+    }
+    let exit = if args.fake {
+        let (menu, _no_icon) = menu::channel();
+        crate::runtime()?.block_on(run(args, menu, None))?
+    } else {
+        let updater = installation.clone().and_then(|installation| {
+            Updater::new(installation)
+                .inspect_err(|error| warn!("updates are off: {error:#}"))
+                .ok()
+        });
+        tray::run(|menu| crate::runtime()?.block_on(run(args, menu, updater)))?
+    };
+    match exit {
+        Exit::Quit => Ok(()),
+        Exit::Restart => {
+            update::restart(&installation.context("cannot find this executable to run it again")?)
+        }
+    }
+}
+
+/// The daemon, until a shutdown signal, `menu`'s "Quit" or an update.
+async fn run(args: Args, menu: Menu, updater: Option<Updater>) -> Result<Exit> {
     let paths = match args.config {
         Some(config_file) => Paths::beside_config(config_file),
         None => Paths::discover()?,
@@ -67,6 +95,7 @@ async fn run(args: Args, menu: Menu) -> Result<()> {
         &paths,
         shutdown_signal(),
         menu,
+        updater.as_ref(),
     )
     .await
 }
@@ -105,6 +134,7 @@ struct Downloaded {
 /// file up to date for `clipbroad status` (see [`status`]) and received files in the file cache.
 /// It also pairs when `clipbroad pair` asks over the control channel (see [`control`]) or the
 /// tray menu does, and syncs with the new peer right away. `menu` also pauses sync and quits.
+/// With an `updater`, it looks for new versions and installs one when `menu` says so.
 ///
 /// Errors from a single read, write or clip are logged and the loop keeps going; only a failed
 /// setup or a failed clipboard watcher end it.
@@ -118,7 +148,8 @@ pub async fn sync(
     paths: &Paths,
     shutdown: impl Future<Output = io::Result<()>>,
     mut menu: Menu,
-) -> Result<()> {
+    updater: Option<&Updater>,
+) -> Result<Exit> {
     let mut changes = clipboard.watch().context("cannot watch the clipboard")?;
     let cache = FileCache::open(paths.file_cache_dir.clone(), config).with_context(|| {
         format!(
@@ -148,6 +179,10 @@ pub async fn sync(
     let mut links = node.links();
     let mut heartbeat = time::interval(status::HEARTBEAT);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut self_update = Updates::new(updater);
+    let mut update_timer =
+        time::interval_at(Instant::now() + update::FIRST_CHECK, update::CHECK_EVERY);
+    update_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     let mut shutdown = pin!(shutdown);
     let result = loop {
@@ -195,7 +230,11 @@ pub async fn sync(
                     Served::Nothing => {}
                     Served::Quit => {
                         info!("quit requested over the control channel");
-                        break Ok(());
+                        break Ok(Exit::Quit);
+                    }
+                    Served::Restart => {
+                        info!("restart requested over the control channel");
+                        break Ok(Exit::Restart);
                     }
                     Served::Paired(outcome) => {
                         menu.note(pairing_result(&outcome), now_ms());
@@ -210,7 +249,7 @@ pub async fn sync(
             Some(action) = menu.next_action() => match action {
                 Action::Quit => {
                     info!("quit chosen in the tray menu");
-                    break Ok(());
+                    break Ok(Exit::Quit);
                 }
                 Action::TogglePause => {
                     status.paused = !status.paused;
@@ -225,7 +264,22 @@ pub async fn sync(
                     let text = start_pairing(copied, &mut pairing, &clipboard, &node, paths).await;
                     menu.note(text, now_ms());
                 }
+                Action::Update => {
+                    if let Some(note) = self_update.choose(status.paused || pairing.is_some()) {
+                        menu.note(note, now_ms());
+                    }
+                }
             },
+            finished_update = finished(&mut self_update.task) => {
+                let outcome = self_update.finish(finished_update);
+                if let Some(note) = outcome.note {
+                    menu.note(note, now_ms());
+                }
+                if outcome.restart {
+                    break Ok(Exit::Restart);
+                }
+            }
+            _ = update_timer.tick(), if config.update_check => self_update.check_on_schedule(),
             downloaded = finished(&mut download) => {
                 download = None;
                 if let Err(error) = apply_files(&clipboard, downloaded).await {
@@ -237,11 +291,14 @@ pub async fn sync(
             _ = heartbeat.tick() => {}
             result = &mut shutdown => {
                 info!("shutting down");
-                break result.context("cannot listen for the shutdown signal");
+                break result
+                    .map(|()| Exit::Quit)
+                    .context("cannot listen for the shutdown signal");
             }
         }
+        status.update = self_update.available().map(|version| version.to_string());
         status.save(&status_file);
-        menu.show(&status, pairing.is_some(), now_ms());
+        menu.show(&status, pairing.is_some(), self_update.state(), now_ms());
     };
     // They borrow the node.
     drop((download, pairing));

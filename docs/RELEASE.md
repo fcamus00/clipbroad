@@ -18,6 +18,9 @@ GitHub Release with them.
 
 4. Follow the workflow with `gh run watch` (or in the Actions tab). When it finishes, the release is at
    `gh release view v0.2.0`.
+5. Sign it with `packaging/sign-release.sh v0.2.0`. It asks for the password of the signing key (see
+   [Signing](#signing)). Until then, `clipbroad update` and the tray menu refuse the release and say
+   that it is not signed yet. Homebrew installs do not wait for this step.
 
 A tag with a suffix (`v0.2.0-rc.1`) creates a **pre-release**. The binary version does not carry the suffix:
 `v0.2.0-rc.1` expects `clipbroad --version` to say `clipbroad 0.2.0`.
@@ -32,6 +35,25 @@ A tag with a suffix (`v0.2.0-rc.1`) creates a **pre-release**. The binary versio
 - **release**: collects the 3 archives, the Windows installer and `packaging/install.sh`, writes
   `SHA256SUMS` and creates the release with `gh release create` (notes generated from the merged PRs).
 - **publish**: only on tags without a suffix. Updates the Homebrew tap (see below).
+
+## Signing
+
+`packaging/sign-release.sh` signs `SHA256SUMS` with [minisign](https://jedisct1.github.io/minisign/) and
+attaches `SHA256SUMS.minisig` to the release. The binary carries the public key
+(`packaging/minisign.pub`) and installs nothing without that signature. `SHA256SUMS` alone proves
+nothing, because it comes from the same place as the archives. The checks are in
+`crates/daemon/src/update.rs`.
+
+The signature is a manual step on purpose: a key stored in a GitHub secret would fall with the GitHub
+account, which is the attack it has to stop.
+
+- The secret key lives in `~/.config/clipbroad-release/minisign.key` on the owner's Linux machine,
+  encrypted with a password. The key file and the password are backed up in a password manager.
+- Only a person signs, never an agent or CI.
+- Homebrew installs do not use this signature. They trust the tap, as `brew upgrade` by hand does.
+- To replace the key: generate a new one with `minisign -G`, replace `packaging/minisign.pub`, publish a
+  release and sign it with the **old** key. If the old key is lost, each machine has to install that
+  release once through its normal channel.
 
 ## Package manager
 

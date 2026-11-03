@@ -1,5 +1,5 @@
-//! The control channel: how `clipbroad pair` asks the running daemon to pair, and how `clipbroad
-//! service` on Windows asks it to quit.
+//! The control channel: how `clipbroad pair` asks the running daemon to pair, how `clipbroad
+//! service` on Windows asks it to quit, and how `clipbroad update` asks it to restart.
 //!
 //! The daemon listens on a local socket: a Unix socket `control.sock` beside the identity file
 //! on Linux and macOS, and a named pipe on Windows whose name comes from the same path. Either
@@ -56,6 +56,8 @@ pub enum Request {
     /// Shut down, as the tray menu's "Quit" does. A new variant goes last: a daemon from before
     /// it closes the channel, which tells the client to stop it some other way.
     Quit,
+    /// Shut down and run the binary again, to pick up an update.
+    Restart,
 }
 
 /// What the daemon answers.
@@ -66,7 +68,7 @@ pub enum Reply {
     Paired(Paired),
     /// Why pairing failed, ready to show.
     Failed(String),
-    /// The daemon got [`Request::Quit`] and is shutting down.
+    /// The daemon got [`Request::Quit`] or [`Request::Restart`] and is shutting down.
     Quitting,
 }
 
@@ -79,6 +81,17 @@ pub enum Served {
     Paired(Result<(Peer, bool)>),
     /// The daemon should shut down.
     Quit,
+    /// The daemon should shut down and run the binary again.
+    Restart,
+}
+
+/// How the daemon answered a [`request`](ask).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asked {
+    NoDaemon,
+    Agreed,
+    /// It cannot do it yet: it is from before that request, or busy pairing.
+    Refused,
 }
 
 /// Where the daemon listens: `control.sock` beside the identity file. On Windows, the pipe name
@@ -149,6 +162,10 @@ pub async fn serve(stream: impl Stream, node: &Node, paths: &Paths) -> Served {
             let _ = write(&mut writer, &Reply::Quitting).await;
             return Served::Quit;
         }
+        Request::Restart => {
+            let _ = write(&mut writer, &Reply::Quitting).await;
+            return Served::Restart;
+        }
         Request::Host => {
             async {
                 let host = pair::host_on(node)?;
@@ -195,18 +212,30 @@ pub async fn refuse(mut stream: impl Stream) {
     let _ = write(&mut stream, &reply).await;
 }
 
-/// Asks the daemon that uses `paths` to shut down. Returns whether it agreed: there may be no
-/// daemon, or one that cannot do it yet (from before [`Request::Quit`], or busy pairing).
+/// Asks the daemon that uses `paths` to shut down. Returns whether it agreed.
 #[cfg(any(windows, test))]
 pub async fn quit(paths: &Paths) -> bool {
+    ask(paths, &Request::Quit).await == Asked::Agreed
+}
+
+/// Asks the daemon that uses `paths` to run the binary again.
+pub async fn restart(paths: &Paths) -> Asked {
+    ask(paths, &Request::Restart).await
+}
+
+async fn ask(paths: &Paths, request: &Request) -> Asked {
     let Ok(Some(mut daemon)) = connect(paths).await else {
-        return false;
+        return Asked::NoDaemon;
     };
-    if write(&mut daemon, &Request::Quit).await.is_err() {
-        return false;
+    if write(&mut daemon, request).await.is_err() {
+        return Asked::Refused;
     }
     let reply = time::timeout(REQUEST_TIMEOUT, read(&mut daemon)).await;
-    matches!(reply, Ok(Ok(Reply::Quitting)))
+    if matches!(reply, Ok(Ok(Reply::Quitting))) {
+        Asked::Agreed
+    } else {
+        Asked::Refused
+    }
 }
 
 #[cfg(test)]

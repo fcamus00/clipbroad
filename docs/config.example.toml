@@ -60,6 +60,12 @@ file_cache_max_bytes = 2147483648
 # cleanup, except those of the last received clip. Default 7. Must be greater than 0.
 file_cache_max_days = 7
 
+# Ask GitHub once a day whether there is a new version: one request that sends this machine's
+# public IP and nothing about it, its clips or its peers. With `false`, clipbroad asks only
+# when you choose "Check for updates" in the tray menu or run `clipbroad update`. Installing
+# always takes a click or that command.
+update_check = true
+
 # Paired machines. `clipbroad pair` usually writes them; you can edit them by hand, but
 # `clipbroad run` reads them only when it starts. Peers added by `clipbroad pair` while it runs
 # sync right away.

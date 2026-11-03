@@ -32,8 +32,9 @@ Why not a central server (like ClipCascade):
 - Direct connections over the LAN or over Tailscale.
 
 Chosen configuration:
-- **`presets::Minimal` preset**: no n0 relays and no DNS/pkarr discovery. No traffic goes out to
-  third-party services.
+- **`presets::Minimal` preset**: no n0 relays and no DNS/pkarr discovery. No sync traffic goes out to
+  third-party services. The only outside connection in clipbroad is the check for new versions (see
+  "Updates").
 - **LAN discovery** with mDNS (see "LAN discovery (mDNS)" below).
 - **Tailscale**: mDNS does not cross the tailnet, so each peer can also have static addresses in the
   configuration (`EndpointAddr::new(id).with_ip_addr(...)`), for example `100.x.y.z:port` or the
@@ -291,7 +292,8 @@ How `clipbroad pair` talks to the running daemon (code in `crates/daemon/src/con
 
 On Windows, `clipbroad service` also uses it to ask the daemon to quit (`Request::Quit`), because
 there is no SIGTERM there. A daemon from before that request closes the channel, and `service` then
-kills it.
+kills it. `clipbroad update` uses it to restart the daemon on the new binary (`Request::Restart`), and
+a daemon that refuses keeps running the old version until the next restart.
 
 ## Clipboard per platform
 
@@ -758,7 +760,7 @@ thread messages. The menu shows nothing live while it is open on Windows and mac
 reason.
 
 - Items: the peers connected and the last clip (disabled, they only show text), "Pair a machine",
-  "Pair with the copied ticket", "Pause sync", "Quit clipbroad". The icon is a blue circle while
+  "Pair with the copied ticket", "Pause sync", the update item (see "Updates"), "Quit clipbroad". The icon is a blue circle while
   clips flow and a grey ring otherwise, different in shape so color is not needed to tell them apart.
 - Pairing uses the same functions and the same slot as `clipbroad pair`, so there is one pairing at a
   time from either place, and its items stay disabled meanwhile. The ticket goes through the clipboard
@@ -800,6 +802,102 @@ account) is only needed if that is not enough.
 - Linux: on exit, zbus sometimes logs a `NameLost` warning while the icon's D-Bus connection closes.
   It is harmless (the exit code is still 0) but shows up in the log.
 
+## Updates
+
+The daemon looks for new versions and a person installs them, from the tray menu or with `clipbroad
+update`. Both run the same code (`crates/daemon/src/update.rs`). Nothing installs without a click, because
+a new `PROTOCOL_VERSION` stops a machine from syncing with the ones that have not updated yet.
+
+**Looking for a version.** A `HEAD` to `github.com/fcamus00/clipbroad/releases/latest`, one minute after
+the start and then every 24 hours. GitHub answers with a redirect to the tag of the latest stable
+release, which excludes pre-releases. The GitHub API would need JSON and allows 60 requests an hour per
+IP, shared by everyone behind that IP.
+
+- **What leaves the machine:** the public IP, the time and a fixed `clipbroad` user agent. There is no
+  version, OS or id, and cookies are not stored. Installing also connects to
+  `release-assets.githubusercontent.com`.
+- `update_check = false` turns off the timer. A click or `clipbroad update` still asks, because a person
+  did.
+- A failed scheduled check only goes to the debug log, and one a person asked for shows in the menu.
+
+**Who installs.** The binary is the same on every channel, so its real path says which one it is:
+
+| Channel | Detected by | Installs with |
+|---|---|---|
+| Homebrew | a path in `<prefix>/Cellar/clipbroad/` | `<prefix>/bin/brew update`, then `brew upgrade fcamus00/tap/clipbroad` |
+| Direct (`install.sh`, the Windows installer, an archive by hand) | anything else | the release archive, verified and swapped in |
+
+| Option | Result |
+|---|---|
+| Always swap the binary | One code path, but `brew` keeps reporting the old version |
+| Always use the channel | `install.sh` would run an unsigned script. The Windows installer removes the login start before it copies, so a failure leaves no daemon and nothing to show the error |
+| Depends on the channel (chosen) | Each install stays correct, with one more flow to test |
+
+- The tap is updated a few minutes after a release, and `brew upgrade` does not fail then. So the daemon
+  compares `--version` afterwards and says that Homebrew does not have the version yet.
+- `brew update` comes first because `brew upgrade` refreshes taps only once a day.
+- The daemon takes `brew` from its own path, because `launchd` gives it a `PATH` without Homebrew.
+- On Windows the direct path also sets `DisplayVersion` in the installer's registry key, so Settings >
+  Apps shows the new version. The installer's next run and its uninstaller work on the file by name.
+
+**Verifying a download.** Each step stops the update and leaves the old binary in place:
+
+1. Download `SHA256SUMS` and `SHA256SUMS.minisig` over HTTPS only.
+2. Check the [minisign](https://jedisct1.github.io/minisign/) signature with the public key built into
+   the binary. `SHA256SUMS` proves nothing alone, because it comes from the same place as the archive.
+3. Find the archive by its whole name, which has the version in it. An old signed release cannot pass
+   as a new one, and the version must be higher than the current one.
+4. Compare the archive's SHA-256, unpack it with the OS's `tar` and run the new binary with `--version`.
+
+The owner signs each release by hand with a key outside GitHub (see `RELEASE.md`), so taking over the
+GitHub account is not enough to reach the machines. A compromised build would still get signed.
+Homebrew installs do not use this signature: they trust the tap, as `brew upgrade` by hand does.
+
+**Replacing the binary.** The new file is unpacked in a folder beside the executable and renamed over it.
+On Linux and macOS a rename works while the old file runs. Windows does not allow it, but a running
+executable can be renamed: the old one moves to `clipbroad.exe.old` and the next daemon deletes it, retrying
+while the old process exits. There is no rollback: the `--version` check catches a binary that does not
+run here, and a new version that fails later is fixed through the normal channel.
+
+**Restarting.** The daemon shuts down as it does for "Quit", which frees the port and removes the icon, and
+then runs the binary again with the same arguments, so `--config` survives. `Installation` keeps the path
+from the start, because Linux reports a replaced executable as `... (deleted)`.
+
+- Linux and macOS: `exec`. The PID stays, so systemd and launchd see nothing. It also works without a
+  service, with `exec-once` or in a terminal. A new process and an exit would not work: systemd kills what
+  is left in the unit's cgroup when the main process ends, and `Restart=on-failure` does not restart a
+  clean exit. If `exec` fails, the process ends with an error, and the service manager starts it again.
+- Windows: there is no `exec`, so the daemon starts itself with `CREATE_NO_WINDOW`, as `service install`
+  does, and exits. The `Run` value keeps working because the path does not change.
+
+**In the menu.** One item: "Check for updates (0.3.0)", "Checking for updates...", "Update to 0.3.1 and
+restart" and "Updating to 0.3.1...". The result goes in the note where the last clip shows. There is no
+percentage, because an open menu does not refresh on Windows and macOS. Installing stays disabled during a
+pairing, which a restart would cut off, and during a pause, which a restart would undo. `clipbroad update`
+from a terminal does not wait: during a pairing it replaces the binary and the daemon keeps running the old
+version, and a pause ends with the restart.
+
+**Without a tray.** The daemon logs the new version, `clipbroad status` shows it and `clipbroad update`
+installs it.
+
+**Dependencies.** `reqwest` and `rustls` are already in the tree through iroh, so the only new crate in the
+binary is `minisign-verify` (MIT, no dependencies). The tests also use `minisign` to sign fake releases.
+Measured on Linux in November 2026, on a base of 23.34 MB, with a prototype that downloads and verifies:
+
+| | Crates added | Binary growth | Notes |
+|---|---|---|---|
+| `reqwest` (chosen) | 1 | 233 KiB, and 410 KiB (1.8%) with all of this feature | |
+| `ureq` | 3 | 583 KiB, without hash or signature checks | A second HTTP client, and it needs the root certificates set up by hand |
+| `self_update` | 15 to 17 | not measured | Brings `aws-lc-sys` (C and cmake) and does not know Homebrew |
+
+The OS's `tar` unpacks the archive. The `tar` and `zip` crates would add 4 to 6 crates. `self-replace` is
+not used either: renaming the old file and deleting it at the next start is enough here.
+
+**Tests.** `crates/daemon/tests/update_smoke.rs` runs the real binary in a temporary folder, with a daemon,
+against a fake release on localhost. It needs the `update-smoke` feature, the only way to change the
+release URL, the key and the current version, and a release build never has it. The Homebrew flow is tested
+with a fake `brew`. The real `brew`, SmartScreen and the tray on macOS and Windows are tested by hand.
+
 ## Distribution
 
 - Each `v*` tag publishes a GitHub Release with the 3 binaries (`.tar.gz` / `.zip`), a Windows
@@ -836,7 +934,7 @@ account) is only needed if that is not enough.
 | 2 | P2P network, pairing, text sync with anti-echo | Copy on one machine and paste on the other two |
 | 3 | Sensitive content filter, startup service, `clipbroad status` | One day of real use without problems |
 | 4 | Images, then files | Screenshot on one machine, paste on another; 100 MB file |
-| 5 | Tray icon (same menu on the 3 OSes), history (optional) | Pair and pause from the icon on the 3 OSes, without a terminal |
+| 5 | Tray icon (same menu on the 3 OSes), updates from the menu, history (optional) | Pair, pause and update from the icon on the 3 OSes, without a terminal |
 
 ## Testing strategy
 
