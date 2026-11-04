@@ -20,6 +20,8 @@ use anyhow::{Context, Result, ensure};
 #[cfg_attr(windows, path = "service/windows.rs")]
 mod platform;
 
+#[cfg(target_os = "macos")]
+pub use platform::launched_as_service;
 #[cfg(windows)]
 pub use platform::start_hidden;
 

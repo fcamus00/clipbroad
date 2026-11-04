@@ -299,11 +299,8 @@ fn replaces_the_binary_and_restarts_the_daemon() {
     assert!(text.contains("restarting"), "{text}");
     assert_eq!(fs::read(&machine.exe).expect("the binary"), new_binary);
 
-    if cfg!(windows) {
-        // A new process, with the old executable set aside until it is gone.
-        daemon.pid = Some(machine.wait_for_pid(|pid| pid != first_pid));
-    } else {
-        // The same process, which systemd and launchd keep tracking, running the new file.
+    if cfg!(target_os = "linux") {
+        // The same process, which systemd keeps tracking, running the new file.
         machine.wait_for_pid(|pid| pid == first_pid);
         let deadline = Instant::now() + TIMEOUT;
         while machine.log().matches("node started").count() < 2 {
@@ -312,6 +309,10 @@ fn replaces_the_binary_and_restarts_the_daemon() {
         }
         machine.wait_for_pid(|pid| pid == first_pid);
         assert!(daemon.child.try_wait().expect("try_wait").is_none());
+    } else {
+        // A new process, which the menu bar accepts an icon from on macOS. On Windows, the old
+        // executable stays aside until the old process is gone.
+        daemon.pid = Some(machine.wait_for_pid(|pid| pid != first_pid));
     }
 }
 
