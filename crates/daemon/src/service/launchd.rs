@@ -13,6 +13,12 @@ use super::{Status, output, remove_file, run_tool, succeeds, write_file};
 
 const LABEL: &str = "io.github.fcamus00.clipbroad";
 
+/// Whether launchd started this process for the `LaunchAgent`, which it starts again after an
+/// error exit. launchd gives each job's processes its label in `XPC_SERVICE_NAME`.
+pub fn launched_as_service() -> bool {
+    env::var_os("XPC_SERVICE_NAME").is_some_and(|name| name == LABEL)
+}
+
 pub fn install(exe: &str, config: Option<&str>) -> Result<()> {
     let plist = plist_path()?;
     write_file(

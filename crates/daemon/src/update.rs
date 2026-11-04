@@ -8,8 +8,8 @@
 //! in the name. So a change to a release on GitHub fails the signature, and an old signed release
 //! does not pass as a new one.
 //!
-//! The running daemon is replaced by [`restart`], after it has shut down: `exec` keeps the process
-//! that systemd and launchd know, and Windows has no `exec`, so there a new process starts.
+//! The running daemon is replaced by [`restart`], after it has shut down. On Linux, `exec` keeps the
+//! process that systemd knows. macOS and Windows get a new process instead.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -191,8 +191,9 @@ fn replaced(exe: &Path) -> PathBuf {
 
 /// Runs the binary again, with the same arguments. Call it once the daemon has shut down.
 ///
-/// An error ends the process with a failure, so a service manager starts it again.
-#[cfg(unix)]
+/// `exec` keeps the PID, so systemd keeps tracking the daemon. An error ends the process with a
+/// failure, so a service manager starts it again.
+#[cfg(target_os = "linux")]
 pub fn restart(installation: &Installation) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
@@ -200,6 +201,28 @@ pub fn restart(installation: &Installation) -> Result<()> {
         .args(env::args_os().skip(1))
         .exec();
     Err(error).with_context(|| format!("cannot run {}", installation.exe.display()))
+}
+
+/// Starts the binary again in a new process, with the same arguments. Call it once the daemon has
+/// shut down, and then exit.
+///
+/// Not `exec`: after one, the menu bar refuses the icon, because it still takes the PID for the
+/// old process on its way out. Under the `LaunchAgent`, this exits with an error, and launchd
+/// starts the new version because of `KeepAlive`. Anywhere else, it starts the new version itself.
+#[cfg(target_os = "macos")]
+pub fn restart(installation: &Installation) -> Result<()> {
+    /// `EX_TEMPFAIL` from `sysexits.h`: a failure that is worth a retry.
+    const RESTART_BY_LAUNCHD: i32 = 75;
+
+    if crate::service::launched_as_service() {
+        info!("exiting so that launchd starts the new version");
+        std::process::exit(RESTART_BY_LAUNCHD);
+    }
+    std::process::Command::new(&installation.exe)
+        .args(env::args_os().skip(1))
+        .spawn()
+        .with_context(|| format!("cannot start {}", installation.exe.display()))?;
+    Ok(())
 }
 
 /// Starts the binary again, with the same arguments. Call it once the daemon has shut down, and

@@ -863,10 +863,15 @@ run here, and a new version that fails later is fixed through the normal channel
 then runs the binary again with the same arguments, so `--config` survives. `Installation` keeps the path
 from the start, because Linux reports a replaced executable as `... (deleted)`.
 
-- Linux and macOS: `exec`. The PID stays, so systemd and launchd see nothing. It also works without a
-  service, with `exec-once` or in a terminal. A new process and an exit would not work: systemd kills what
-  is left in the unit's cgroup when the main process ends, and `Restart=on-failure` does not restart a
-  clean exit. If `exec` fails, the process ends with an error, and the service manager starts it again.
+- Linux: `exec`. The PID stays, so systemd sees nothing. It also works without a service, with
+  `exec-once` or in a terminal. A new process and an exit would not work: systemd kills what is left in
+  the unit's cgroup when the main process ends, and `Restart=on-failure` does not restart a clean exit. If
+  `exec` fails, the process ends with an error, and the service manager starts it again.
+- macOS: a new process. `exec` works, but the icon does not come back: after the `exec`, the menu bar
+  (`MenuBarAgent`) still takes the PID for the old process on its way out, and cancels each request for
+  the new icon. Found on macOS 27 with the update from 0.3.0 to 0.3.1. Under the `LaunchAgent`
+  (`XPC_SERVICE_NAME` is its label), the daemon exits with code 75, and launchd starts it again because
+  of `KeepAlive` on an error exit. Without the `LaunchAgent`, the daemon starts itself and exits.
 - Windows: there is no `exec`, so the daemon starts itself with `CREATE_NO_WINDOW`, as `service install`
   does, and exits. The `Run` value keeps working because the path does not change.
 
