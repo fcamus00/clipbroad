@@ -16,12 +16,13 @@ use clipbroad_core::sync::{LocalAction, RemoteAction, SyncEngine};
 use clipbroad_core::{ClipContent, ContentHash, Png};
 use clipbroad_net::pair::Ticket;
 use clipbroad_net::{FetchError, FileCache, Node, Offer, Received};
-use iroh::EndpointId;
+use iroh::{EndpointId, SecretKey};
 use tokio::time::{self, Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 use crate::control::Served;
 use crate::menu::{self, Action, Menu};
+use crate::mesh::{self, Mesh};
 use crate::status::{self, ClipEvent, DaemonStatus};
 use crate::update::{self, Installation, Updater, Updates};
 use crate::{backend, control, pair, tray};
@@ -130,10 +131,11 @@ struct Downloaded {
     paths: Result<Vec<PathBuf>, FetchError>,
 }
 
-/// Syncs `clipboard` with the peers in `config` until `shutdown` completes, keeping the status
-/// file up to date for `clipbroad status` (see [`status`]) and received files in the file cache.
-/// It also pairs when `clipbroad pair` asks over the control channel (see [`control`]) or the
-/// tray menu does, and syncs with the new peer right away. `menu` also pauses sync and quits.
+/// Syncs `clipboard` with the members of the mesh (see [`mesh`]) until `shutdown` completes,
+/// keeping the status file up to date for `clipbroad status` (see [`status`]) and received files
+/// in the file cache. It also pairs when `clipbroad pair` asks over the control channel (see
+/// [`control`]) or the tray menu does, and syncs with the new peer right away, and removes a
+/// member when `clipbroad remove` asks. `menu` also pauses sync and quits.
 /// With an `updater`, it looks for new versions and installs one when `menu` says so.
 ///
 /// Errors from a single read, write or clip are logged and the loop keeps going; only a failed
@@ -157,13 +159,21 @@ pub async fn sync(
             paths.file_cache_dir.display()
         )
     })?;
-    let (node, mut inbox) = Node::spawn(identity, config)
+    let me = SecretKey::from_bytes(&identity.to_bytes()).public();
+    let mesh = Mesh::load(paths, config, me)?;
+    let node_config = Config {
+        peers: mesh.peers(),
+        ..config.clone()
+    };
+    let (node, mut inbox) = Node::spawn(identity, &node_config)
         .await
         .context("cannot start the network node")?;
+    mesh.announce(&node);
     info!(
         node_id = %node.id(),
         port = %config.listen_port,
-        "node started; other machines list this id in their config's [[peers]]"
+        peers = node_config.peers.len(),
+        "node started"
     );
     let mut engine = SyncEngine::new(NodeId::from_bytes(*node.id().as_bytes()));
     let status_file = paths.status_file();
@@ -209,7 +219,7 @@ pub async fn sync(
                 }
             }
             // The node holds a sender, so this never ends while it runs.
-            Some(received) = inbox.recv() => {
+            Some(received) = inbox.clips.recv() => {
                 if status.paused {
                     debug!(from = %received.from.fmt_short(), "sync is paused, clip ignored");
                     continue;
@@ -220,8 +230,10 @@ pub async fn sync(
                     warn!("{error:#}");
                 }
             }
+            // Same: the node holds a sender.
+            Some(received) = inbox.members.recv() => mesh.merge(received, &node),
             client = accept(control.as_mut()) => match client {
-                Ok(client) => serve(client, &mut pairing, &node, paths),
+                Ok(client) => serve(client, &mut pairing, &node, &mesh),
                 Err(error) => warn!(%error, "cannot accept a control connection"),
             },
             served = finished(&mut pairing) => {
@@ -236,14 +248,8 @@ pub async fn sync(
                         info!("restart requested over the control channel");
                         break Ok(Exit::Restart);
                     }
-                    Served::Paired(outcome) => {
-                        menu.note(pairing_result(&outcome), now_ms());
-                        if let Ok((peer, true)) = outcome {
-                            status.add_peer(&peer);
-                        }
-                        // It may have connected already.
-                        status.update_links(&links.borrow_and_update());
-                    }
+                    Served::Paired(outcome) => menu.note(pairing_result(&outcome), now_ms()),
+                    Served::Removed(outcome) => menu.note(removal_result(&outcome), now_ms()),
                 }
             }
             Some(action) = menu.next_action() => match action {
@@ -261,8 +267,12 @@ pub async fn sync(
                 }
                 Action::Pair | Action::PairCopied => {
                     let copied = action == Action::PairCopied;
-                    let text = start_pairing(copied, &mut pairing, &clipboard, &node, paths).await;
+                    let text = start_pairing(copied, &mut pairing, &clipboard, &node, &mesh).await;
                     menu.note(text, now_ms());
+                }
+                Action::Remove(id) => {
+                    let removed = mesh.remove_id(id, Some(&node));
+                    menu.note(removal_result(&removed), now_ms());
                 }
                 Action::Update => {
                     if let Some(note) = self_update.choose(status.paused || pairing.is_some()) {
@@ -287,7 +297,7 @@ pub async fn sync(
                 }
             }
             // The node holds the sender, so this never ends while it runs.
-            Ok(()) = links.changed() => status.update_links(&links.borrow_and_update()),
+            Ok(()) = links.changed() => {}
             _ = heartbeat.tick() => {}
             result = &mut shutdown => {
                 info!("shutting down");
@@ -296,6 +306,7 @@ pub async fn sync(
                     .context("cannot listen for the shutdown signal");
             }
         }
+        status.set_peers(&mesh, &links.borrow());
         status.update = self_update.available().map(|version| version.to_string());
         status.save(&status_file);
         menu.show(&status, pairing.is_some(), self_update.state(), now_ms());
@@ -332,6 +343,21 @@ fn pairing_result(outcome: &Result<(Peer, bool)>) -> String {
     }
 }
 
+/// Logs how a removal ended and returns it as a note for the menu.
+fn removal_result(outcome: &Result<clipbroad_core::members::Member>) -> String {
+    match outcome {
+        Ok(member) => {
+            let label = mesh::label(member);
+            info!(member = %label, "removed from the mesh");
+            format!("Removed {label}")
+        }
+        Err(error) => {
+            warn!("removal failed: {error:#}");
+            format!("Removal failed: {error:#}")
+        }
+    }
+}
+
 /// Starts pairing from the menu, unless one is running: with the ticket on the clipboard if
 /// `copied`, or else by copying a new one there and waiting. Returns the note to show meanwhile.
 async fn start_pairing<'a>(
@@ -339,15 +365,15 @@ async fn start_pairing<'a>(
     pairing: &mut Option<Pairing<'a>>,
     clipboard: &Arc<dyn Clipboard>,
     node: &'a Node,
-    paths: &'a Paths,
+    mesh: &'a Mesh,
 ) -> String {
     if pairing.is_some() {
         return "Another pairing is running".to_owned();
     }
     let begun = if copied {
-        join_copied(clipboard, node, paths).await
+        join_copied(clipboard, node, mesh).await
     } else {
-        host_copied(clipboard, node, paths).await
+        host_copied(clipboard, node, mesh).await
     };
     match begun {
         Ok((task, text)) => {
@@ -361,7 +387,7 @@ async fn start_pairing<'a>(
 async fn host_copied<'a>(
     clipboard: &Arc<dyn Clipboard>,
     node: &'a Node,
-    paths: &'a Paths,
+    mesh: &'a Mesh,
 ) -> Result<(Pairing<'a>, &'static str)> {
     let host = pair::host_on(node)?;
     let ticket = host.ticket().to_string();
@@ -371,7 +397,7 @@ async fn host_copied<'a>(
         .context("cannot copy the ticket")?;
     info!("waiting for the other machine to use the pairing ticket");
     let task = async move {
-        Served::Paired(pair::finish_host(host, paths, pair::TICKET_TTL, Some(node)).await)
+        Served::Paired(pair::finish_host(host, mesh, pair::TICKET_TTL, Some(node)).await)
     };
     let text = "Ticket copied. Send it to the other machine, copy it there and choose \
                 \"Pair with the copied ticket\"";
@@ -381,7 +407,7 @@ async fn host_copied<'a>(
 async fn join_copied<'a>(
     clipboard: &Arc<dyn Clipboard>,
     node: &'a Node,
-    paths: &'a Paths,
+    mesh: &'a Mesh,
 ) -> Result<(Pairing<'a>, &'static str)> {
     let clipboard = Arc::clone(clipboard);
     let text = tokio::task::spawn_blocking(move || clipboard.read_text())
@@ -390,7 +416,7 @@ async fn join_copied<'a>(
     let ticket: Ticket = text
         .and_then(|text| text.parse().ok())
         .context("the clipboard holds no pairing ticket")?;
-    let task = async move { Served::Paired(pair::join_on(node, paths, &ticket).await) };
+    let task = async move { Served::Paired(pair::join_on(node, mesh, &ticket).await) };
     Ok((Box::pin(task), "Pairing..."))
 }
 
@@ -399,12 +425,12 @@ fn serve<'a>(
     client: control::ServerStream,
     pairing: &mut Option<Pairing<'a>>,
     node: &'a Node,
-    paths: &'a Paths,
+    mesh: &'a Mesh,
 ) {
     if pairing.is_some() {
         tokio::spawn(control::refuse(client));
     } else {
-        *pairing = Some(Box::pin(control::serve(client, node, paths)));
+        *pairing = Some(Box::pin(control::serve(client, node, mesh)));
     }
 }
 

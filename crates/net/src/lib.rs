@@ -1,7 +1,7 @@
 //! Peer-to-peer transport: connects to every paired peer with iroh and exchanges clips.
 //!
 //! [`Node::spawn`] binds an iroh endpoint and keeps one connection per peer alive in the
-//! background. [`Node::broadcast`] sends a clip to every connected peer, and the receiver returned
+//! background. [`Node::broadcast`] sends a clip to every connected peer, and the [`Inbox`] returned
 //! by `spawn` yields the clips that arrive.
 //!
 //! # Network
@@ -40,11 +40,16 @@
 //! it. A clip whose `origin` is not the sending peer is dropped. The receiver still has to get
 //! the content through [`Clip::into_content`], which checks the payload.
 //!
-//! # Pairing
+//! # Pairing and members
 //!
 //! [`pair`] adds a peer: one machine shows a ticket and the other dials it, on a separate ALPN.
 //! A running node can do either side with its own endpoint ([`Node::host_pairing`],
 //! [`Node::join_pairing`]), and [`Node::add_peer`] starts syncing with the new peer.
+//!
+//! The node also passes the members of the mesh around, but does not decide who is one: each
+//! session sends the list given to [`Node::announce`] right after `Hello` and whenever it
+//! changes, and the lists peers send arrive in [`Inbox::members`]. The caller merges them (see
+//! `clipbroad_core::members`) and calls [`Node::add_peer`] and [`Node::remove_peer`].
 
 mod cache;
 mod files;
@@ -65,6 +70,7 @@ pub use cache::{Cleaned, FileCache, StoreError};
 use clipbroad_config::{Config, IdentityKey, Peer};
 use clipbroad_core::{
     FileList,
+    members::Members,
     protocol::{self, Clip, FrameError, Message},
 };
 pub use files::{FetchError, Offer};
@@ -81,7 +87,7 @@ use tokio::{
         mpsc::{self, error::TrySendError},
         watch,
     },
-    task::JoinSet,
+    task::{AbortHandle, JoinSet},
 };
 use tracing::{debug, info, warn};
 
@@ -94,6 +100,9 @@ pub const MDNS_SERVICE: &str = "clipbroad";
 
 /// How many received clips can wait for the daemon before the peers are slowed down.
 const INBOX_CAPACITY: usize = 64;
+/// How many received member lists can wait for the daemon. Past it, new ones are dropped: each
+/// list is complete, and the peer sends it again on its next change or connection.
+const MEMBERS_CAPACITY: usize = 16;
 /// How many outgoing clips a slow connection can fall behind before it skips some.
 const OUTBOX_CAPACITY: usize = 16;
 
@@ -105,6 +114,7 @@ mod close {
     pub const REPLACED: VarInt = VarInt::from_u32(1);
     pub const PROTOCOL_ERROR: VarInt = VarInt::from_u32(2);
     pub const NOT_PAIRED: VarInt = VarInt::from_u32(3);
+    pub const REMOVED: VarInt = VarInt::from_u32(4);
 }
 
 /// An encoded frame, shared by every connection that sends it.
@@ -117,6 +127,21 @@ pub struct Received {
     pub from: EndpointId,
     /// Not verified yet: get the content with [`Clip::into_content`].
     pub clip: Clip,
+}
+
+/// The list of members a peer sent, with only valid ids. See [`Node::announce`].
+#[derive(Debug)]
+pub struct ReceivedMembers {
+    pub from: EndpointId,
+    pub members: Members,
+}
+
+/// What arrives from the peers. Both receivers must be drained; when `clips` is full, peers
+/// wait. Dropping `members` is fine for a node that ignores them.
+#[derive(Debug)]
+pub struct Inbox {
+    pub clips: mpsc::Receiver<Received>,
+    pub members: mpsc::Receiver<ReceivedMembers>,
 }
 
 /// Whether a configured peer is connected right now. See [`Node::links`].
@@ -154,6 +179,8 @@ pub struct Node {
     outbox: broadcast::Sender<Frame>,
     /// Files of the latest broadcast clip, served to peers that ask.
     offer: watch::Sender<Option<Arc<Offer>>>,
+    /// The latest [`Node::announce`]d list, encoded.
+    members: watch::Sender<Option<Frame>>,
     links: watch::Sender<Links>,
     lan_discovery: bool,
     /// Kept to start the task of a peer added later.
@@ -162,7 +189,14 @@ pub struct Node {
     allowlist: Arc<RwLock<HashSet<EndpointId>>>,
     routes: Arc<Routes>,
     tasks: Mutex<JoinSet<()>>,
-    peers: Mutex<HashMap<EndpointId, Arc<peer::PeerState>>>,
+    peers: Mutex<HashMap<EndpointId, RunningPeer>>,
+}
+
+/// A peer's task, for [`Node::remove_peer`], and what its sessions share.
+#[derive(Debug)]
+struct RunningPeer {
+    state: Arc<peer::PeerState>,
+    task: AbortHandle,
 }
 
 /// Where the accept loop hands each incoming connection.
@@ -181,8 +215,7 @@ impl Node {
     /// If `config.mdns` is on but mDNS cannot start (for example, no network interface allows
     /// multicast), the node logs a warning and runs without it.
     ///
-    /// Returns the node and the receiver of incoming clips. The receiver must be drained: when it
-    /// is full, peers wait.
+    /// Returns the node and the receivers of what peers send.
     ///
     /// # Errors
     ///
@@ -191,10 +224,7 @@ impl Node {
     /// # Panics
     ///
     /// Only on a bug: if iroh rejects one unspecified bind address per IP family.
-    pub async fn spawn(
-        identity: &IdentityKey,
-        config: &Config,
-    ) -> Result<(Self, mpsc::Receiver<Received>), Error> {
+    pub async fn spawn(identity: &IdentityKey, config: &Config) -> Result<(Self, Inbox), Error> {
         let port = config.listen_port.get();
         let allowlist = config.peers.iter().map(|peer| peer.id).collect();
         let allowlist = Arc::new(RwLock::new(allowlist));
@@ -211,9 +241,11 @@ impl Node {
             .await
             .map_err(|source| Error::Bind { port, source })?;
 
-        let (inbox_tx, inbox) = mpsc::channel(INBOX_CAPACITY);
+        let (inbox_tx, clips) = mpsc::channel(INBOX_CAPACITY);
+        let (members_tx, members_rx) = mpsc::channel(MEMBERS_CAPACITY);
         let (outbox, _) = broadcast::channel(OUTBOX_CAPACITY);
         let offer = watch::Sender::new(None);
+        let members = watch::Sender::new(None);
         let links = config.peers.iter().map(|p| (p.id, Link::Disconnected));
         let links = watch::Sender::new(links.collect());
         let channels = peer::Channels {
@@ -221,6 +253,8 @@ impl Node {
             inbox: inbox_tx,
             offer: offer.subscribe(),
             links: links.clone(),
+            members_in: members_tx,
+            members_out: members.subscribe(),
         };
         let routes = Arc::new(Routes::default());
         let mut tasks = JoinSet::new();
@@ -229,6 +263,7 @@ impl Node {
             endpoint,
             outbox,
             offer,
+            members,
             links,
             lan_discovery: discovery,
             channels,
@@ -240,6 +275,10 @@ impl Node {
         for peer in &config.peers {
             node.start_peer(peer);
         }
+        let inbox = Inbox {
+            clips,
+            members: members_rx,
+        };
         Ok((node, inbox))
     }
 
@@ -260,6 +299,38 @@ impl Node {
         true
     }
 
+    /// Stops syncing with `id`: closes its connections, stops dialing it and rejects it from now
+    /// on. Returns `false`, and changes nothing, if it is not a peer.
+    pub fn remove_peer(&self, id: EndpointId) -> bool {
+        if !lock_write(&self.allowlist).remove(&id) {
+            return false;
+        }
+        lock(&self.routes.peers).remove(&id);
+        if let Some(running) = lock(&self.peers).remove(&id) {
+            running.task.abort();
+            running
+                .state
+                .close_all(close::REMOVED, b"removed from the mesh");
+        }
+        self.links.send_modify(|links| {
+            links.remove(&id);
+        });
+        info!(peer = %id.fmt_short(), "removed peer");
+        true
+    }
+
+    /// Sends `members` to every connected peer, and from now on to each peer right after
+    /// `Hello`.
+    ///
+    /// # Errors
+    ///
+    /// [`FrameError::TooLarge`] if the list does not fit in a frame. Nothing changes then.
+    pub fn announce(&self, members: &Members) -> Result<(), FrameError> {
+        let frame = protocol::encode(&Message::Members(members.clone()))?;
+        self.members.send_replace(Some(frame.into()));
+        Ok(())
+    }
+
     /// Runs the task that keeps `peer` connected. The allowlist and the links must have it.
     fn start_peer(&self, peer: &Peer) {
         let (conn_tx, conn_rx) = mpsc::channel(4);
@@ -270,9 +341,10 @@ impl Node {
             self.lan_discovery,
             self.channels.clone(),
         );
-        lock(&self.peers).insert(peer.id, peer_task.state());
+        let state = peer_task.state();
         lock(&self.routes.peers).insert(peer.id, conn_tx);
-        lock(&self.tasks).spawn(peer_task.run(conn_rx));
+        let task = lock(&self.tasks).spawn(peer_task.run(conn_rx));
+        lock(&self.peers).insert(peer.id, RunningPeer { state, task });
     }
 
     /// This node's public identity.
@@ -353,6 +425,7 @@ impl Node {
         let live = lock(&self.peers)
             .get(&from)
             .ok_or(FetchError::UnknownPeer)?
+            .state
             .live();
         files::fetch(live, files, cache).await
     }
@@ -408,7 +481,7 @@ fn start_mdns(identity: &IdentityKey) -> Option<MdnsAddressLookup> {
 }
 
 /// Locks a mutex. Nothing panics while holding one of the node's locks, but if it did, the data
-/// would still be consistent: every change is a single insert.
+/// would still be consistent: every change is a single insert or removal.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }

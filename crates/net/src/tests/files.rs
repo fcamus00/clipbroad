@@ -180,7 +180,7 @@ async fn several_files_transfer_between_two_nodes() {
     let clip = files_clip(a.id(), 1, offer.list().clone());
     node_a.broadcast_files(clip, offer).expect("send");
 
-    let received = time::timeout(TIMEOUT, inbox_b.recv())
+    let received = time::timeout(TIMEOUT, inbox_b.clips.recv())
         .await
         .expect("clip in time")
         .expect("node running");

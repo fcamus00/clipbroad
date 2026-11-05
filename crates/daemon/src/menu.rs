@@ -6,6 +6,7 @@
 
 use std::sync::mpsc::{self as std_mpsc, Receiver, Sender};
 
+use iroh::EndpointId;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::pair::TICKET_TTL;
@@ -26,6 +27,9 @@ pub enum Action {
     TogglePause,
     /// Check for updates, or install the one a check found.
     Update,
+    /// Remove this member from the mesh, for good. The menu asks for it in a submenu of its own,
+    /// so it takes a second, deliberate click.
+    Remove(EndpointId),
     Quit,
 }
 
@@ -42,6 +46,16 @@ pub struct View {
     /// Whether clips are flowing, which picks the icon.
     pub syncing: bool,
     pub update: UpdateItem,
+    /// The members the "Remove a machine" submenu lists.
+    pub members: Vec<MemberItem>,
+}
+
+/// A member in the "Remove a machine" submenu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberItem {
+    pub id: EndpointId,
+    /// `laptop (ae58ff8833)`: the short id tells apart machines with the same name.
+    pub label: String,
 }
 
 /// The menu item that checks for updates and installs them.
@@ -64,6 +78,7 @@ impl View {
                 text: format!("Check for updates ({VERSION})"),
                 enabled: false,
             },
+            members: Vec::new(),
         }
     }
 
@@ -106,6 +121,18 @@ impl View {
             paused: status.paused,
             syncing: connected > 0 && !status.paused,
             update: UpdateItem { text, enabled },
+            members: status
+                .peers
+                .iter()
+                .map(|peer| MemberItem {
+                    id: peer.id,
+                    label: format!(
+                        "{} ({})",
+                        peer.name.as_deref().unwrap_or("no name"),
+                        peer.id.fmt_short()
+                    ),
+                })
+                .collect(),
         }
     }
 }

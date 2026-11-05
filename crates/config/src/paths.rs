@@ -18,7 +18,8 @@ use crate::Error;
 /// the identity belong to one machine and must not follow a roaming profile to another one.
 ///
 /// The running daemon's status file is `status.toml` beside the secret key file (see
-/// [`Paths::status_file`]).
+/// [`Paths::status_file`]), and so is `members.toml`, the members of the mesh (see
+/// [`Paths::members_file`]).
 ///
 /// Files received from peers are kept in `file_cache_dir`:
 ///
@@ -63,6 +64,13 @@ impl Paths {
     #[must_use]
     pub fn status_file(&self) -> PathBuf {
         self.secret_key_file.with_file_name("status.toml")
+    }
+
+    /// Where the members of the mesh are kept: `members.toml` beside the secret key file, since
+    /// they belong to this identity (see [`crate::members`]).
+    #[must_use]
+    pub fn members_file(&self) -> PathBuf {
+        self.secret_key_file.with_file_name("members.toml")
     }
 
     /// Builds the paths from a home directory and an environment lookup, so tests can fake both.
@@ -180,11 +188,15 @@ mod tests {
     }
 
     #[test]
-    fn status_file_follows_the_identity() {
+    fn status_and_members_files_follow_the_identity() {
         let paths = Paths::beside_config(PathBuf::from("instance").join("config.toml"));
         assert_eq!(
             paths.status_file(),
             PathBuf::from("instance").join("status.toml")
+        );
+        assert_eq!(
+            paths.members_file(),
+            PathBuf::from("instance").join("members.toml")
         );
     }
 

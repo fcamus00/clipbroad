@@ -137,6 +137,15 @@ impl Daemon {
         view.clone()
     }
 
+    /// The active members in its members file.
+    fn saved_members(&self) -> Vec<EndpointId> {
+        let members = members_of(&self.paths);
+        members
+            .active()
+            .map(|member| EndpointId::from_bytes(member.id.as_bytes()).expect("valid key"))
+            .collect()
+    }
+
     fn connected_to(&self, other: &Self) -> bool {
         self.status().is_some_and(|status| {
             status
@@ -197,7 +206,7 @@ impl Observer {
         let seen = Arc::new(Mutex::new(HashSet::new()));
         let record = Arc::clone(&seen);
         tokio::spawn(async move {
-            while let Some(received) = inbox.recv().await {
+            while let Some(received) = inbox.clips.recv().await {
                 lock(&record).insert((received.from, received.clip.hash));
             }
         });
@@ -213,6 +222,10 @@ impl Observer {
             .map(|(from, _)| *from)
             .collect()
     }
+}
+
+fn members_of(paths: &Paths) -> clipbroad_core::members::Members {
+    clipbroad_config::members::load(&paths.members_file()).expect("valid members file")
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -692,9 +705,11 @@ async fn running_daemons_pair_and_sync_without_restarting() {
     assert_eq!((b_as_seen.id, b_as_seen.added), (b.id, true));
     assert_eq!((a_as_seen.id, a_as_seen.added), (a.id, true));
     for (daemon, other) in [(&a, &b), (&b, &a)] {
-        let config = Config::load_or_default(&daemon.paths.config_file).expect("valid config");
-        let saved: Vec<_> = config.peers.iter().map(|peer| peer.id).collect();
-        assert_eq!(saved, [other.id], "{daemon:?} saved the other one");
+        assert_eq!(
+            daemon.saved_members(),
+            [other.id],
+            "{daemon:?} saved the other one"
+        );
     }
 
     // Without restarting either daemon. A clip sent before the connection is up is lost, so
@@ -741,14 +756,7 @@ async fn menu_pairs_two_daemons_through_the_clipboard_and_never_sends_the_ticket
     assert!(eventually(TIMEOUT, || a.view().can_pair && b.view().can_pair).await);
     assert_eq!(a.view().status, "2 of 2 machines connected");
     assert!(a.view().syncing);
-    assert!(
-        Config::load_or_default(&a.paths.config_file)
-            .expect("valid config")
-            .peers
-            .iter()
-            .any(|peer| peer.id == b.id),
-        "a saved b"
-    );
+    assert!(a.saved_members().contains(&b.id), "a saved b");
 
     // Changes are handled in order, so once this one arrives the ticket was handled.
     a.clipboard.simulate_copy_text("after the ticket");
@@ -884,4 +892,110 @@ async fn the_update_item_says_so_without_an_updater() {
         daemon.view()
     );
     daemon.stop().await;
+}
+
+/// What `clipbroad remove` does when the daemon runs.
+async fn remove_through(daemon: &Daemon, machine: &str) -> Result<String> {
+    use crate::control::{Reply, Request};
+    let mut stream = crate::control::connect(&daemon.paths)
+        .await?
+        .context("the daemon listens")?;
+    crate::control::write(&mut stream, &Request::Remove(machine.to_owned())).await?;
+    match crate::control::read(&mut stream).await? {
+        Reply::Removed(label) => Ok(label),
+        Reply::Failed(error) => Err(anyhow!(error)),
+        other => Err(anyhow!("unexpected reply {other:?}")),
+    }
+}
+
+/// The feature in one test: c pairs with a only, syncs with b too, and a removal on b takes it
+/// out of a as well.
+#[tokio::test]
+async fn pairing_with_one_member_joins_the_whole_mesh_and_removal_spreads() {
+    let (spec_a, spec_b, spec_c) = (Spec::new(), Spec::new(), Spec::new());
+    let max = Config::DEFAULT_INLINE_MAX_BYTES.get();
+    // a and b are paired already (through their config files); c knows nobody.
+    let a = Daemon::start(&spec_a, spec_a.config([&spec_b], max));
+    let b = Daemon::start(&spec_b, spec_b.config([&spec_a], max));
+    let c = Daemon::start(&spec_c, spec_c.config([], max));
+    assert!(eventually(TIMEOUT, || a.connected_to(&b) && c.status().is_some()).await);
+
+    // c pairs with a, and only with a.
+    let (ticket_tx, ticket_rx) = oneshot::channel();
+    let hosting = pair_through(&a, None, &spec_a, |ticket| {
+        ticket_tx.send(ticket).expect("the test waits");
+    });
+    let joining = async {
+        let ticket = ticket_rx.await.expect("a shows a ticket");
+        pair_through(&c, Some(&ticket), &spec_a, drop).await
+    };
+    let (c_as_seen, a_as_seen) = tokio::join!(hosting, joining);
+    assert_eq!(c_as_seen.expect("a pairs").id, c.id);
+    assert_eq!(a_as_seen.expect("c pairs").id, a.id);
+
+    // a tells b about c and c about b, so b and c connect and sync.
+    assert!(eventually(TIMEOUT, || b.connected_to(&c) && c.connected_to(&b)).await);
+    c.clipboard.simulate_copy_text("from c");
+    assert!(eventually(TIMEOUT, || b.text().as_deref() == Some("from c")).await);
+    b.clipboard.simulate_copy_text("from b");
+    assert!(eventually(TIMEOUT, || c.text().as_deref() == Some("from b")).await);
+    assert!(b.saved_members().contains(&c.id));
+    assert!(c.saved_members().contains(&b.id));
+    // `clipbroad status` on b tells that a added c.
+    let c_on_b = b
+        .status()
+        .and_then(|status| status.peers.into_iter().find(|peer| peer.id == c.id))
+        .expect("b lists c");
+    assert_eq!(c_on_b.added_by, Some(a.id));
+
+    // Removed on b: a hears of it too, and both drop c.
+    let err = remove_through(&b, "no such machine")
+        .await
+        .expect_err("unknown");
+    assert!(err.to_string().contains("no machine named"), "{err:#}");
+    let prefix = &c.id.to_string()[..16];
+    let removed = remove_through(&b, prefix).await.expect("removed");
+    assert!(removed.contains(&c.id.to_string()[..10]), "{removed}");
+    let gone = |daemon: &Daemon| {
+        !daemon.saved_members().contains(&c.id)
+            && daemon
+                .status()
+                .is_some_and(|status| status.peers.iter().all(|peer| peer.id != c.id))
+    };
+    assert!(eventually(TIMEOUT, || gone(&a) && gone(&b)).await);
+    assert!(eventually(TIMEOUT, || !c.connected_to(&a) && !c.connected_to(&b)).await);
+
+    // c keeps dialing, and is turned away: a copy on a reaches b only.
+    a.clipboard.simulate_copy_text("after the removal");
+    assert!(eventually(TIMEOUT, || b.text().as_deref() == Some("after the removal")).await);
+    time::sleep(QUIET).await;
+    assert_eq!(c.text().as_deref(), Some("from b"));
+    assert!(!c.connected_to(&a) && !c.connected_to(&b));
+    a.stop().await;
+    b.stop().await;
+    c.stop().await;
+}
+
+#[tokio::test]
+async fn menu_removes_a_member() {
+    let (spec_a, spec_b) = (Spec::new(), Spec::new());
+    let max = Config::DEFAULT_INLINE_MAX_BYTES.get();
+    let a = Daemon::start(&spec_a, spec_a.config([&spec_b], max));
+    let b = Daemon::start(&spec_b, spec_b.config([&spec_a], max));
+    assert!(eventually(TIMEOUT, || a.connected_to(&b) && b.connected_to(&a)).await);
+    let listed = |daemon: &Daemon| daemon.view().members.iter().any(|m| m.id == spec_b.id());
+    assert!(eventually(TIMEOUT, || listed(&a)).await);
+
+    a.click(Action::Remove(b.id));
+    let removed = || a.view().activity.starts_with("Removed ") && !listed(&a);
+    assert!(eventually(TIMEOUT, removed).await, "{:?}", a.view());
+    assert!(!a.saved_members().contains(&b.id));
+    assert!(eventually(TIMEOUT, || !b.connected_to(&a)).await);
+
+    // A second click, from a menu that has not redrawn yet, only says why nothing happened.
+    a.click(Action::Remove(b.id));
+    let failed = || a.view().activity.contains("not a member anymore");
+    assert!(eventually(TIMEOUT, failed).await, "{:?}", a.view());
+    a.stop().await;
+    b.stop().await;
 }

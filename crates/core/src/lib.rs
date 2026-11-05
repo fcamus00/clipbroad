@@ -1,9 +1,10 @@
-//! Platform-independent core: clipboard content model, wire protocol, sync rules, file name rules
-//! and sensitive-content markers.
+//! Platform-independent core: clipboard content model, wire protocol, sync rules, mesh members,
+//! file name rules and sensitive-content markers.
 
 mod content;
 mod files;
 mod hash;
+pub mod members;
 pub mod protocol;
 pub mod sensitive;
 pub mod sync;

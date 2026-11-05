@@ -1,7 +1,9 @@
 mod backend;
 mod control;
 mod menu;
+mod mesh;
 mod pair;
+mod remove;
 mod run;
 mod service;
 mod status;
@@ -31,15 +33,25 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Pair with another machine, so that `clipbroad run` syncs with it.
+    /// Pair with another machine, so that `clipbroad run` syncs with it and with its mesh.
     ///
     /// Run `clipbroad pair` on one machine: it shows a ticket and waits. Then run
-    /// `clipbroad pair <TICKET>` on the other one. Both add each other to their config file. The
-    /// ticket works once and for 5 minutes. If `clipbroad run` is running, it does the pairing and
-    /// syncs with the new machine right away, without a restart.
+    /// `clipbroad pair <TICKET>` on the other one. Both add each other to their members file
+    /// (`members.toml` beside the identity file). The ticket works once and for 5 minutes.
+    ///
+    /// To add a machine to a mesh, pair it with any one member: the members tell each other about
+    /// it, and it syncs with all of them once they meet. If `clipbroad run` is running, it does
+    /// the pairing and syncs with the new machine right away, without a restart.
     Pair(pair::Args),
-    /// Sync the clipboard with the peers in the config file until Ctrl+C, SIGTERM or the tray
-    /// icon's "Quit".
+    /// Remove a machine from the mesh, for good.
+    ///
+    /// Give its name, as `clipbroad status` shows it, or the first characters of its id. Every
+    /// member stops syncing with it once it hears of the removal from another member. The removed
+    /// machine cannot join again with the same identity: it has to delete its `secret.key` and
+    /// pair again.
+    Remove(remove::Args),
+    /// Sync the clipboard with the members of the mesh until Ctrl+C, SIGTERM or the tray icon's
+    /// "Quit".
     ///
     /// Each text, image or set of files copied here is sent to every connected peer, and what a
     /// peer copies is written to this clipboard. Files are downloaded into a local cache first,
@@ -82,6 +94,7 @@ fn main() -> anyhow::Result<()> {
     let default_level = match cli.command {
         Command::Run(_) => LevelFilter::INFO,
         Command::Pair(_)
+        | Command::Remove(_)
         | Command::Watch(_)
         | Command::Service(_)
         | Command::Status(_)
@@ -90,6 +103,7 @@ fn main() -> anyhow::Result<()> {
     init_logging(default_level, cli.verbose);
     match cli.command {
         Command::Pair(args) => runtime()?.block_on(pair::run(args)),
+        Command::Remove(args) => runtime()?.block_on(remove::run(args)),
         // It owns the main thread for the tray icon, and starts its own runtime.
         Command::Run(args) => run::start(args),
         Command::Watch(args) => runtime()?.block_on(watch::run(args)),

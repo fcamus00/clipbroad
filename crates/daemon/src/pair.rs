@@ -1,4 +1,7 @@
-//! `clipbroad pair`: adds a peer to the config by passing a ticket from one machine to the other.
+//! `clipbroad pair`: adds a machine to the mesh by passing a ticket from it to any member.
+//!
+//! Each side saves the other in its members file (see [`crate::mesh`]). The members then tell
+//! each other about the new machine, so pairing with one of them is enough.
 //!
 //! If `clipbroad run` is running with the same config, `pair` asks it to pair over the control
 //! channel (see [`control`]): the daemon pairs on its own endpoint and syncs with the new peer
@@ -11,10 +14,11 @@ use anyhow::{Context, Result};
 use clipbroad_config::{Config, IdentityKey, Paths, Peer};
 use clipbroad_net::Node;
 use clipbroad_net::pair::{self, Host, PairError, PairedPeer, Ticket};
-use iroh::EndpointId;
+use iroh::{EndpointId, SecretKey};
 use serde::{Deserialize, Serialize};
 
 use crate::control::{self, Reply, Request};
+use crate::mesh::Mesh;
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -36,7 +40,7 @@ pub const TICKET_TTL: Duration = Duration::from_mins(5);
 pub struct Paired {
     pub id: EndpointId,
     pub name: Option<String>,
-    /// `false` if it was in the config already, which was left unchanged.
+    /// `false` if it was a member already, which was left unchanged.
     pub added: bool,
 }
 
@@ -71,15 +75,14 @@ pub async fn run(args: Args) -> Result<()> {
         println!("Paired with {name:?} ({}).", paired.id);
     } else {
         println!(
-            "Paired with {name:?} ({}), which was already in {}: left it unchanged.",
-            paired.id,
-            paths.config_file.display()
+            "Paired with {name:?} ({}), which was already a member: left it unchanged.",
+            paired.id
         );
     }
     if through_daemon {
-        println!("`clipbroad run` syncs with it from now on.");
+        println!("`clipbroad run` syncs with it, and with the rest of its mesh, from now on.");
     } else {
-        println!("Start `clipbroad run` to sync with it.");
+        println!("Start `clipbroad run` to sync with it and with the rest of its mesh.");
     }
     Ok(())
 }
@@ -116,6 +119,7 @@ pub async fn through<S: control::Stream>(
             Reply::Paired(paired) => return Ok(paired),
             Reply::Failed(error) => anyhow::bail!(error),
             Reply::Quitting => anyhow::bail!("the daemon is shutting down"),
+            Reply::Removed(_) => anyhow::bail!("the daemon answered something else"),
         }
     }
 }
@@ -123,13 +127,13 @@ pub async fn through<S: control::Stream>(
 /// Shows a ticket through `show`, waits up to `ttl` for the other machine and saves it. Returns
 /// the peer and whether it was new.
 async fn host(paths: &Paths, ttl: Duration, show: impl FnOnce(&Ticket)) -> Result<(Peer, bool)> {
-    let (config, identity) = load(paths)?;
+    let (config, identity, mesh) = load(paths)?;
     let host = Host::bind(&identity, config.listen_port, hostname())
         .await
         .with_context(|| port_in_use(&config))?;
     check_reachable(&host)?;
     show(host.ticket());
-    finish_host(host, paths, ttl, None).await
+    finish_host(host, &mesh, ttl, None).await
 }
 
 /// Starts hosting on the daemon's node. Show the ticket, then call [`finish_host`].
@@ -147,11 +151,11 @@ fn check_reachable(host: &Host) -> Result<()> {
     Ok(())
 }
 
-/// Waits up to `ttl` for the other machine and saves it to the config, and to `node` if the
+/// Waits up to `ttl` for the other machine and admits it to the mesh, and to `node` if the
 /// daemon hosts. Returns the peer and whether it was new.
 pub async fn finish_host(
     host: Host,
-    paths: &Paths,
+    mesh: &Mesh,
     ttl: Duration,
     node: Option<&Node>,
 ) -> Result<(Peer, bool)> {
@@ -159,10 +163,7 @@ pub async fn finish_host(
     let peer = to_peer(pending.peer());
     // Saved before confirming, so the other machine only saves this one if this one saved it.
     // On an error, `pending` is dropped, which rejects the request.
-    let added = save(paths, &peer)?;
-    if let Some(node) = node {
-        node.add_peer(&peer);
-    }
+    let added = mesh.admit(&peer, node)?;
     pending.confirm().await?;
     Ok((peer, added))
 }
@@ -170,34 +171,32 @@ pub async fn finish_host(
 /// Pairs with the machine that showed `ticket` and saves it. Returns the peer and whether it
 /// was new.
 async fn join(paths: &Paths, ticket: &Ticket) -> Result<(Peer, bool)> {
-    let (config, identity) = load(paths)?;
+    let (config, identity, mesh) = load(paths)?;
     let paired = match pair::join(&identity, config.listen_port, ticket, hostname()).await {
         Err(PairError::Start(e)) => return Err(anyhow::Error::new(e).context(port_in_use(&config))),
         result => result?,
     };
     let peer = to_peer(&paired);
-    let added = save(paths, &peer)?;
+    let added = mesh.admit(&peer, None)?;
     Ok((peer, added))
 }
 
-/// Pairs with the machine that showed `ticket` from the daemon's node, saves it and starts
+/// Pairs with the machine that showed `ticket` from the daemon's node, admits it and starts
 /// syncing with it. Returns the peer and whether it was new.
-pub async fn join_on(node: &Node, paths: &Paths, ticket: &Ticket) -> Result<(Peer, bool)> {
+pub async fn join_on(node: &Node, mesh: &Mesh, ticket: &Ticket) -> Result<(Peer, bool)> {
     let paired = node.join_pairing(ticket, hostname()).await?;
     let peer = to_peer(&paired);
-    let added = save(paths, &peer)?;
-    node.add_peer(&peer);
+    let added = mesh.admit(&peer, Some(node))?;
     Ok((peer, added))
 }
 
-fn load(paths: &Paths) -> Result<(Config, IdentityKey)> {
+/// The config, the identity and the members of a machine without a running daemon.
+pub fn load(paths: &Paths) -> Result<(Config, IdentityKey, Mesh)> {
     let config = Config::load_or_default(&paths.config_file)?;
     let identity = IdentityKey::load_or_generate(&paths.secret_key_file)?;
-    Ok((config, identity))
-}
-
-fn save(paths: &Paths, peer: &Peer) -> Result<bool> {
-    Config::append_peer(&paths.config_file, peer).context("could not save the new peer")
+    let me = SecretKey::from_bytes(&identity.to_bytes()).public();
+    let mesh = Mesh::load(paths, &config, me)?;
+    Ok((config, identity, mesh))
 }
 
 fn to_peer(paired: &PairedPeer) -> Peer {

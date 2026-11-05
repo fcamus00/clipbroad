@@ -15,19 +15,23 @@
 //!
 //! If the icon cannot be shown, the daemon keeps running without it and the log says why.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::panic;
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use iroh::EndpointId;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
-use tray_icon::menu::{Menu as NativeMenu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{
+    Menu as NativeMenu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
+};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-use crate::menu::{self, Action, Gui, Menu, View};
+use crate::menu::{self, Action, Gui, MemberItem, Menu, View};
 
 #[cfg_attr(target_os = "linux", path = "tray/linux.rs")]
 #[cfg_attr(target_os = "macos", path = "tray/macos.rs")]
@@ -77,6 +81,12 @@ struct Tray {
     pair_copied: MenuItem,
     pause: MenuItem,
     update: MenuItem,
+    /// "Remove a machine", with a submenu per member.
+    remove: Submenu,
+    /// The members `remove` lists now.
+    members: RefCell<Vec<MemberItem>>,
+    /// The confirmation item of each member in `remove`, shared with the click handler.
+    removals: Arc<Mutex<Vec<(MenuId, EndpointId)>>>,
     syncing: Cell<bool>,
 }
 
@@ -91,6 +101,7 @@ impl Tray {
         let pair_copied = MenuItem::new("Pair with the copied ticket", view.can_pair, None);
         let pause = MenuItem::new(pause_label(view.paused), true, None);
         let update = MenuItem::new(&view.update.text, view.update.enabled, None);
+        let remove = Submenu::new("Remove a machine", false);
         let quit = MenuItem::new("Quit clipbroad", true, None);
         let menu = NativeMenu::with_items(&[
             &status,
@@ -99,6 +110,7 @@ impl Tray {
             &pair,
             &pair_copied,
             &pause,
+            &remove,
             &PredefinedMenuItem::separator(),
             &update,
             &quit,
@@ -111,11 +123,19 @@ impl Tray {
             (update.id().clone(), Action::Update),
             (quit.id().clone(), Action::Quit),
         ];
+        let removals: Arc<Mutex<Vec<(MenuId, EndpointId)>>> = Arc::default();
+        let clicked_removals = Arc::clone(&removals);
         // Called on the main thread (macOS, Windows) or on the D-Bus thread (Linux).
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-            if let Some((_, action)) = choices.iter().find(|(id, _)| *id == event.id) {
+            let fixed = choices.iter().find(|(id, _)| *id == event.id);
+            let action = fixed.map(|(_, action)| *action).or_else(|| {
+                let removals = lock(&clicked_removals);
+                let removal = removals.iter().find(|(id, _)| *id == event.id);
+                removal.map(|(_, member)| Action::Remove(*member))
+            });
+            if let Some(action) = action {
                 // Fails if the daemon ended, and then there is nothing to do.
-                let _ = actions.send(*action);
+                let _ = actions.send(action);
             }
         }));
         let icon = TrayIconBuilder::new()
@@ -133,6 +153,9 @@ impl Tray {
             pair_copied,
             pause,
             update,
+            remove,
+            members: RefCell::new(Vec::new()),
+            removals,
             syncing: Cell::new(view.syncing),
         })
     }
@@ -156,6 +179,9 @@ impl Tray {
         self.pause.set_text(pause_label(view.paused));
         self.update.set_text(&view.update.text);
         self.update.set_enabled(view.update.enabled);
+        if *self.members.borrow() != view.members {
+            self.draw_members(&view.members);
+        }
         if let Err(error) = self.icon.set_tooltip(Some(&view.status)) {
             warn!("cannot update the tray tooltip: {error}");
         }
@@ -166,6 +192,33 @@ impl Tray {
             }
         }
     }
+}
+
+impl Tray {
+    /// Rebuilds "Remove a machine": a submenu per member that says what removing means and
+    /// holds the item that does it, so a removal takes two deliberate clicks.
+    fn draw_members(&self, members: &[MemberItem]) {
+        while self.remove.remove_at(0).is_some() {}
+        let mut removals = Vec::new();
+        for member in members {
+            let warning = MenuItem::new("It cannot join again with this identity", false, None);
+            let confirm = MenuItem::new(format!("Remove {} for good", member.label), true, None);
+            let built = Submenu::with_items(&member.label, true, &[&warning, &confirm])
+                .and_then(|submenu| self.remove.append(&submenu));
+            match built {
+                Ok(()) => removals.push((confirm.id().clone(), member.id)),
+                Err(error) => warn!("cannot add {} to the tray menu: {error}", member.label),
+            }
+        }
+        self.remove.set_enabled(!removals.is_empty());
+        *lock(&self.removals) = removals;
+        *self.members.borrow_mut() = members.to_vec();
+    }
+}
+
+/// Nothing panics while holding it, and each change is one assignment.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn pause_label(paused: bool) -> &'static str {

@@ -76,11 +76,11 @@ impl Spec {
     }
 
     /// Starts the node without mDNS, so it reaches peers only at their static addresses.
-    async fn spawn(&self, peers: Vec<Peer>) -> (Node, mpsc::Receiver<Received>) {
+    async fn spawn(&self, peers: Vec<Peer>) -> (Node, Inbox) {
         self.spawn_with(peers, false).await
     }
 
-    async fn spawn_with(&self, peers: Vec<Peer>, mdns: bool) -> (Node, mpsc::Receiver<Received>) {
+    async fn spawn_with(&self, peers: Vec<Peer>, mdns: bool) -> (Node, Inbox) {
         let config = Config {
             listen_port: self.port,
             mdns,
@@ -111,8 +111,8 @@ fn text_clip(origin: EndpointId, id: u64, text: &str) -> Clip {
 }
 
 /// Waits for the next clip and returns who sent it and its verified text.
-async fn recv_text(inbox: &mut mpsc::Receiver<Received>) -> (EndpointId, String) {
-    let received = time::timeout(TIMEOUT, inbox.recv())
+async fn recv_text(inbox: &mut Inbox) -> (EndpointId, String) {
+    let received = time::timeout(TIMEOUT, inbox.clips.recv())
         .await
         .expect("a clip arrives in time")
         .expect("node still running");
@@ -134,7 +134,7 @@ async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
 
 impl Node {
     fn live_sessions_with(&self, peer: EndpointId) -> usize {
-        lock(&self.peers)[&peer].live_sessions()
+        lock(&self.peers)[&peer].state.live_sessions()
     }
 
     /// Whether this node has exactly one working connection to each of `peers`.
@@ -301,7 +301,7 @@ async fn three_nodes_exchange_clips() {
             assert_eq!(texts, expected, "node {receiver} from node {sender}");
         }
         assert!(
-            inbox.try_recv().is_err(),
+            inbox.clips.try_recv().is_err(),
             "no duplicates at node {receiver}"
         );
     }
@@ -621,6 +621,112 @@ async fn node_takes_pairing_requests_only_while_hosting() {
         Err(pair::PairError::OwnTicket)
     ));
     assert_eq!(node_a.links().borrow().len(), 0, "no peer was added");
+    node_a.shutdown().await;
+    node_b.shutdown().await;
+}
+
+fn members_naming(ids: &[EndpointId]) -> Members {
+    let mut members = Members::default();
+    for id in ids {
+        let member = clipbroad_core::members::Member {
+            id: NodeId::from_bytes(*id.as_bytes()),
+            name: None,
+            addrs: Vec::new(),
+            added_by: None,
+            removed: false,
+        };
+        assert_eq!(members.admit(member), Ok(true));
+    }
+    members
+}
+
+async fn recv_members(inbox: &mut Inbox) -> ReceivedMembers {
+    time::timeout(TIMEOUT, inbox.members.recv())
+        .await
+        .expect("a member list arrives in time")
+        .expect("node still running")
+}
+
+#[tokio::test]
+async fn announced_members_reach_peers_on_connect_and_on_change() {
+    let (a, b) = (Spec::new(), Spec::new());
+    let (node_a, _inbox_a) = a.spawn(vec![b.peer()]).await;
+    // Announced before the peer connects: it gets the list right after `Hello`.
+    let first = members_naming(&[b.id()]);
+    node_a.announce(&first).expect("small list");
+    let (node_b, mut inbox_b) = b.spawn(vec![a.peer()]).await;
+    let received = recv_members(&mut inbox_b).await;
+    assert_eq!((received.from, &received.members), (a.id(), &first));
+
+    // A list with an id that is not a valid key arrives without it.
+    let third = Spec::new().id();
+    let mut second = members_naming(&[b.id(), third]);
+    let invalid = clipbroad_core::members::Member {
+        id: NodeId::from_bytes(invalid_key()),
+        name: None,
+        addrs: Vec::new(),
+        added_by: None,
+        removed: false,
+    };
+    assert_eq!(second.admit(invalid), Ok(true));
+    node_a.announce(&second).expect("small list");
+    // A duplicate connection, while both nodes dial at once, may bring the first list again.
+    let mut received = recv_members(&mut inbox_b).await;
+    while received.members == first {
+        received = recv_members(&mut inbox_b).await;
+    }
+    assert_eq!(received.members, members_naming(&[b.id(), third]));
+
+    // Clips still flow on the same stream.
+    node_a
+        .broadcast(text_clip(a.id(), 1, "after the list"))
+        .expect("small clip");
+    assert_eq!(
+        recv_text(&mut inbox_b).await,
+        (a.id(), "after the list".to_owned())
+    );
+    node_a.shutdown().await;
+    node_b.shutdown().await;
+}
+
+/// 32 bytes that are not an Ed25519 public key.
+fn invalid_key() -> [u8; 32] {
+    (0..=u8::MAX)
+        .map(|i| [i; 32])
+        .find(|bytes| EndpointId::from_bytes(bytes).is_err())
+        .expect("some repeated byte is not a curve point")
+}
+
+#[tokio::test]
+async fn removed_peer_is_disconnected_and_kept_out() {
+    let (a, b) = (Spec::new(), Spec::new());
+    let (node_a, _inbox_a) = a.spawn(vec![b.peer()]).await;
+    let (node_b, mut inbox_b) = b.spawn(vec![a.peer()]).await;
+    let mut b_links = node_b.links();
+    let a_id = a.id();
+    let a_connected = move |links: &Links| matches!(links[&a_id], Link::Connected { .. });
+    time::timeout(TIMEOUT, b_links.wait_for(a_connected))
+        .await
+        .expect("connects in time")
+        .expect("node still running");
+
+    assert!(node_a.remove_peer(b.id()));
+    assert!(!node_a.remove_peer(b.id()), "already removed");
+    assert!(!node_a.links().borrow().contains_key(&b.id()));
+    time::timeout(TIMEOUT, b_links.wait_for(|links| !a_connected(links)))
+        .await
+        .expect("b notices in time")
+        .expect("node still running");
+
+    // B keeps dialing, but A rejects it, so nothing it sends arrives.
+    time::sleep(Duration::from_secs(2)).await;
+    assert!(!a_connected(&b_links.borrow()));
+    assert!(!node_a.links().borrow().contains_key(&b.id()));
+    node_a
+        .broadcast(text_clip(a.id(), 1, "after removal"))
+        .expect("small clip");
+    let late = time::timeout(Duration::from_millis(500), inbox_b.clips.recv()).await;
+    assert!(late.is_err(), "a removed peer gets nothing: {late:?}");
     node_a.shutdown().await;
     node_b.shutdown().await;
 }

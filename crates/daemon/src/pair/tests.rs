@@ -6,8 +6,8 @@ use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 
 use clipbroad_core::ClipContent;
 use clipbroad_core::protocol::{Clip, ClipId, NodeId};
-use clipbroad_net::{Node, Received};
-use tokio::sync::{mpsc, oneshot};
+use clipbroad_net::{Inbox, Node};
+use tokio::sync::oneshot;
 use tokio::time;
 
 use super::*;
@@ -44,20 +44,24 @@ impl Machine {
         (Ipv4Addr::LOCALHOST, self.port).into()
     }
 
-    fn config(&self) -> Config {
-        Config::load_or_default(&self.paths.config_file).expect("valid config")
+    /// The peers the daemon would start with: its members.
+    fn peers(&self) -> Vec<Peer> {
+        let (_, _, mesh) = load(&self.paths).expect("valid files");
+        mesh.peers()
     }
 
-    async fn spawn_node(&self) -> (Node, mpsc::Receiver<Received>) {
-        let identity = IdentityKey::load(&self.paths.secret_key_file).expect("identity exists");
-        Node::spawn(&identity, &self.config())
-            .await
-            .expect("node starts")
+    async fn spawn_node(&self) -> (Node, Inbox) {
+        let (config, identity, mesh) = load(&self.paths).expect("valid files");
+        let config = Config {
+            peers: mesh.peers(),
+            ..config
+        };
+        Node::spawn(&identity, &config).await.expect("node starts")
     }
 }
 
 /// Sends `text` from `from` and waits until `to` receives it.
-async fn exchange(from: &Node, to: &mut mpsc::Receiver<Received>, text: &str) {
+async fn exchange(from: &Node, to: &mut Inbox, text: &str) {
     let origin = NodeId::from_bytes(*from.id().as_bytes());
     let clip = Clip::new(
         ClipId(1),
@@ -69,7 +73,9 @@ async fn exchange(from: &Node, to: &mut mpsc::Receiver<Received>, text: &str) {
     let received = time::timeout(TIMEOUT, async {
         loop {
             from.broadcast(clip.clone()).expect("small clip");
-            if let Ok(Some(received)) = time::timeout(Duration::from_millis(100), to.recv()).await {
+            if let Ok(Some(received)) =
+                time::timeout(Duration::from_millis(100), to.clips.recv()).await
+            {
                 return received;
             }
         }
@@ -109,10 +115,11 @@ async fn paired_machines_accept_each_other() {
     assert_eq!(a_as_peer.addrs, [a.addr()]);
     assert_eq!(b_as_peer.addrs.first(), Some(&b.addr()));
     assert_ne!(a_as_peer.id, b_as_peer.id);
-    assert_eq!(b.config().peers, [a_as_peer]);
-    assert_eq!(a.config().peers, [b_as_peer]);
+    assert_eq!(b.peers(), [a_as_peer]);
+    assert_eq!(a.peers(), [b_as_peer]);
+    // Pairing leaves the config file alone.
     let text = fs::read_to_string(&a.paths.config_file).expect("read");
-    assert!(text.starts_with("# my settings\n"), "{text}");
+    assert_eq!(text, format!("# my settings\nlisten_port = {}\n", a.port));
 
     // The normal allowlist now lets them talk, in both directions.
     let (node_a, mut inbox_a) = a.spawn_node().await;

@@ -17,6 +17,7 @@ fn peer(byte: u8, name: &str, connected: bool) -> PeerStatus {
         name: Some(name.to_owned()),
         connected,
         addr: None,
+        added_by: None,
     }
 }
 
@@ -59,6 +60,30 @@ fn counts_connected_machines() {
     assert_eq!(view.status, "1 of 2 machines connected");
     assert!(view.syncing);
     assert!(view.can_pair);
+}
+
+#[test]
+fn lists_every_member_to_remove() {
+    let view = View::new(
+        &status(vec![peer(2, "desk", true), peer(3, "desk", false)]),
+        None,
+        false,
+        State::Idle,
+        NOW_MS,
+    );
+    let members: Vec<_> = view
+        .members
+        .iter()
+        .map(|m| (m.id, m.label.clone()))
+        .collect();
+    assert_eq!(
+        members,
+        [
+            (id(2), format!("desk ({})", id(2).fmt_short())),
+            (id(3), format!("desk ({})", id(3).fmt_short())),
+        ]
+    );
+    assert_eq!(View::starting().members, []);
 }
 
 #[test]
