@@ -1,9 +1,12 @@
-//! One connection with a peer: the `Hello` exchange, then clips in both directions and file
-//! requests from the peer.
+//! One connection with a peer: the `Hello` exchange, then clips and member lists in both
+//! directions, and file requests from the peer.
 
 use std::{sync::Arc, time::Duration};
 
-use clipbroad_core::protocol::{self, FrameError, Hello, Message};
+use clipbroad_core::{
+    members::Members,
+    protocol::{self, FrameError, Hello, Message},
+};
 use iroh::{
     EndpointId,
     endpoint::{
@@ -11,13 +14,17 @@ use iroh::{
     },
 };
 use tokio::{
-    sync::{broadcast, mpsc, watch},
+    sync::{
+        broadcast,
+        mpsc::{self, error::TrySendError},
+        watch,
+    },
     task::JoinSet,
     time,
 };
 use tracing::{debug, warn};
 
-use crate::{Frame, Received, close, files, files::Offer, peer::PeerState};
+use crate::{Frame, Received, ReceivedMembers, close, files, files::Offer, peer::PeerState};
 
 /// Most bytes taken from the stream per read.
 pub(crate) const READ_CHUNK: usize = 64 * 1024;
@@ -49,17 +56,32 @@ enum SessionError {
     Stopped,
 }
 
+/// What a session reads from and writes to, besides its connection.
+pub(crate) struct Channels {
+    /// Clips to send.
+    pub(crate) outbox: broadcast::Receiver<Frame>,
+    /// Where received clips go.
+    pub(crate) inbox: mpsc::Sender<Received>,
+    /// Files to serve.
+    pub(crate) offer: watch::Receiver<Option<Arc<Offer>>>,
+    /// Where received member lists go.
+    pub(crate) members_in: mpsc::Sender<ReceivedMembers>,
+    /// The member list to send, encoded.
+    pub(crate) members_out: watch::Receiver<Option<Frame>>,
+}
+
 /// Runs a session until the connection ends, and closes it.
 ///
 /// Returns whether the peer completed the `Hello` exchange, so the caller can tell a peer that
 /// went away from one it cannot talk to.
-pub(crate) async fn run(
-    conn: Connection,
-    mut outbox: broadcast::Receiver<Frame>,
-    inbox: mpsc::Sender<Received>,
-    offer: watch::Receiver<Option<Arc<Offer>>>,
-    peer: Arc<PeerState>,
-) -> bool {
+pub(crate) async fn run(conn: Connection, channels: Channels, peer: Arc<PeerState>) -> bool {
+    let Channels {
+        mut outbox,
+        inbox,
+        offer,
+        members_in,
+        mut members_out,
+    } = channels;
     let handshake = time::timeout(HELLO_TIMEOUT, handshake(&conn)).await;
     let (mut send, mut reader) = match handshake.unwrap_or(Err(SessionError::HelloTimeout)) {
         Ok(streams) => streams,
@@ -70,8 +92,8 @@ pub(crate) async fn run(
     };
     let _live = peer.greeted(&conn);
     let result = tokio::select! {
-        result = send_clips(&mut send, &mut outbox) => result,
-        result = receive_clips(&mut reader, conn.remote_id(), &inbox) => result,
+        result = send_frames(&mut send, &mut outbox, &mut members_out) => result,
+        result = receive(&mut reader, conn.remote_id(), &inbox, &members_in) => result,
         result = serve_files(&conn, &offer) => result,
     };
     // Both loops only stop on an error; a peer that finishes its stream is the exception.
@@ -109,29 +131,47 @@ fn close_after(conn: &Connection, error: &SessionError) {
     }
 }
 
-async fn send_clips(
+/// Sends the member list, if there is one, then each new clip and each new list.
+async fn send_frames(
     send: &mut SendStream,
     outbox: &mut broadcast::Receiver<Frame>,
+    members: &mut watch::Receiver<Option<Frame>>,
 ) -> Result<(), SessionError> {
+    let mut list = members.borrow_and_update().clone();
     loop {
-        match outbox.recv().await {
-            Ok(frame) => send.write_all(&frame).await?,
-            Err(broadcast::error::RecvError::Lagged(missed)) => {
-                warn!(missed, "connection too slow, skipped clips");
+        if let Some(frame) = list.take() {
+            send.write_all(&frame).await?;
+        }
+        tokio::select! {
+            clip = outbox.recv() => match clip {
+                Ok(frame) => send.write_all(&frame).await?,
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    warn!(missed, "connection too slow, skipped clips");
+                }
+                Err(broadcast::error::RecvError::Closed) => return Err(SessionError::Stopped),
+            },
+            changed = members.changed() => {
+                changed.map_err(|_| SessionError::Stopped)?;
+                list.clone_from(&members.borrow_and_update());
             }
-            Err(broadcast::error::RecvError::Closed) => return Err(SessionError::Stopped),
         }
     }
 }
 
-async fn receive_clips(
+/// Reads clips and member lists until the peer finishes its stream.
+async fn receive(
     reader: &mut FrameReader,
     peer: EndpointId,
     inbox: &mpsc::Sender<Received>,
+    members_in: &mpsc::Sender<ReceivedMembers>,
 ) -> Result<(), SessionError> {
     while let Some(message) = reader.next().await? {
         let clip = match message {
             Message::Clip(clip) => clip,
+            Message::Members(members) => {
+                pass_members(peer, members, members_in);
+                continue;
+            }
             Message::Hello(_) => return Err(SessionError::Protocol("second Hello")),
             Message::FileRequest(_) | Message::FileResponse(_) => {
                 return Err(SessionError::Protocol("file message on the clip stream"));
@@ -151,6 +191,23 @@ async fn receive_clips(
             .map_err(|_| SessionError::Stopped)?;
     }
     Ok(())
+}
+
+/// Hands a peer's member list to the node's owner, without the ids that are not valid keys.
+/// Never waits: a full or closed receiver drops the list (see [`crate::Inbox`]).
+fn pass_members(
+    peer: EndpointId,
+    mut members: Members,
+    members_in: &mpsc::Sender<ReceivedMembers>,
+) {
+    members.retain(|member| EndpointId::from_bytes(member.id.as_bytes()).is_ok());
+    let received = ReceivedMembers {
+        from: peer,
+        members,
+    };
+    if let Err(TrySendError::Full(_)) = members_in.try_send(received) {
+        warn!(peer = %peer.fmt_short(), "too many member lists waiting, dropped one");
+    }
 }
 
 /// Answers the file requests the peer opens as bidirectional streams, each in its own task. They

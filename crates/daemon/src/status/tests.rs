@@ -36,12 +36,15 @@ fn sample() -> DaemonStatus {
                 name: Some("laptop".to_owned()),
                 connected: true,
                 addr: Some((Ipv4Addr::new(192, 168, 1, 20), 4747).into()),
+                added_by: None,
             },
             PeerStatus {
                 id: id(3),
                 name: None,
                 connected: false,
                 addr: None,
+                // Paired with the laptop, which told this machine about it.
+                added_by: Some(id(2)),
             },
         ],
     }
@@ -57,7 +60,7 @@ port           UDP 4747
 LAN discovery  on (mDNS)
 peers          1 of 2 connected
                laptop     {laptop}  connected via 192.168.1.20:4747
-               (no name)  {other}  not connected
+               (no name)  {other}  not connected, added by laptop
 last sent      11:57:00 UTC (3 min ago), text, 120 bytes, hash 1a2b3c4d
 last received  nothing yet
 ",

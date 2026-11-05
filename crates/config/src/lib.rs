@@ -1,4 +1,5 @@
-//! Node configuration and identity: the TOML config file, the secret key file and where both live.
+//! Node configuration and identity: the TOML config file, the secret key file, the members of the
+//! mesh ([`members`]) and where they live.
 //!
 //! ```
 //! use clipbroad_config::Config;
@@ -10,6 +11,7 @@
 
 mod config;
 mod identity;
+pub mod members;
 mod paths;
 
 use std::{io, path::PathBuf};
@@ -40,6 +42,14 @@ pub enum Error {
         path: PathBuf,
         #[source]
         source: ParseError,
+    },
+
+    /// The members file exists but is not valid.
+    #[error("invalid members file {}", path.display())]
+    Members {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
     },
 
     /// The secret key file does not hold exactly 32 bytes.

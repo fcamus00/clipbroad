@@ -17,7 +17,7 @@ use tokio::{
 };
 use tracing::{debug, info};
 
-use crate::{ALPN, Frame, Link, Links, Received, close, files::Offer, session};
+use crate::{ALPN, Frame, Link, Links, Received, ReceivedMembers, close, files::Offer, session};
 
 /// Delay before the first redial, and after a session that was up ends.
 const MIN_BACKOFF: Duration = Duration::from_millis(500);
@@ -37,6 +37,10 @@ pub(crate) struct Channels {
     pub(crate) offer: watch::Receiver<Option<Arc<Offer>>>,
     /// Where each peer's [`Link`] is published.
     pub(crate) links: watch::Sender<Links>,
+    /// Member lists received from any peer.
+    pub(crate) members_in: mpsc::Sender<ReceivedMembers>,
+    /// The members list to send, encoded.
+    pub(crate) members_out: watch::Receiver<Option<Frame>>,
 }
 
 pub(crate) struct PeerTask {
@@ -49,6 +53,8 @@ pub(crate) struct PeerTask {
     outbox: broadcast::Sender<Frame>,
     inbox: mpsc::Sender<Received>,
     offer: watch::Receiver<Option<Arc<Offer>>>,
+    members_in: mpsc::Sender<ReceivedMembers>,
+    members_out: watch::Receiver<Option<Frame>>,
     state: Arc<PeerState>,
 }
 
@@ -65,6 +71,8 @@ impl PeerTask {
             inbox,
             offer,
             links,
+            members_in,
+            members_out,
         } = channels;
         let addr = (discovery || !addrs.is_empty()).then(|| {
             addrs
@@ -86,6 +94,8 @@ impl PeerTask {
             outbox,
             inbox,
             offer,
+            members_in,
+            members_out,
             state: Arc::new(state),
         }
     }
@@ -130,9 +140,13 @@ impl PeerTask {
 
             sessions.spawn(session::run(
                 conn,
-                self.outbox.subscribe(),
-                self.inbox.clone(),
-                self.offer.clone(),
+                session::Channels {
+                    outbox: self.outbox.subscribe(),
+                    inbox: self.inbox.clone(),
+                    offer: self.offer.clone(),
+                    members_in: self.members_in.clone(),
+                    members_out: self.members_out.clone(),
+                },
                 Arc::clone(&self.state),
             ));
         }
@@ -193,7 +207,10 @@ impl PeerState {
         let addr = selected_ip(conn);
         self.links.send_modify(|links| {
             self.live_sessions.fetch_add(1, Ordering::Relaxed);
-            links.insert(self.id, Link::Connected { addr });
+            // A removed peer has no entry, and must not get one back.
+            if let Some(link) = links.get_mut(&self.id) {
+                *link = Link::Connected { addr };
+            }
         });
         LiveSession {
             peer: self,
@@ -204,6 +221,13 @@ impl PeerState {
     /// Follows the connections with a live session, oldest first. Some may have closed since.
     pub(crate) fn live(&self) -> watch::Receiver<Vec<Connection>> {
         self.live.subscribe()
+    }
+
+    /// Closes every connection with a live session, telling the peer why.
+    pub(crate) fn close_all(&self, code: iroh::endpoint::VarInt, reason: &[u8]) {
+        for conn in self.live.borrow().iter() {
+            conn.close(code, reason);
+        }
     }
 
     #[cfg(test)]
@@ -227,10 +251,14 @@ impl Drop for LiveSession<'_> {
             .send_modify(|live| live.retain(|conn| conn.stable_id() != id));
         peer.links.send_if_modified(|links| {
             let was_last = peer.live_sessions.fetch_sub(1, Ordering::Relaxed) == 1;
-            if was_last {
-                links.insert(peer.id, Link::Disconnected);
+            // A removed peer has no entry, and must not get one back.
+            match links.get_mut(&peer.id) {
+                Some(link) if was_last => {
+                    *link = Link::Disconnected;
+                    true
+                }
+                _ => false,
             }
-            was_last
         });
     }
 }

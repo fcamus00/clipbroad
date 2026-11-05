@@ -16,7 +16,8 @@ same PR that changes it.
 ## Architecture
 
 **Full-mesh P2P, without a server.** The same `clipbroad` binary runs as a daemon on each machine and
-connects directly to each paired peer.
+connects directly to every member of the mesh. A machine joins by pairing with any one member (see
+"Mesh").
 
 Why not a central server (like ClipCascade):
 - One hop instead of two (faster, especially for images and files).
@@ -39,8 +40,8 @@ Chosen configuration:
 - **Tailscale**: mDNS does not cross the tailnet, so each peer can also have static addresses in the
   configuration (`EndpointAddr::new(id).with_ip_addr(...)`), for example `100.x.y.z:port` or the
   resolved MagicDNS hostname. Fixed, configurable listen port.
-- **Allowlist**: only connections from paired `EndpointId`s are accepted, using `EndpointHooks`
-  (see iroh's `auth-hook` example). Everything else is rejected.
+- **Allowlist**: only connections from the `EndpointId`s of the mesh's members are accepted, using
+  `EndpointHooks` (see iroh's `auth-hook` example). Everything else is rejected.
 - **iroh features**: `tls-ring` and `fast-apple-datapath`, without the default ones. No `portmapper`
   (UPnP is not needed on LAN/Tailscale and brings an MPL-2.0 dependency) and no `metrics`. `cargo deny` only
   checks the targets we publish (so iroh's wasm-only crates do not count) and allows
@@ -64,7 +65,7 @@ Static addresses are still useful for what mDNS does not reach, such as Tailscal
   default `irohv1`, so it does not mix with other iroh apps on the same network. All nodes
   must use the same one.
 - **It only finds addresses, it never grants access.** The allowlist does not change: a node that announces itself on
-  the LAN and is not in the config is still rejected after TLS.
+  the LAN and is not a member of the mesh is still rejected after TLS.
 - **Privacy:** the announcement is multicast on the local network, so anyone on the same LAN sees this node's public
   id, its addresses and that it runs clipbroad. The id is not secret (it cannot be used to
   connect without being paired), but it lets someone recognize the machine on that network. No
@@ -80,7 +81,7 @@ Static addresses are still useful for what mDNS does not reach, such as Tailscal
 ### Connections (`net` crate)
 
 - **One connection per peer**, long-lived. Each node dials all the peers it can find
-  (with mDNS on, all of them; otherwise, the ones that have addresses in the config) and accepts the connections that
+  (with mDNS on, all of them; otherwise, the ones with saved addresses) and accepts the connections that
   arrive from them. Without mDNS, a peer without addresses can only connect if it is the one that dials.
 - **Streams:** each side opens a unidirectional stream and writes frames: first `Hello`, then one
   frame per clip. It reads the other side's stream the same way. Each bidirectional stream is the transfer of
@@ -103,7 +104,8 @@ Static addresses are still useful for what mDNS does not reach, such as Tailscal
 ### Pairing
 
 The user runs `clipbroad pair` on one machine (A), which shows a ticket and waits, and
-`clipbroad pair <ticket>` on the other (B). Each adds the other to its configuration and exits.
+`clipbroad pair <ticket>` on the other (B). Each adds the other to its members file and exits.
+If A is in a mesh already, the members then tell each other about B (see "Mesh").
 If `clipbroad run` is running, `pair` asks it to do the pairing (see "Control channel"), and the
 daemon syncs with the new peer right away. Code in `crates/net/src/pair.rs` and
 `crates/daemon/src/pair.rs`.
@@ -125,22 +127,65 @@ daemon syncs with the new peer right away. Code in `crates/net/src/pair.rs` and
   asked for one. One host at a time. The pairing logic (secret, messages, limits) is the same code
   as without the daemon.
 - **New peer without a restart:** `Node::add_peer` adds the peer to the allowlist, to the links
-  and to the accept loop's routes, and starts its task, which dials it like the peers from the
-  config. The host adds it after saving it and before confirming, so it is a peer by the time B
-  knows the pairing worked. Peers edited by hand in the config still need a restart.
-- **Config:** a `[[peers]]` block is appended as text at the end of the file (comments are
-  kept), with `id`, `name` and `addrs`. The file is created if it does not exist, the result is validated
-  before writing, and a peer that was already there is neither duplicated nor modified.
+  and to the accept loop's routes, and starts its task, which dials it like the peers it started
+  with. The host adds it after saving it and before confirming, so it is a peer by the time B
+  knows the pairing worked. `Node::remove_peer` undoes all of that and closes its connections.
+  Peers edited by hand in `config.toml` still need a restart.
+- **Saved:** each side admits the other to its members file, `members.toml` (see "Mesh"), with
+  `id`, `name`, `addrs` and `added_by`. `config.toml` is not touched. A machine that was a member
+  already is neither duplicated nor modified, and one that was removed is refused before the host
+  confirms.
 - **Threats:** iroh's TLS already authenticates both `EndpointId`s; the secret only proves that B saw the
   ticket on A's screen. A accepts a single valid request and stops listening, or stops listening after
   5 minutes: a ticket leaked after it was used or expired is useless, because nobody answers anymore. A
   wrong secret only closes that connection and the session keeps waiting (guessing 128 bits in 5
   minutes is not feasible), so a foreign attempt does not ruin the user's pairing. If someone
-  uses a leaked ticket *before* B, they get paired with A; the user notices because their
-  `clipbroad pair <ticket>` fails, and must remove that peer from the config.
+  uses a leaked ticket *before* B, they get paired with A, and through A with the whole mesh; the
+  user notices because their `clipbroad pair <ticket>` fails, and must `clipbroad remove` that
+  machine. `clipbroad status` shows which member added each machine.
 - **Limit:** the saved addresses are the ones from that moment. If a machine's LAN IP changes,
-  mDNS finds the new one; the saved ones just become outdated. With `mdns = false` you have to edit
-  `addrs` by hand (or pair again after deleting the peer).
+  mDNS finds the new one; the saved ones just become outdated. With `mdns = false` you have to write
+  the peer's `addrs` in `config.toml`, which wins over the members file.
+
+### Mesh
+
+Pairing with one member is enough to join the whole mesh: the members tell each other who is in.
+Code in `crates/core/src/members.rs` (the rules), `crates/config/src/members.rs` (the file) and
+`crates/daemon/src/mesh.rs` (wiring it to the node).
+
+- **The list:** each node keeps every machine it knows, removed ones included, each with `id`,
+  `name`, `addrs`, `added_by` (the member that paired with it, or none for a `config.toml` peer) and
+  `removed`. The node syncs with the ones that are not removed.
+- **Gossip:** each side sends its whole list (`Message::Members`) right after `Hello`, and again
+  whenever it changes. The receiver merges it and, if anything changed, saves it, starts or stops
+  peers (`Node::add_peer`, `Node::remove_peer`) and sends its own list to its peers. A list that
+  changes nothing is not sent on, so the gossip stops.
+- **Merge rule:** a union by id where removal wins. Known members keep their name and addresses.
+  The result does not depend on the order lists arrive in, and merging the same list twice changes
+  nothing, so every node that keeps meeting the others converges on the same list. Two meshes
+  that pair join into one the same way.
+- **Self-claims are ignored:** entries about the receiver itself, or about the sender, are skipped. A
+  removed machine that still talks to a member that has not heard of the removal cannot list itself
+  back in.
+- **Removal is permanent:** `clipbroad remove <name or id prefix>` marks the member removed, and
+  nothing makes it active again: not a list that still has it, not pairing, not `config.toml`. To
+  join again, the machine needs a new identity (delete its `secret.key` and pair). A permanent mark
+  is simpler than versions per entry, and versions would let a removed machine send itself back
+  with a higher one. `remove` asks the running daemon over the control channel, which disconnects
+  the machine (close code 4) and tells the others; without a daemon it edits the file, and the daemon
+  tells the others when it starts.
+- **Who can admit:** any member. A leaked ticket gives access to the whole mesh, not one machine
+  (see "Threats" above); accepted, since all the machines belong to one person.
+- **File:** `members.toml` beside `secret.key`, because it belongs to the identity. Only clipbroad
+  writes it, replacing it atomically, so a person's edits and comments in `config.toml` never mix
+  with gossip. `config.toml`'s `[[peers]]` are still read at start and added as members (their name
+  and addresses win), so older configs keep working without a migration.
+- **Limits:** at most 256 entries; a merge adds no new one past that. Ids that are not valid keys
+  are dropped on receipt. A full queue of received lists drops the newest one (each list is
+  complete, and the peer sends it again on its next change or connection).
+- **Known gap:** if C pairs with A while B is off, and A is off when B comes back, B still rejects C
+  until A and B meet. Solving it would need an introduction signed by A that C carries; not worth it
+  until it shows up in real use.
 
 ### Protocol
 
@@ -163,10 +208,10 @@ Details (code in `crates/core/src/protocol.rs`):
   sender does not encode a larger frame. Because of that, the config rejects an `inline_max_bytes` greater than
   16 MiB minus 64 KiB (margin for the clip metadata), and the daemon does not sync copied text
   larger than `inline_max_bytes`: it skips it with a warning.
-- **Messages:** `Hello { protocol_version }`, `Clip`, `FileRequest` and `FileResponse`. Each side sends
-  `Hello` first; `decode` returns a typed error if the version does not match, and the connection is
-  closed. The last two only travel on the bidirectional file streams; on the
-  clip stream they are a protocol error.
+- **Messages:** `Hello { protocol_version }`, `Clip`, `FileRequest`, `FileResponse` and `Members`
+  (version 4, see "Mesh"). Each side sends `Hello` first; `decode` returns a typed error if the
+  version does not match, and the connection is closed. `FileRequest` and `FileResponse` only travel
+  on the bidirectional file streams; on the clip stream they are a protocol error.
 - **`Hello` is stable across versions:** it is always variant 0 and `protocol_version` is always its
   first field; fields can only be added at the end. `decode` ignores leftover bytes inside a
   frame, so an old node can read the version of a new `Hello` and reject it with a clear error.
@@ -229,7 +274,7 @@ Ctrl+C, SIGTERM or the tray icon's "Quit" (see "Tray icon").
 - The logs show the node id at startup, the connections and each clip sent or received with its
   size and the first 8 characters of the hash, never the content. `run` logs at info level by
   default.
-- `--config <file>` (on `run` and `pair`) uses another config file, and `secret.key` in the same
+- `--config <file>` (on `run`, `pair` and `remove`) uses another config file, and `secret.key` in the same
   folder as the identity. It is useful to run two instances on one machine (testing).
 - Content marked as sensitive is not sent: the daemon skips it with a debug-level log that
   shows the marker, never the content.
@@ -262,7 +307,8 @@ The daemon writes its status to a TOML file, `status.toml`, in the same folder a
 
 ### Control channel
 
-How `clipbroad pair` talks to the running daemon (code in `crates/daemon/src/control.rs`).
+How `clipbroad pair` and `clipbroad remove` talk to the running daemon (code in
+`crates/daemon/src/control.rs`).
 
 - **A local socket:** a Unix socket `control.sock` beside `secret.key` on Linux and macOS, and on
   Windows a named pipe whose name is `\\.\pipe\clipbroad\` and the path of that same
@@ -277,8 +323,9 @@ How `clipbroad pair` talks to the running daemon (code in `crates/daemon/src/con
   Windows the pipe refuses remote clients, and its default security lets only this user,
   administrators and SYSTEM open it for writing.
 - **Messages:** a big-endian `u32` length and the message in `postcard`, up to 64 KiB. The client
-  sends one request (`Host`, or `Join` with the ticket); the daemon answers with the ticket to
-  show (`Host` only) and then `Paired` or `Failed` with the error to show. Both sides are the same
+  sends one request (`Host`, `Join` with the ticket, or `Remove` with a name or id); the daemon
+  answers with the ticket to show (`Host` only) and then `Paired`, `Removed` or `Failed` with the
+  error to show. Both sides are the same
   binary; an old daemon after an upgrade fails to decode, and the error says to restart it.
 - **One at a time:** while one `pair` is served, another one gets "already running". A client that
   sends no request in 5 s is dropped. While the daemon hosts, it watches the socket: if `pair` quits
@@ -766,6 +813,8 @@ reason.
   time from either place, and its items stay disabled meanwhile. The ticket goes through the clipboard
   so the feature needs no window to show text. A note in place of the last clip says how it went, and
   stays for 5 minutes, because a notification would need an app bundle on macOS.
+- There is no "Remove" item: removal is permanent and the menu has no way to ask for confirmation,
+  so it stays a command (`clipbroad remove`).
 - A pairing ticket is never synced, whoever copied it: the ticket is for a machine that is not paired
   yet, and it is a secret until it is used. `local_change` drops text that parses as a ticket.
 - Pause drops clips in both directions and cancels a running download. What is copied during a pause

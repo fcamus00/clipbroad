@@ -77,6 +77,16 @@ xattr -d com.apple.quarantine clipbroad
 (`gh run download` usually does not set the flag; it is needed when the file was downloaded with a
 browser. If `xattr` says "No such xattr", there is nothing to do.)
 
+## Add and remove machines
+
+Run `clipbroad pair` on a machine that is already in your mesh. It shows a ticket and waits. Then run
+`clipbroad pair <TICKET>` on the new machine. Pairing with one member is enough: the members tell each
+other about the new machine, and it syncs with all of them once they meet.
+
+`clipbroad remove <NAME>` takes a machine out of the mesh, for good, on every member. Use the name
+that `clipbroad status` shows, or the first characters of the id. The removed machine cannot join
+again with the same identity: delete its `secret.key` and pair it again.
+
 ## Tray icon
 
 `clipbroad run` shows an icon in the notification area on Windows, the menu bar on macOS, and the

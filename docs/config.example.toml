@@ -66,9 +66,10 @@ file_cache_max_days = 7
 # always takes a click or that command.
 update_check = true
 
-# Paired machines. `clipbroad pair` usually writes them; you can edit them by hand, but
-# `clipbroad run` reads them only when it starts. Peers added by `clipbroad pair` while it runs
-# sync right away.
+# Peers written by hand. `clipbroad pair` does not write here: it saves machines in
+# `members.toml`, beside `secret.key`, and the members of the mesh share that list. `clipbroad run`
+# reads these only when it starts, adds them to the mesh, and uses the name and addresses written
+# here. A peer removed with `clipbroad remove` stays out even if it is still listed here.
 # Each one has:
 #   id     public identity of the peer (64 lowercase hexadecimal characters). Required and
 #          unique.

@@ -15,7 +15,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use std::{fs, process};
 
 use anyhow::{Context, Result};
-use clipbroad_config::{Config, Paths, Peer};
+use clipbroad_config::{Config, Paths};
 use clipbroad_core::protocol::ContentKind;
 use clipbroad_net::{Link, Links, Node};
 use iroh::EndpointId;
@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::backend;
+use crate::mesh::Mesh;
 use crate::run::now_ms;
 use crate::watch::{files_summary, utc_time};
 
@@ -69,7 +70,7 @@ pub struct DaemonStatus {
     pub update: Option<String>,
     pub last_sent: Option<ClipEvent>,
     pub last_received: Option<ClipEvent>,
-    /// In config order, then the peers paired while running.
+    /// The members of the mesh, in the order this machine learned of them.
     pub peers: Vec<PeerStatus>,
 }
 
@@ -118,23 +119,20 @@ pub struct PeerStatus {
     pub connected: bool,
     /// The address the connection uses, if known.
     pub addr: Option<SocketAddr>,
+    /// The member that paired with it, if it was not this machine or the config file.
+    #[serde(default)]
+    pub added_by: Option<EndpointId>,
 }
 
 impl DaemonStatus {
-    /// The status of a daemon that just started `node` from `config`: no clips, no peer
-    /// connected yet.
+    /// The status of a daemon that just started `node` from `config`: no clips, and no peers
+    /// until [`DaemonStatus::set_peers`].
     pub fn new(node: &Node, config: &Config) -> Self {
         let mdns = match (config.mdns, node.lan_discovery()) {
             (true, true) => Mdns::On,
             (true, false) => Mdns::Failed,
             (false, _) => Mdns::Off,
         };
-        let peers = config.peers.iter().map(|peer| PeerStatus {
-            id: peer.id,
-            name: peer.name.clone(),
-            connected: false,
-            addr: None,
-        });
         Self {
             pid: process::id(),
             updated_ms: 0,
@@ -146,20 +144,26 @@ impl DaemonStatus {
             update: None,
             last_sent: None,
             last_received: None,
-            peers: peers.collect(),
+            peers: Vec::new(),
         }
     }
 
-    /// Lists a peer that was just paired, not connected yet.
-    pub fn add_peer(&mut self, peer: &Peer) {
-        if self.peers.iter().all(|known| known.id != peer.id) {
-            self.peers.push(PeerStatus {
+    /// Lists the members of `mesh`, each with its link.
+    pub fn set_peers(&mut self, mesh: &Mesh, links: &Links) {
+        let peers = mesh.peers().into_iter().map(|peer| {
+            let (connected, addr) = match links.get(&peer.id) {
+                Some(Link::Connected { addr }) => (true, *addr),
+                Some(Link::Disconnected) | None => (false, None),
+            };
+            PeerStatus {
+                added_by: mesh.added_by(peer.id),
                 id: peer.id,
-                name: peer.name.clone(),
-                connected: false,
-                addr: None,
-            });
-        }
+                name: peer.name,
+                connected,
+                addr,
+            }
+        });
+        self.peers = peers.collect();
     }
 
     /// The newest clip, sent or received, for the tray menu.
@@ -178,15 +182,6 @@ impl DaemonStatus {
     fn peer_label(&self, id: EndpointId) -> &str {
         let peer = self.peers.iter().find(|peer| peer.id == id);
         peer.map_or("an unknown peer", peer_name)
-    }
-
-    pub fn update_links(&mut self, links: &Links) {
-        for peer in &mut self.peers {
-            (peer.connected, peer.addr) = match links.get(&peer.id) {
-                Some(Link::Connected { addr }) => (true, *addr),
-                Some(Link::Disconnected) | None => (false, None),
-            };
-        }
     }
 
     /// Refreshes the time and the macOS pasteboard access, then replaces the file at `path`. A
@@ -274,11 +269,7 @@ pub fn render(status: Option<&DaemonStatus>, now_ms: u64) -> String {
         let names: Vec<&str> = status.peers.iter().map(peer_name).collect();
         let width = names.iter().map(|name| name.chars().count()).max();
         for (peer, name) in status.peers.iter().zip(names) {
-            let state = match (peer.connected, peer.addr) {
-                (true, Some(addr)) => format!("connected via {addr}"),
-                (true, None) => "connected".to_owned(),
-                (false, _) => "not connected".to_owned(),
-            };
+            let state = peer_state(status, peer);
             let id = peer.id.fmt_short();
             line(
                 "",
@@ -332,6 +323,19 @@ pub fn render(status: Option<&DaemonStatus>, now_ms: u64) -> String {
         }
     }
     out
+}
+
+/// `connected via 192.168.1.20:42420`, `not connected, added by laptop`.
+fn peer_state(status: &DaemonStatus, peer: &PeerStatus) -> String {
+    let mut state = match (peer.connected, peer.addr) {
+        (true, Some(addr)) => format!("connected via {addr}"),
+        (true, None) => "connected".to_owned(),
+        (false, _) => "not connected".to_owned(),
+    };
+    if let Some(by) = peer.added_by {
+        let _ = write!(state, ", added by {}", status.peer_label(by));
+    }
+    state
 }
 
 fn peer_name(peer: &PeerStatus) -> &str {

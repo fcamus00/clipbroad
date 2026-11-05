@@ -17,6 +17,7 @@ fn peer(byte: u8, name: &str, connected: bool) -> PeerStatus {
         name: Some(name.to_owned()),
         connected,
         addr: None,
+        added_by: None,
     }
 }
 

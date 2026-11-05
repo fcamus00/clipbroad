@@ -15,6 +15,8 @@
 //!   is one file transfer: the receiver of a files clip sends a [`FileRequest`], and the sender
 //!   answers with a [`FileResponse`] followed, if it is [`FileResponse::Ok`], by exactly `size`
 //!   raw file bytes and the end of the stream.
+//! - [`Members`] also travels on the unidirectional stream: each side sends its list right after
+//!   `Hello`, and again whenever it changes.
 //!
 //! # Compatibility
 //!
@@ -24,11 +26,11 @@
 //! [`decode`] ignores bytes left over after the message inside a frame, so an older peer still
 //! reads the version from a newer, longer `Hello`.
 
-use std::fmt;
+use std::{fmt, str::FromStr};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::{ClipContent, ContentHash, FileEntry, FileList, FileListError, Png};
+use crate::{ClipContent, ContentHash, FileEntry, FileList, FileListError, Png, members::Members};
 
 /// Wire protocol version. Bump on any incompatible message change.
 ///
@@ -37,7 +39,8 @@ use crate::{ClipContent, ContentHash, FileEntry, FileList, FileListError, Png};
 /// - 2: image clips ([`ContentKind::Image`]). A version 1 peer cannot decode them.
 /// - 3: files clips ([`ContentKind::Files`], [`Payload::Files`]) and file transfers
 ///   ([`FileRequest`], [`FileResponse`]).
-pub const PROTOCOL_VERSION: u16 = 3;
+/// - 4: the members of the mesh ([`Message::Members`]).
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Largest frame body accepted or sent, in bytes.
 ///
@@ -64,6 +67,8 @@ pub enum Message {
     FileRequest(FileRequest),
     /// Answer to a [`FileRequest`], on the same stream.
     FileResponse(FileResponse),
+    /// Every member of the mesh the sender knows, removed ones included (see [`crate::members`]).
+    Members(Members),
 }
 
 /// Asks the peer for the file with this hash from its latest files clip.
@@ -97,8 +102,9 @@ impl Hello {
 
 /// Identity of a node: the 32 bytes of its iroh `EndpointId` (an Ed25519 public key).
 ///
-/// `core` does not interpret the bytes, so it does not depend on iroh.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// `core` does not interpret the bytes, so it does not depend on iroh. Serialized as the raw
+/// bytes on the wire and as hex in text formats such as TOML.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId([u8; 32]);
 
 impl NodeId {
@@ -128,6 +134,52 @@ impl fmt::Display for NodeId {
 impl fmt::Debug for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "NodeId({self})")
+    }
+}
+
+/// A [`NodeId`] that is not 64 hex characters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("a node id is 64 hexadecimal characters")]
+pub struct InvalidNodeId;
+
+impl FromStr for NodeId {
+    type Err = InvalidNodeId;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let (pairs, []) = text.as_bytes().as_chunks::<2>() else {
+            return Err(InvalidNodeId);
+        };
+        if pairs.len() != 32 {
+            return Err(InvalidNodeId);
+        }
+        let digit = |c: u8| char::from(c).to_digit(16).ok_or(InvalidNodeId);
+        let mut bytes = [0; 32];
+        for (byte, &[high, low]) in bytes.iter_mut().zip(pairs) {
+            // Two hex digits always fit in a byte.
+            *byte = u8::try_from(digit(high)? * 16 + digit(low)?).map_err(|_| InvalidNodeId)?;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl Serialize for NodeId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            serializer.collect_str(self)
+        } else {
+            self.0.serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            let text = <&str>::deserialize(deserializer)?;
+            text.parse().map_err(de::Error::custom)
+        } else {
+            <[u8; 32]>::deserialize(deserializer).map(Self)
+        }
     }
 }
 
@@ -435,9 +487,9 @@ mod tests {
 
     #[test]
     fn hello_wire_format_never_changes() {
-        // Length 2, variant 0 (Hello), version 3. Older and newer peers depend on these bytes.
+        // Length 2, variant 0 (Hello), version 4. Older and newer peers depend on these bytes.
         let frame = encode(&Message::Hello(Hello::CURRENT)).expect("encode");
-        assert_eq!(frame, [0, 0, 0, 2, 0, 3]);
+        assert_eq!(frame, [0, 0, 0, 2, 0, 4]);
     }
 
     #[test]
@@ -648,6 +700,34 @@ mod tests {
         for response in [FileResponse::Ok { size: 1 << 40 }, FileResponse::NotOffered] {
             let message = Message::FileResponse(response);
             assert_eq!(round_trip(&message), message);
+        }
+    }
+
+    #[test]
+    fn members_round_trip() {
+        let member = crate::members::Member {
+            id: NodeId::from_bytes([5; 32]),
+            name: Some("laptop".to_owned()),
+            addrs: vec!["192.168.1.20:42420".parse().expect("valid")],
+            added_by: Some(NodeId::from_bytes([3; 32])),
+            removed: false,
+        };
+        let mut members = Members::default();
+        assert_eq!(members.admit(member), Ok(true));
+        let message = Message::Members(members);
+        assert_eq!(round_trip(&message), message);
+    }
+
+    #[test]
+    fn node_id_is_raw_bytes_on_the_wire_and_hex_in_text() {
+        let id = NodeId::from_bytes([0xab; 32]);
+        assert_eq!(postcard::to_allocvec(&id).expect("encode"), [0xab; 32]);
+        let hex = "ab".repeat(32);
+        assert_eq!(hex.parse(), Ok(id));
+        assert_eq!(id.to_string(), hex);
+        assert_eq!("AB".repeat(32).parse(), Ok(id));
+        for bad in ["ab", &"zz".repeat(32), &"é".repeat(32)] {
+            assert_eq!(bad.parse::<NodeId>(), Err(InvalidNodeId), "{bad}");
         }
     }
 
