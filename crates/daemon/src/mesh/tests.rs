@@ -93,6 +93,19 @@ fn removal_is_saved_and_permanent() {
 }
 
 #[test]
+fn remove_by_id_takes_an_active_member_only() {
+    let machine = Machine::new();
+    let mesh = machine.mesh(&Config::default());
+    mesh.admit(&peer(1, "laptop"), None).expect("saved");
+    assert_eq!(
+        mesh.remove_id(id(1), None).expect("removed").id,
+        node_id(id(1))
+    );
+    assert!(mesh.remove_id(id(1), None).is_err(), "already removed");
+    assert!(mesh.remove_id(id(2), None).is_err(), "never a member");
+}
+
+#[test]
 fn remove_finds_one_machine_by_name_or_id_prefix() {
     let machine = Machine::new();
     let mesh = machine.mesh(&Config::default());

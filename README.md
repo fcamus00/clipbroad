@@ -83,8 +83,9 @@ Run `clipbroad pair` on a machine that is already in your mesh. It shows a ticke
 `clipbroad pair <TICKET>` on the new machine. Pairing with one member is enough: the members tell each
 other about the new machine, and it syncs with all of them once they meet.
 
-`clipbroad remove <NAME>` takes a machine out of the mesh, for good, on every member. Use the name
-that `clipbroad status` shows, or the first characters of the id. The removed machine cannot join
+`clipbroad remove <NAME>`, or **Remove a machine** in the tray menu, takes a machine out of the
+mesh, for good, on every member. Use the name that `clipbroad status` shows, or the first characters
+of the id. The removed machine cannot join
 again with the same identity: delete its `secret.key` and pair it again.
 
 ## Tray icon
@@ -103,6 +104,8 @@ items:
 - **Pair with the copied ticket** pairs with the ticket on the clipboard. Use it on the other machine
   after copying the ticket there. Both machines start syncing right away. The first line under the
   status says how it went.
+- **Remove a machine** lists the members of the mesh. Point at one and choose **Remove ... for
+  good** to take it out of the mesh, as `clipbroad remove` does.
 - **Pause sync** stops sending and applying clips, until **Resume sync** or a restart. What you copy
   during a pause is not sent later.
 - **Check for updates** looks for a new version, and turns into **Update to 0.3.1 and restart** when

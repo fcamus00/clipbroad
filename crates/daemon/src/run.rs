@@ -270,6 +270,10 @@ pub async fn sync(
                     let text = start_pairing(copied, &mut pairing, &clipboard, &node, &mesh).await;
                     menu.note(text, now_ms());
                 }
+                Action::Remove(id) => {
+                    let removed = mesh.remove_id(id, Some(&node));
+                    menu.note(removal_result(&removed), now_ms());
+                }
                 Action::Update => {
                     if let Some(note) = self_update.choose(status.paused || pairing.is_some()) {
                         menu.note(note, now_ms());

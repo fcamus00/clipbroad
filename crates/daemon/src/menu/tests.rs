@@ -63,6 +63,30 @@ fn counts_connected_machines() {
 }
 
 #[test]
+fn lists_every_member_to_remove() {
+    let view = View::new(
+        &status(vec![peer(2, "desk", true), peer(3, "desk", false)]),
+        None,
+        false,
+        State::Idle,
+        NOW_MS,
+    );
+    let members: Vec<_> = view
+        .members
+        .iter()
+        .map(|m| (m.id, m.label.clone()))
+        .collect();
+    assert_eq!(
+        members,
+        [
+            (id(2), format!("desk ({})", id(2).fmt_short())),
+            (id(3), format!("desk ({})", id(3).fmt_short())),
+        ]
+    );
+    assert_eq!(View::starting().members, []);
+}
+
+#[test]
 fn does_not_count_as_syncing_without_a_connected_peer() {
     let alone = View::new(&status(vec![]), None, false, State::Idle, NOW_MS);
     assert_eq!(alone.status, "No machines paired yet");

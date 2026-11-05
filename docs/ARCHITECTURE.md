@@ -807,14 +807,17 @@ thread messages. The menu shows nothing live while it is open on Windows and mac
 reason.
 
 - Items: the peers connected and the last clip (disabled, they only show text), "Pair a machine",
-  "Pair with the copied ticket", "Pause sync", the update item (see "Updates"), "Quit clipbroad". The icon is a blue circle while
+  "Pair with the copied ticket", "Pause sync", "Remove a machine", the update item (see "Updates"), "Quit clipbroad". The icon is a blue circle while
   clips flow and a grey ring otherwise, different in shape so color is not needed to tell them apart.
 - Pairing uses the same functions and the same slot as `clipbroad pair`, so there is one pairing at a
   time from either place, and its items stay disabled meanwhile. The ticket goes through the clipboard
   so the feature needs no window to show text. A note in place of the last clip says how it went, and
   stays for 5 minutes, because a notification would need an app bundle on macOS.
-- There is no "Remove" item: removal is permanent and the menu has no way to ask for confirmation,
-  so it stays a command (`clipbroad remove`).
+- "Remove a machine" has a submenu per member, and each of those holds a disabled line that says the
+  machine cannot join again with that identity, and the item "Remove <name> for good". Removal is
+  permanent and the menu cannot show a dialog, so this nesting is the confirmation: it takes two
+  deliberate clicks. Labels carry the short id, since two machines may share a hostname. The tray
+  rebuilds the submenu only when the members change. It does the same as `clipbroad remove`.
 - A pairing ticket is never synced, whoever copied it: the ticket is for a machine that is not paired
   yet, and it is a secret until it is used. `local_change` drops text that parses as a ticket.
 - Pause drops clips in both directions and cancels a running download. What is copied during a pause

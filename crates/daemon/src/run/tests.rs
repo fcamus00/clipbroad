@@ -975,3 +975,27 @@ async fn pairing_with_one_member_joins_the_whole_mesh_and_removal_spreads() {
     b.stop().await;
     c.stop().await;
 }
+
+#[tokio::test]
+async fn menu_removes_a_member() {
+    let (spec_a, spec_b) = (Spec::new(), Spec::new());
+    let max = Config::DEFAULT_INLINE_MAX_BYTES.get();
+    let a = Daemon::start(&spec_a, spec_a.config([&spec_b], max));
+    let b = Daemon::start(&spec_b, spec_b.config([&spec_a], max));
+    assert!(eventually(TIMEOUT, || a.connected_to(&b) && b.connected_to(&a)).await);
+    let listed = |daemon: &Daemon| daemon.view().members.iter().any(|m| m.id == spec_b.id());
+    assert!(eventually(TIMEOUT, || listed(&a)).await);
+
+    a.click(Action::Remove(b.id));
+    let removed = || a.view().activity.starts_with("Removed ") && !listed(&a);
+    assert!(eventually(TIMEOUT, removed).await, "{:?}", a.view());
+    assert!(!a.saved_members().contains(&b.id));
+    assert!(eventually(TIMEOUT, || !b.connected_to(&a)).await);
+
+    // A second click, from a menu that has not redrawn yet, only says why nothing happened.
+    a.click(Action::Remove(b.id));
+    let failed = || a.view().activity.contains("not a member anymore");
+    assert!(eventually(TIMEOUT, failed).await, "{:?}", a.view());
+    a.stop().await;
+    b.stop().await;
+}

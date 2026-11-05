@@ -121,8 +121,28 @@ impl Mesh {
     /// Removes the member whose name or id is `query` for good, and stops syncing with it on
     /// `node`, telling the other members. An id can be shortened to its first characters.
     pub fn remove(&self, query: &str, node: Option<&Node>) -> Result<Member> {
+        self.remove_picked(|members| find(members, query), node)
+    }
+
+    /// Removes the member `id` for good, as [`Mesh::remove`] does.
+    pub fn remove_id(&self, id: EndpointId, node: Option<&Node>) -> Result<Member> {
+        let id = node_id(id);
+        let pick = |members: &Members| {
+            let member = members.active().find(|member| member.id == id);
+            member
+                .cloned()
+                .context("this machine is not a member anymore")
+        };
+        self.remove_picked(pick, node)
+    }
+
+    fn remove_picked(
+        &self,
+        pick: impl FnOnce(&Members) -> Result<Member>,
+        node: Option<&Node>,
+    ) -> Result<Member> {
         let removed = self.change(|members| {
-            let member = find(members, query)?;
+            let member = pick(members)?;
             members.remove(member.id);
             Ok(member)
         })?;
