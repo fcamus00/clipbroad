@@ -108,7 +108,8 @@ items:
 - **Remove a machine** lists the members of the mesh. Point at one and choose **Remove ... for
   good** to take it out of the mesh, as `clipbroad remove` does.
 - **Reset identity** gives this machine a new identity and restarts the daemon, as `clipbroad reset`
-  does. Use it on a machine that was removed, before pairing it again.
+  does. It also deletes the `[[peers]]` in its `config.toml`. Use it on a machine that was removed,
+  before pairing it again.
 - **Pause sync** stops sending and applying clips, until **Resume sync** or a restart. What you copy
   during a pause is not sent later.
 - **Check for updates** looks for a new version, and turns into **Update to 0.3.1 and restart** when

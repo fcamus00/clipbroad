@@ -38,6 +38,7 @@ tempfile = "3.27"
 thiserror = "2.0"
 tokio = "1.54"
 toml = "1.1"
+toml_edit = "0.25"
 # Default features pull GTK and libappindicator on Linux; the daemon turns on `ksni` there instead.
 tray-icon = { version = "0.26.1", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["std"] }

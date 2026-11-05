@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
-    fs, io,
+    fs,
+    io::{self, Write as _},
     net::SocketAddr,
     num::{NonZeroU16, NonZeroU32, NonZeroU64},
     path::Path,
@@ -129,6 +130,39 @@ impl Config {
             path: path.to_owned(),
             source,
         })
+    }
+
+    /// Deletes every peer from the config file at `path`, keeping the rest of the file (comments
+    /// included) as it is. Returns how many it deleted. A missing file has none.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the file cannot be read or written, [`Error::Config`] if it is invalid
+    /// (it is left unchanged).
+    pub fn remove_peers(path: &Path) -> Result<usize, Error> {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(Error::io(path, e)),
+        };
+        let invalid = |source| Error::Config {
+            path: path.to_owned(),
+            source,
+        };
+        let count = Self::from_toml_str(&text).map_err(invalid)?.peers.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        let mut document: toml_edit::DocumentMut = text
+            .parse()
+            .map_err(|e: toml_edit::TomlError| invalid(ParseError::Invalid(e.to_string())))?;
+        document.remove("peers");
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut file = tempfile::NamedTempFile::new_in(dir).map_err(|e| Error::io(dir, e))?;
+        file.write_all(document.to_string().as_bytes())
+            .map_err(|e| Error::io(file.path(), e))?;
+        file.persist(path).map_err(|e| Error::io(path, e.error))?;
+        Ok(count)
     }
 
     fn validate(&self) -> Result<(), ParseError> {
@@ -356,5 +390,56 @@ mod tests {
         fs::write(&path, EXAMPLE).expect("write");
         let config = Config::load_or_default(&path).expect("valid");
         assert_eq!(config.peers.len(), 2);
+    }
+
+    #[test]
+    fn remove_peers_keeps_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        // What pairing wrote before 0.4.0: blocks appended after the user's settings.
+        let text = format!(
+            "# my settings\nlisten_port = 5000\n\n[[peers]]\nname = \"desk\"\nid = \"{ID_A}\"\n\
+             addrs = [\"192.168.1.20:42420\"]\n"
+        );
+        fs::write(&path, &text).expect("write");
+
+        assert_eq!(Config::remove_peers(&path).expect("removed"), 1);
+        let left = fs::read_to_string(&path).expect("still there");
+        assert!(
+            left.starts_with("# my settings\nlisten_port = 5000\n"),
+            "{left}"
+        );
+        let config = Config::load_or_default(&path).expect("valid");
+        assert_eq!(config.peers, []);
+        assert_eq!(config.listen_port.get(), 5000);
+
+        // Also the commented example, with the peers at the end.
+        fs::write(&path, EXAMPLE).expect("write");
+        assert_eq!(Config::remove_peers(&path).expect("removed"), 2);
+        let left = fs::read_to_string(&path).expect("still there");
+        assert!(
+            left.contains("# A misspelled field name is an error"),
+            "{left}"
+        );
+        assert_eq!(Config::load_or_default(&path).expect("valid").peers, []);
+
+        // Nothing to remove: the file is not rewritten.
+        assert_eq!(Config::remove_peers(&path).expect("no peers"), 0);
+        assert_eq!(fs::read_to_string(&path).expect("same"), left);
+        assert_eq!(
+            Config::remove_peers(&dir.path().join("none.toml")).expect("no file"),
+            0
+        );
+    }
+
+    #[test]
+    fn remove_peers_leaves_an_invalid_file_alone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        let text = format!("listen_port = 0\n[[peers]]\nid = \"{ID_A}\"\n");
+        fs::write(&path, &text).expect("write");
+        let err = Config::remove_peers(&path).expect_err("invalid port");
+        assert!(matches!(err, Error::Config { .. }), "{err}");
+        assert_eq!(fs::read_to_string(&path).expect("same"), text);
     }
 }

@@ -170,16 +170,18 @@ Code in `crates/core/src/members.rs` (the rules), `crates/config/src/members.rs`
 - **Removal is permanent:** `clipbroad remove <name or id prefix>` marks the member removed, and
   nothing makes it active again: not a list that still has it, not pairing, not `config.toml`. To
   join again, the machine needs a new identity: `clipbroad reset` (or "Reset identity" in the tray
-  menu) deletes its `secret.key` and `members.toml`, and the next start creates a new key; then it
+  menu) deletes its `secret.key`, `members.toml` and the `[[peers]]` in `config.toml`, and the next
+  start creates a new key; then it
   pairs again. A permanent mark
   is simpler than versions per entry, and versions would let a removed machine send itself back
   with a higher one. `remove` asks the running daemon over the control channel, which disconnects
   the machine (close code 4) and tells the others; without a daemon it edits the file, and the daemon
   tells the others when it starts.
-- **Reset:** `config.toml` is left as it is, so its `[[peers]]` stay. Those members reject the new
-  identity until the machine pairs again, and after that they are members anyway. A running daemon
-  is asked over the control channel: it stops, deletes the two files only once the node is down
-  (nothing writes them anymore), and restarts the same way an update does. `reset` prints the old
+- **Reset:** the `[[peers]]` in `config.toml` go too (with `toml_edit`, so the rest of the file and
+  its comments stay). They would become members again on the next start, and they only know the old
+  identity, so the machine would show a mesh it is not in. Pairing wrote them there before 0.4.0. A
+  running daemon is asked over the control channel: it stops, deletes the files only once the node
+  is down (nothing writes them anymore), and restarts the same way an update does. `reset` prints the old
   id, so it can be removed from another member if nobody did yet. A machine cannot remove itself
   from the others: entries a peer sends about itself are ignored (see above).
 - **Who can admit:** any member. A leaked ticket gives access to the whole mesh, not one machine
