@@ -83,6 +83,8 @@ struct Tray {
     update: MenuItem,
     /// "Remove a machine", with a submenu per member.
     remove: Submenu,
+    /// "Reset identity", with its confirmation.
+    reset: Submenu,
     /// The members `remove` lists now.
     members: RefCell<Vec<MemberItem>>,
     /// The confirmation item of each member in `remove`, shared with the click handler.
@@ -102,6 +104,14 @@ impl Tray {
         let pause = MenuItem::new(pause_label(view.paused), true, None);
         let update = MenuItem::new(&view.update.text, view.update.enabled, None);
         let remove = Submenu::new("Remove a machine", false);
+        let reset_warning = MenuItem::new("Leaves the mesh. Pair again to rejoin", false, None);
+        let reset_confirm = MenuItem::new("Reset identity and restart", true, None);
+        let reset = Submenu::with_items(
+            "Reset identity",
+            view.can_pair,
+            &[&reset_warning, &reset_confirm],
+        )
+        .context("cannot build the tray menu")?;
         let quit = MenuItem::new("Quit clipbroad", true, None);
         let menu = NativeMenu::with_items(&[
             &status,
@@ -111,6 +121,7 @@ impl Tray {
             &pair_copied,
             &pause,
             &remove,
+            &reset,
             &PredefinedMenuItem::separator(),
             &update,
             &quit,
@@ -121,6 +132,7 @@ impl Tray {
             (pair_copied.id().clone(), Action::PairCopied),
             (pause.id().clone(), Action::TogglePause),
             (update.id().clone(), Action::Update),
+            (reset_confirm.id().clone(), Action::Reset),
             (quit.id().clone(), Action::Quit),
         ];
         let removals: Arc<Mutex<Vec<(MenuId, EndpointId)>>> = Arc::default();
@@ -154,6 +166,7 @@ impl Tray {
             pause,
             update,
             remove,
+            reset,
             members: RefCell::new(Vec::new()),
             removals,
             syncing: Cell::new(view.syncing),
@@ -176,6 +189,7 @@ impl Tray {
         self.activity.set_text(&view.activity);
         self.pair.set_enabled(view.can_pair);
         self.pair_copied.set_enabled(view.can_pair);
+        self.reset.set_enabled(view.can_pair);
         self.pause.set_text(pause_label(view.paused));
         self.update.set_text(&view.update.text);
         self.update.set_enabled(view.update.enabled);

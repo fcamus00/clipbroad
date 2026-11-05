@@ -86,7 +86,8 @@ struct Daemon {
     gui: Gui,
     /// The newest view from the menu.
     view: Mutex<View>,
-    _dir: TempDir,
+    /// Deleted when the daemon is dropped.
+    dir: TempDir,
 }
 
 impl Daemon {
@@ -119,7 +120,7 @@ impl Daemon {
             task,
             gui,
             view: Mutex::new(View::starting()),
-            _dir: dir,
+            dir,
         }
     }
 
@@ -998,4 +999,48 @@ async fn menu_removes_a_member() {
     assert!(eventually(TIMEOUT, failed).await, "{:?}", a.view());
     a.stop().await;
     b.stop().await;
+}
+
+/// Waits until `daemon` ends by itself and returns how, with its directory, which still exists.
+async fn ended(daemon: Daemon) -> (Exit, TempDir) {
+    let exit = time::timeout(TIMEOUT, daemon.task)
+        .await
+        .expect("daemon ends")
+        .expect("daemon does not panic")
+        .expect("daemon ends cleanly");
+    (exit, daemon.dir)
+}
+
+#[tokio::test]
+async fn reset_restarts_without_identity_or_members() {
+    let (spec_a, spec_b) = (Spec::new(), Spec::new());
+    let max = Config::DEFAULT_INLINE_MAX_BYTES.get();
+    for through_control in [false, true] {
+        let a = Daemon::start(&spec_a, spec_a.config([&spec_b], max));
+        assert!(eventually(TIMEOUT, || a.status().is_some()).await);
+        // The tests hand the key over in memory; a real daemon has it on disk.
+        IdentityKey::load_or_generate(&a.paths.secret_key_file).expect("key file");
+        assert!(a.paths.members_file().exists());
+
+        if through_control {
+            use crate::control::{Reply, Request};
+            let mut stream = crate::control::connect(&a.paths)
+                .await
+                .expect("no error")
+                .expect("the daemon listens");
+            crate::control::write(&mut stream, &Request::Reset)
+                .await
+                .expect("sent");
+            let reply: Reply = crate::control::read(&mut stream).await.expect("answer");
+            assert!(matches!(reply, Reply::Quitting), "{reply:?}");
+        } else {
+            a.click(Action::Reset);
+        }
+        let paths = a.paths.clone();
+        let (exit, dir) = ended(a).await;
+        assert_eq!(exit, Exit::Restart);
+        assert!(dir.path().exists());
+        assert!(!paths.secret_key_file.exists(), "identity deleted");
+        assert!(!paths.members_file().exists(), "members deleted");
+    }
 }

@@ -44,8 +44,8 @@ pub async fn run(args: Args) -> Result<()> {
     };
     println!(
         "Removed {removed} from the mesh, for good. The other members stop syncing with it as \
-         they hear of it. To join again, that machine needs a new identity: delete its \
-         secret.key and pair it again."
+         they hear of it. To join again, that machine needs a new identity: run \
+         `clipbroad reset` on it and pair it again."
     );
     if !through_daemon {
         println!("Start `clipbroad run` to tell the other members.");

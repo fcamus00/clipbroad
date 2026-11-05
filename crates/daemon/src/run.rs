@@ -25,7 +25,7 @@ use crate::menu::{self, Action, Menu};
 use crate::mesh::{self, Mesh};
 use crate::status::{self, ClipEvent, DaemonStatus};
 use crate::update::{self, Installation, Updater, Updates};
-use crate::{backend, control, pair, tray};
+use crate::{backend, control, pair, reset, tray};
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -194,6 +194,8 @@ pub async fn sync(
         time::interval_at(Instant::now() + update::FIRST_CHECK, update::CHECK_EVERY);
     update_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+    // Set when the daemon stops to restart with a new identity.
+    let mut new_identity = false;
     let mut shutdown = pin!(shutdown);
     let result = loop {
         tokio::select! {
@@ -248,6 +250,11 @@ pub async fn sync(
                         info!("restart requested over the control channel");
                         break Ok(Exit::Restart);
                     }
+                    Served::Reset => {
+                        info!("new identity requested over the control channel");
+                        new_identity = true;
+                        break Ok(Exit::Restart);
+                    }
                     Served::Paired(outcome) => menu.note(pairing_result(&outcome), now_ms()),
                     Served::Removed(outcome) => menu.note(removal_result(&outcome), now_ms()),
                 }
@@ -270,6 +277,12 @@ pub async fn sync(
                     let text = start_pairing(copied, &mut pairing, &clipboard, &node, &mesh).await;
                     menu.note(text, now_ms());
                 }
+                Action::Reset if pairing.is_none() => {
+                    info!("new identity chosen in the tray menu");
+                    new_identity = true;
+                    break Ok(Exit::Restart);
+                }
+                Action::Reset => menu.note("Wait for the pairing to end", now_ms()),
                 Action::Remove(id) => {
                     let removed = mesh.remove_id(id, Some(&node));
                     menu.note(removal_result(&removed), now_ms());
@@ -317,6 +330,11 @@ pub async fn sync(
     drop(control);
     node.shutdown().await;
     status::remove(&status_file);
+    if new_identity {
+        // Only now: the node no longer uses the key, and nothing writes the members file.
+        reset::wipe(paths)?;
+        info!("deleted the identity and the members of the mesh; restarting with a new identity");
+    }
     result
 }
 
