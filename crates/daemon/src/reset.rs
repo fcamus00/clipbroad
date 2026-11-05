@@ -44,7 +44,7 @@ pub async fn run(args: Args) -> Result<()> {
         let peers = wipe(&paths)?;
         if peers > 0 {
             println!(
-                "Deleted the {peers} peers in {}.",
+                "Deleted the peers in {} ({peers}).",
                 paths.config_file.display()
             );
         }
