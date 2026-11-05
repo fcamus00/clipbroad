@@ -1,6 +1,7 @@
 //! The control channel: how `clipbroad pair` asks the running daemon to pair, how `clipbroad
-//! remove` asks it to remove a member, how `clipbroad service` on Windows asks it to quit, and how
-//! `clipbroad update` asks it to restart.
+//! remove` asks it to remove a member, how `clipbroad reset` asks it to restart with a new
+//! identity, how `clipbroad service` on Windows asks it to quit, and how `clipbroad update` asks it
+//! to restart.
 //!
 //! The daemon listens on a local socket: a Unix socket `control.sock` beside the identity file
 //! on Linux and macOS, and a named pipe on Windows whose name comes from the same path. Either
@@ -63,6 +64,8 @@ pub enum Request {
     Restart,
     /// Remove the member with this name or id from the mesh.
     Remove(String),
+    /// Shut down, delete the identity and the members file, and run the binary again.
+    Reset,
 }
 
 /// What the daemon answers.
@@ -73,7 +76,8 @@ pub enum Reply {
     Paired(Paired),
     /// Why pairing failed, ready to show.
     Failed(String),
-    /// The daemon got [`Request::Quit`] or [`Request::Restart`] and is shutting down.
+    /// The daemon got [`Request::Quit`], [`Request::Restart`] or [`Request::Reset`] and is shutting
+    /// down.
     Quitting,
     /// The member that [`Request::Remove`] removed, as `name (id)`.
     Removed(String),
@@ -92,6 +96,8 @@ pub enum Served {
     Quit,
     /// The daemon should shut down and run the binary again.
     Restart,
+    /// Like `Restart`, with a new identity.
+    Reset,
 }
 
 /// How the daemon answered a [`request`](ask).
@@ -174,6 +180,10 @@ pub async fn serve(stream: impl Stream, node: &Node, mesh: &Mesh) -> Served {
         Request::Restart => {
             let _ = write(&mut writer, &Reply::Quitting).await;
             return Served::Restart;
+        }
+        Request::Reset => {
+            let _ = write(&mut writer, &Reply::Quitting).await;
+            return Served::Reset;
         }
         Request::Remove(query) => {
             let removed = mesh.remove(&query, Some(node));

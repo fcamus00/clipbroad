@@ -86,7 +86,8 @@ other about the new machine, and it syncs with all of them once they meet.
 `clipbroad remove <NAME>`, or **Remove a machine** in the tray menu, takes a machine out of the
 mesh, for good, on every member. Use the name that `clipbroad status` shows, or the first characters
 of the id. The removed machine cannot join
-again with the same identity: delete its `secret.key` and pair it again.
+again with the same identity: run `clipbroad reset` there, or choose **Reset identity** in its tray
+menu, and pair it again.
 
 ## Tray icon
 
@@ -106,6 +107,8 @@ items:
   status says how it went.
 - **Remove a machine** lists the members of the mesh. Point at one and choose **Remove ... for
   good** to take it out of the mesh, as `clipbroad remove` does.
+- **Reset identity** gives this machine a new identity and restarts the daemon, as `clipbroad reset`
+  does. Use it on a machine that was removed, before pairing it again.
 - **Pause sync** stops sending and applying clips, until **Resume sync** or a restart. What you copy
   during a pause is not sent later.
 - **Check for updates** looks for a new version, and turns into **Update to 0.3.1 and restart** when

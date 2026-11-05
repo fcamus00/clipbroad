@@ -169,11 +169,19 @@ Code in `crates/core/src/members.rs` (the rules), `crates/config/src/members.rs`
   back in.
 - **Removal is permanent:** `clipbroad remove <name or id prefix>` marks the member removed, and
   nothing makes it active again: not a list that still has it, not pairing, not `config.toml`. To
-  join again, the machine needs a new identity (delete its `secret.key` and pair). A permanent mark
+  join again, the machine needs a new identity: `clipbroad reset` (or "Reset identity" in the tray
+  menu) deletes its `secret.key` and `members.toml`, and the next start creates a new key; then it
+  pairs again. A permanent mark
   is simpler than versions per entry, and versions would let a removed machine send itself back
   with a higher one. `remove` asks the running daemon over the control channel, which disconnects
   the machine (close code 4) and tells the others; without a daemon it edits the file, and the daemon
   tells the others when it starts.
+- **Reset:** `config.toml` is left as it is, so its `[[peers]]` stay. Those members reject the new
+  identity until the machine pairs again, and after that they are members anyway. A running daemon
+  is asked over the control channel: it stops, deletes the two files only once the node is down
+  (nothing writes them anymore), and restarts the same way an update does. `reset` prints the old
+  id, so it can be removed from another member if nobody did yet. A machine cannot remove itself
+  from the others: entries a peer sends about itself are ignored (see above).
 - **Who can admit:** any member. A leaked ticket gives access to the whole mesh, not one machine
   (see "Threats" above); accepted, since all the machines belong to one person.
 - **File:** `members.toml` beside `secret.key`, because it belongs to the identity. Only clipbroad
@@ -274,7 +282,7 @@ Ctrl+C, SIGTERM or the tray icon's "Quit" (see "Tray icon").
 - The logs show the node id at startup, the connections and each clip sent or received with its
   size and the first 8 characters of the hash, never the content. `run` logs at info level by
   default.
-- `--config <file>` (on `run`, `pair` and `remove`) uses another config file, and `secret.key` in the same
+- `--config <file>` (on `run`, `pair`, `remove` and `reset`) uses another config file, and `secret.key` in the same
   folder as the identity. It is useful to run two instances on one machine (testing).
 - Content marked as sensitive is not sent: the daemon skips it with a debug-level log that
   shows the marker, never the content.
@@ -323,9 +331,10 @@ How `clipbroad pair` and `clipbroad remove` talk to the running daemon (code in
   Windows the pipe refuses remote clients, and its default security lets only this user,
   administrators and SYSTEM open it for writing.
 - **Messages:** a big-endian `u32` length and the message in `postcard`, up to 64 KiB. The client
-  sends one request (`Host`, `Join` with the ticket, or `Remove` with a name or id); the daemon
-  answers with the ticket to show (`Host` only) and then `Paired`, `Removed` or `Failed` with the
-  error to show. Both sides are the same
+  sends one request (`Host`, `Join` with the ticket, `Remove` with a name or id, `Reset`, `Quit` or
+  `Restart`); the daemon
+  answers with the ticket to show (`Host` only) and then `Paired`, `Removed`, `Quitting` or
+  `Failed` with the error to show. Both sides are the same
   binary; an old daemon after an upgrade fails to decode, and the error says to restart it.
 - **One at a time:** while one `pair` is served, another one gets "already running". A client that
   sends no request in 5 s is dropped. While the daemon hosts, it watches the socket: if `pair` quits
@@ -807,7 +816,7 @@ thread messages. The menu shows nothing live while it is open on Windows and mac
 reason.
 
 - Items: the peers connected and the last clip (disabled, they only show text), "Pair a machine",
-  "Pair with the copied ticket", "Pause sync", "Remove a machine", the update item (see "Updates"), "Quit clipbroad". The icon is a blue circle while
+  "Pair with the copied ticket", "Pause sync", "Remove a machine", "Reset identity", the update item (see "Updates"), "Quit clipbroad". The icon is a blue circle while
   clips flow and a grey ring otherwise, different in shape so color is not needed to tell them apart.
 - Pairing uses the same functions and the same slot as `clipbroad pair`, so there is one pairing at a
   time from either place, and its items stay disabled meanwhile. The ticket goes through the clipboard
@@ -818,6 +827,9 @@ reason.
   permanent and the menu cannot show a dialog, so this nesting is the confirmation: it takes two
   deliberate clicks. Labels carry the short id, since two machines may share a hostname. The tray
   rebuilds the submenu only when the members change. It does the same as `clipbroad remove`.
+- "Reset identity" works the same way: a submenu with a disabled line ("Leaves the mesh. Pair again
+  to rejoin") and "Reset identity and restart". It is disabled while a pairing runs, which a restart
+  would cut off. It does the same as `clipbroad reset`.
 - A pairing ticket is never synced, whoever copied it: the ticket is for a machine that is not paired
   yet, and it is a secret until it is used. `local_change` drops text that parses as a ticket.
 - Pause drops clips in both directions and cancels a running download. What is copied during a pause

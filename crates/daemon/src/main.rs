@@ -4,6 +4,7 @@ mod menu;
 mod mesh;
 mod pair;
 mod remove;
+mod reset;
 mod run;
 mod service;
 mod status;
@@ -47,9 +48,16 @@ enum Command {
     ///
     /// Give its name, as `clipbroad status` shows it, or the first characters of its id. Every
     /// member stops syncing with it once it hears of the removal from another member. The removed
-    /// machine cannot join again with the same identity: it has to delete its `secret.key` and
-    /// pair again.
+    /// machine cannot join again with the same identity: run `clipbroad reset` on it, then pair
+    /// it again.
     Remove(remove::Args),
+    /// Give this machine a new identity, to join a mesh again after it was removed.
+    ///
+    /// It deletes `secret.key` and `members.toml` (beside it), and the next start creates a new
+    /// identity. `config.toml` is left as it is. If `clipbroad run` is running, it restarts right
+    /// away with the new identity. Then pair this machine with any member of the mesh. The tray
+    /// menu does the same.
+    Reset(reset::Args),
     /// Sync the clipboard with the members of the mesh until Ctrl+C, SIGTERM or the tray icon's
     /// "Quit".
     ///
@@ -95,6 +103,7 @@ fn main() -> anyhow::Result<()> {
         Command::Run(_) => LevelFilter::INFO,
         Command::Pair(_)
         | Command::Remove(_)
+        | Command::Reset(_)
         | Command::Watch(_)
         | Command::Service(_)
         | Command::Status(_)
@@ -104,6 +113,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Pair(args) => runtime()?.block_on(pair::run(args)),
         Command::Remove(args) => runtime()?.block_on(remove::run(args)),
+        Command::Reset(args) => runtime()?.block_on(reset::run(args)),
         // It owns the main thread for the tray icon, and starts its own runtime.
         Command::Run(args) => run::start(args),
         Command::Watch(args) => runtime()?.block_on(watch::run(args)),

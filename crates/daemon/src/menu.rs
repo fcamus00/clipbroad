@@ -30,6 +30,8 @@ pub enum Action {
     /// Remove this member from the mesh, for good. The menu asks for it in a submenu of its own,
     /// so it takes a second, deliberate click.
     Remove(EndpointId),
+    /// Restart with a new identity (see [`crate::reset`]). Asked for in a submenu too.
+    Reset,
     Quit,
 }
 
@@ -40,7 +42,7 @@ pub struct View {
     pub status: String,
     /// A note about pairing, or else the last clip.
     pub activity: String,
-    /// False while a pairing runs: there is one at a time.
+    /// False while a pairing runs: there is one at a time. A reset would also cut it off.
     pub can_pair: bool,
     pub paused: bool,
     /// Whether clips are flowing, which picks the icon.
