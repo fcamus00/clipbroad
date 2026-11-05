@@ -569,6 +569,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]
@@ -3895,6 +3896,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 

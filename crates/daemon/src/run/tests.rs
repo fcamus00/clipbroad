@@ -1012,7 +1012,7 @@ async fn ended(daemon: Daemon) -> (Exit, TempDir) {
 }
 
 #[tokio::test]
-async fn reset_restarts_without_identity_or_members() {
+async fn reset_restarts_without_identity_members_or_config_peers() {
     let (spec_a, spec_b) = (Spec::new(), Spec::new());
     let max = Config::DEFAULT_INLINE_MAX_BYTES.get();
     for through_control in [false, true] {
@@ -1021,6 +1021,9 @@ async fn reset_restarts_without_identity_or_members() {
         // The tests hand the key over in memory; a real daemon has it on disk.
         IdentityKey::load_or_generate(&a.paths.secret_key_file).expect("key file");
         assert!(a.paths.members_file().exists());
+        // The tests hand the config over in memory too; pairing wrote this before 0.4.0.
+        let config = format!("[[peers]]\nid = \"{}\"\n", spec_b.id());
+        std::fs::write(&a.paths.config_file, config).expect("config file");
 
         if through_control {
             use crate::control::{Reply, Request};
@@ -1042,5 +1045,7 @@ async fn reset_restarts_without_identity_or_members() {
         assert!(dir.path().exists());
         assert!(!paths.secret_key_file.exists(), "identity deleted");
         assert!(!paths.members_file().exists(), "members deleted");
+        let config = Config::load_or_default(&paths.config_file).expect("valid");
+        assert_eq!(config.peers, [], "config peers deleted");
     }
 }

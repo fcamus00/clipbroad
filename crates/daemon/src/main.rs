@@ -53,9 +53,9 @@ enum Command {
     Remove(remove::Args),
     /// Give this machine a new identity, to join a mesh again after it was removed.
     ///
-    /// It deletes `secret.key` and `members.toml` (beside it), and the next start creates a new
-    /// identity. `config.toml` is left as it is. If `clipbroad run` is running, it restarts right
-    /// away with the new identity. Then pair this machine with any member of the mesh. The tray
+    /// It deletes `secret.key`, `members.toml` (beside it) and the `[[peers]]` in `config.toml`,
+    /// which only know the old identity. The rest of `config.toml` stays. The next start creates a
+    /// new identity. If `clipbroad run` is running, it restarts right away with the new identity. Then pair this machine with any member of the mesh. The tray
     /// menu does the same.
     Reset(reset::Args),
     /// Sync the clipboard with the members of the mesh until Ctrl+C, SIGTERM or the tray icon's

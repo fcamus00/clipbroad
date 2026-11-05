@@ -332,8 +332,12 @@ pub async fn sync(
     status::remove(&status_file);
     if new_identity {
         // Only now: the node no longer uses the key, and nothing writes the members file.
-        reset::wipe(paths)?;
-        info!("deleted the identity and the members of the mesh; restarting with a new identity");
+        let peers = reset::wipe(paths)?;
+        info!(
+            config_peers = peers,
+            "deleted the identity, the members of the mesh and the peers in the config file; \
+             restarting with a new identity"
+        );
     }
     result
 }

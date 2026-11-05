@@ -70,6 +70,7 @@ update_check = true
 # `members.toml`, beside `secret.key`, and the members of the mesh share that list. `clipbroad run`
 # reads these only when it starts, adds them to the mesh, and uses the name and addresses written
 # here. A peer removed with `clipbroad remove` stays out even if it is still listed here.
+# `clipbroad reset` deletes these blocks, since they only know the old identity.
 # Each one has:
 #   id     public identity of the peer (64 lowercase hexadecimal characters). Required and
 #          unique.
