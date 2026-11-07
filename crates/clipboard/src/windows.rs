@@ -12,10 +12,11 @@
 //!
 //! # Sensitive content
 //!
-//! [`read_text`](Clipboard::read_text), [`read_image`](Clipboard::read_image) and
-//! [`read_files`](Clipboard::read_files) open the clipboard once, list the formats, read the DWORD
-//! of the `CanUploadToCloudClipboard` / `CanIncludeInClipboardHistory` flags, check them for
-//! sensitive markers and read the content, all before closing it. While the clipboard is open no
+//! [`read_content`](Clipboard::read_content), [`read_text`](Clipboard::read_text),
+//! [`read_image`](Clipboard::read_image) and [`read_files`](Clipboard::read_files) open the
+//! clipboard once, list the formats, read the DWORD of the `CanUploadToCloudClipboard` /
+//! `CanIncludeInClipboardHistory` flags, check them for sensitive markers and read the content,
+//! all before closing it. While the clipboard is open no
 //! other app can change it, so the check and the content always belong to the same copy. A flag
 //! whose value cannot be read fails the read.
 //!
@@ -89,7 +90,9 @@ use windows_sys::w;
 
 use crate::dib::{self, DibError};
 use crate::hdrop;
-use crate::{ChangeSender, Clipboard, ClipboardChange, ClipboardError, ClipboardWatch};
+use crate::{
+    ChangeSender, Clipboard, ClipboardChange, ClipboardContent, ClipboardError, ClipboardWatch,
+};
 
 /// Longest a read or write may block its caller.
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -143,6 +146,10 @@ impl Clipboard for WindowsClipboard {
 
     fn read_files(&self) -> Result<Option<Vec<PathBuf>>, ClipboardError> {
         run_with_timeout("win-read", || read_unless_sensitive(read_file_list))
+    }
+
+    fn read_content(&self) -> Result<Option<ClipboardContent>, ClipboardError> {
+        run_with_timeout("win-read", read_content)
     }
 
     fn write_files(&self, paths: &[PathBuf]) -> Result<(), ClipboardError> {
@@ -257,43 +264,84 @@ enum ClipboardImage {
 
 fn read_png() -> Result<Option<Png>, ClipboardError> {
     let png_format = registered_format("PNG")?;
-    let image = read_unless_sensitive(|open| {
-        if is_offered(open, png_format) {
-            return Ok(Some(ClipboardImage::Png(read_bytes(open, png_format)?)));
+    let image = read_unless_sensitive(|open| read_image_data(open, png_format))?;
+    // Converted after closing the clipboard, so other apps are not kept waiting.
+    image.map_or(Ok(None), ClipboardImage::into_png)
+}
+
+/// What a copy holds, with an image still as found on the clipboard.
+enum RawContent {
+    Files(Vec<PathBuf>),
+    Text(String),
+    Image(ClipboardImage),
+}
+
+/// Files, else text, else image (see [`Clipboard::read_content`]), in one clipboard open.
+fn read_content() -> Result<Option<ClipboardContent>, ClipboardError> {
+    let png_format = registered_format("PNG")?;
+    let content = read_unless_sensitive(|open| {
+        if let Some(paths) = read_file_list(open)? {
+            return Ok(Some(RawContent::Files(paths)));
         }
-        // Windows lists the formats an app put before the ones it derives from them, so the
-        // first bitmap format listed is the original and needs no conversion by Windows.
-        let bitmaps = [CF_DIB, CF_DIBV5].map(u32::from);
-        let Some(bitmap) = format_ids(open)?
-            .into_iter()
-            .find(|format| bitmaps.contains(format))
-        else {
-            return Ok(None);
-        };
-        Ok(Some(ClipboardImage::Dib(read_bytes(open, bitmap)?)))
+        if let Some(text) = read_unicode_text(open)? {
+            return Ok(Some(RawContent::Text(text)));
+        }
+        Ok(read_image_data(open, png_format)?.map(RawContent::Image))
     })?;
     // Converted after closing the clipboard, so other apps are not kept waiting.
-    match image {
-        None => Ok(None),
-        Some(ClipboardImage::Png(mut bytes)) => {
-            bytes.truncate(dib::png_len(&bytes).unwrap_or(bytes.len()));
-            Png::try_from(bytes)
-                .map(Some)
-                .map_err(|error| ClipboardError::backend("reading the PNG format", error))
-        }
-        Some(ClipboardImage::Dib(bitmap)) => match dib::dib_to_png(&bitmap) {
-            Ok(bytes) => Ok(Some(
-                Png::try_from(bytes).expect("the PNG encoder writes a valid PNG header"),
-            )),
-            Err(DibError::Unsupported(reason)) => {
-                tracing::debug!(reason, "the clipboard bitmap is not converted to PNG");
-                Ok(None)
+    Ok(match content {
+        None => None,
+        Some(RawContent::Files(paths)) => Some(ClipboardContent::Files(paths)),
+        Some(RawContent::Text(text)) => Some(ClipboardContent::Text(text)),
+        Some(RawContent::Image(image)) => image.into_png()?.map(ClipboardContent::Image),
+    })
+}
+
+/// The image on the open clipboard: the `PNG` format (registered as `png_format`) if offered,
+/// else the bitmap the app put there.
+fn read_image_data(
+    open: &OpenedClipboard,
+    png_format: u32,
+) -> Result<Option<ClipboardImage>, ClipboardError> {
+    if is_offered(open, png_format) {
+        return Ok(Some(ClipboardImage::Png(read_bytes(open, png_format)?)));
+    }
+    // Windows lists the formats an app put before the ones it derives from them, so the first
+    // bitmap format listed is the original and needs no conversion by Windows.
+    let bitmaps = [CF_DIB, CF_DIBV5].map(u32::from);
+    let Some(bitmap) = format_ids(open)?
+        .into_iter()
+        .find(|format| bitmaps.contains(format))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ClipboardImage::Dib(read_bytes(open, bitmap)?)))
+}
+
+impl ClipboardImage {
+    /// The image as PNG, or `None` for a bitmap the converter does not read.
+    fn into_png(self) -> Result<Option<Png>, ClipboardError> {
+        match self {
+            Self::Png(mut bytes) => {
+                bytes.truncate(dib::png_len(&bytes).unwrap_or(bytes.len()));
+                Png::try_from(bytes)
+                    .map(Some)
+                    .map_err(|error| ClipboardError::backend("reading the PNG format", error))
             }
-            Err(error) => Err(ClipboardError::backend(
-                "converting the clipboard bitmap to PNG",
-                error,
-            )),
-        },
+            Self::Dib(bitmap) => match dib::dib_to_png(&bitmap) {
+                Ok(bytes) => Ok(Some(
+                    Png::try_from(bytes).expect("the PNG encoder writes a valid PNG header"),
+                )),
+                Err(DibError::Unsupported(reason)) => {
+                    tracing::debug!(reason, "the clipboard bitmap is not converted to PNG");
+                    Ok(None)
+                }
+                Err(error) => Err(ClipboardError::backend(
+                    "converting the clipboard bitmap to PNG",
+                    error,
+                )),
+            },
+        }
     }
 }
 
@@ -823,6 +871,28 @@ mod tests {
         dib
     }
 
+    /// What `read_content` returns, as text a test can compare: the content is not `Debug` on
+    /// purpose.
+    fn content(clipboard: &dyn Clipboard) -> String {
+        match clipboard.read_content().expect("read content") {
+            None => "nothing".to_owned(),
+            Some(ClipboardContent::Files(paths)) => format!("files {paths:?}"),
+            Some(ClipboardContent::Text(text)) => format!("text {text:?}"),
+            Some(ClipboardContent::Image(png)) => format!("image, {} bytes", png.as_bytes().len()),
+        }
+    }
+
+    /// `read_content` fails with the `marker` sensitive marker.
+    fn assert_sensitive(clipboard: &dyn Clipboard, marker: &str) {
+        assert!(
+            matches!(
+                clipboard.read_content(),
+                Err(ClipboardError::Sensitive { marker: found }) if found == marker
+            ),
+            "sensitive content was read"
+        );
+    }
+
     async fn next_change(watch: &mut ClipboardWatch) -> ClipboardChange {
         tokio::time::timeout(Duration::from_secs(2), watch.recv())
             .await
@@ -853,6 +923,8 @@ mod tests {
             Some(png.clone())
         );
         assert_eq!(clipboard.read_text().expect("read text"), None);
+        let image = format!("image, {} bytes", png.as_bytes().len());
+        assert_eq!(content(clipboard), image);
 
         // A bitmap with no PNG (PrintScreen, Paint) is converted.
         write_formats(&[(CF_DIB.into(), &small_dib())]);
@@ -861,6 +933,7 @@ mod tests {
             clipboard.read_image().expect("read bitmap"),
             Some(png.clone())
         );
+        assert_eq!(content(clipboard), image);
 
         // A browser's "Copy image": the image plus `<img>` markup. The image wins.
         let html = registered("HTML Format");
@@ -874,6 +947,15 @@ mod tests {
             clipboard.read_image().expect("read image"),
             Some(png.clone())
         );
+        assert_eq!(content(clipboard), image);
+
+        // Plain text next to an image (a spreadsheet's cells) is still text.
+        write_formats(&[
+            (CF_UNICODETEXT.into(), &utf16("a\tb")),
+            (registered("PNG"), png.as_bytes()),
+        ]);
+        change_with(watch, "PNG").await;
+        assert_eq!(content(clipboard), r#"text "a\tb""#);
 
         // A sensitive marker hides the image too.
         write_formats(&[
@@ -885,6 +967,7 @@ mod tests {
             clipboard.read_image(),
             Err(ClipboardError::Sensitive { marker }) if marker == exclude
         ));
+        assert_sensitive(clipboard, exclude);
     }
 
     /// The file part of the smoke test.
@@ -906,6 +989,20 @@ mod tests {
             clipboard.read_files().expect("read files"),
             Some(files.clone())
         );
+        assert_eq!(content(clipboard), format!("files {files:?}"));
+
+        // Files with their paths as text too (as Wayland file managers offer them): files win.
+        let wide: Vec<Vec<u16>> = files
+            .iter()
+            .map(|file| file.as_os_str().encode_wide().collect())
+            .collect();
+        let list = hdrop::encode(&wide).expect("valid paths");
+        write_formats(&[
+            (CF_UNICODETEXT.into(), &utf16("a b.txt")),
+            (CF_HDROP.into(), &list),
+        ]);
+        change_with(watch, "CF_HDROP").await;
+        assert_eq!(content(clipboard), format!("files {files:?}"));
 
         // A copied web link is text, not files.
         let url = "https://example.com/file.txt";
@@ -919,15 +1016,12 @@ mod tests {
             clipboard.read_text().expect("read text").as_deref(),
             Some(url)
         );
+        assert_eq!(content(clipboard), format!("text {url:?}"));
 
         // A sensitive marker hides files too.
-        let wide: Vec<Vec<u16>> = files
-            .iter()
-            .map(|file| file.as_os_str().encode_wide().collect())
-            .collect();
         let exclude = "ExcludeClipboardContentFromMonitorProcessing";
         write_formats(&[
-            (CF_HDROP.into(), &hdrop::encode(&wide).expect("valid paths")),
+            (CF_HDROP.into(), &list),
             (registered(exclude), &0_u32.to_le_bytes()),
         ]);
         change_with(watch, exclude).await;
@@ -935,6 +1029,7 @@ mod tests {
             clipboard.read_files(),
             Err(ClipboardError::Sensitive { marker }) if marker == exclude
         ));
+        assert_sensitive(clipboard, exclude);
     }
 
     /// Smoke test against the real clipboard. GitHub's Windows runners allow clipboard access,
@@ -960,6 +1055,7 @@ mod tests {
         let change = change_with(&mut watch, "CF_UNICODETEXT").await;
         assert!(change.has_format("CF_UNICODETEXT"), "{change:?}");
         assert_eq!(clipboard.read_text().expect("read").as_deref(), Some(text));
+        assert_eq!(content(&clipboard), format!("text {text:?}"));
 
         clipboard.write_text("").expect("write empty");
         change_with(&mut watch, "CF_UNICODETEXT").await;
@@ -977,6 +1073,7 @@ mod tests {
             clipboard.read_text(),
             Err(ClipboardError::Sensitive { marker }) if marker == exclude
         ));
+        assert_sensitive(&clipboard, exclude);
 
         // The flags count only when 0.
         for flag in WINDOWS_FLAG_FORMATS {
@@ -987,6 +1084,7 @@ mod tests {
                 clipboard.read_text(),
                 Err(ClipboardError::Sensitive { marker }) if marker == zero
             ));
+            assert_sensitive(&clipboard, &zero);
 
             write_with_marker("shareable", flag, 1);
             change_with(&mut watch, flag).await;

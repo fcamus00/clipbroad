@@ -9,11 +9,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use clipbroad_clipboard::fake::FakeClipboard;
-use clipbroad_clipboard::{Clipboard, ClipboardError};
+use clipbroad_clipboard::{Clipboard, ClipboardContent, ClipboardError};
 use clipbroad_config::{Config, IdentityKey, Paths, Peer};
 use clipbroad_core::protocol::{ContentKind, NodeId, Payload};
 use clipbroad_core::sync::{LocalAction, RemoteAction, SyncEngine};
-use clipbroad_core::{ClipContent, ContentHash, Png};
+use clipbroad_core::{ClipContent, ContentHash};
 use clipbroad_net::pair::Ticket;
 use clipbroad_net::{FetchError, FileCache, Node, Offer, Received};
 use iroh::{EndpointId, SecretKey};
@@ -488,8 +488,8 @@ async fn local_change(
     config: &Config,
 ) -> Result<Option<ClipEvent>> {
     let clipboard = Arc::clone(clipboard);
-    // Reads may block (up to 2 s each by contract), so keep them off the async thread.
-    let copied = match tokio::task::spawn_blocking(move || read_content(&*clipboard)).await? {
+    // Reads may block (up to 2 s by contract), so keep them off the async thread.
+    let copied = match tokio::task::spawn_blocking(move || clipboard.read_content()).await? {
         Ok(Some(copied)) => copied,
         Ok(None) => {
             debug!("clipboard holds no files, text or PNG image, nothing to send");
@@ -506,7 +506,7 @@ async fn local_change(
         Err(error) => return Err(error).context("cannot read the clipboard"),
     };
     let (content, offer) = match copied {
-        Copied::Files(paths) => {
+        ClipboardContent::Files(paths) => {
             let config = config.clone();
             // Hashes every file, so it takes a while for big ones.
             let offer = tokio::task::spawn_blocking(move || Offer::read(&paths, &config))
@@ -519,12 +519,12 @@ async fn local_change(
             (ClipContent::Files(offer.list().clone()), Some(offer))
         }
         // A ticket is meant for a machine that is not paired yet, and it is a secret for 5 minutes.
-        Copied::Text(text) if text.parse::<Ticket>().is_ok() => {
+        ClipboardContent::Text(text) if text.parse::<Ticket>().is_ok() => {
             debug!("clipboard holds a pairing ticket, not synced");
             return Ok(None);
         }
-        Copied::Text(text) => (ClipContent::Text(text), None),
-        Copied::Image(png) => (ClipContent::Image(png), None),
+        ClipboardContent::Text(text) => (ClipContent::Text(text), None),
+        ClipboardContent::Image(png) => (ClipContent::Image(png), None),
     };
     let (kind, size, files) = match &content {
         ClipContent::Text(text) => (ContentKind::Text, text.len() as u64, None),
@@ -660,35 +660,6 @@ fn report_write(
         Err(error) => return Err(error).context("cannot write the clip to the clipboard"),
     }
     Ok(())
-}
-
-/// What a local copy holds. Not `Debug`, so its content cannot end up in the logs.
-pub enum Copied {
-    /// Local paths, as the clipboard lists them. They may be folders or missing files.
-    Files(Vec<PathBuf>),
-    Text(String),
-    Image(Png),
-}
-
-/// What a local copy holds: its files, else its text, else its image.
-///
-/// Files win: a file manager's copy also offers the paths as text, but the files are what the
-/// person copied. Backends only report files when every reference is a local file, so a copied
-/// web link stays text.
-///
-/// Text wins over an image when a copy offers both: apps that offer both for one copy (a
-/// spreadsheet's cells, an office document) mostly do it so the text can also be pasted as a
-/// picture, and the text is what the person meant and is much smaller. A browser's "Copy image"
-/// offers the image with `<img>` markup but no plain text; backends do not report that markup as
-/// text, so the image wins there.
-pub fn read_content(clipboard: &dyn Clipboard) -> Result<Option<Copied>, ClipboardError> {
-    if let Some(paths) = clipboard.read_files()? {
-        return Ok(Some(Copied::Files(paths)));
-    }
-    if let Some(text) = clipboard.read_text()? {
-        return Ok(Some(Copied::Text(text)));
-    }
-    Ok(clipboard.read_image()?.map(Copied::Image))
 }
 
 /// The first 8 hex characters: enough to match clips across machines' logs.

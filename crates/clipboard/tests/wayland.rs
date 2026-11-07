@@ -15,7 +15,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clipbroad_clipboard::wayland::WaylandClipboard;
-use clipbroad_clipboard::{Clipboard, ClipboardChange, ClipboardError, ClipboardWatch};
+use clipbroad_clipboard::{
+    Clipboard, ClipboardChange, ClipboardContent, ClipboardError, ClipboardWatch,
+};
 use clipbroad_core::Png;
 use wl_clipboard_rs::{copy, paste};
 
@@ -52,6 +54,16 @@ fn paste_as(mime_type: &str) -> String {
     let mut text = String::new();
     pipe.read_to_string(&mut text).expect("read pasted text");
     text
+}
+
+/// What `read_content` returns, as text a test can compare: the content is not `Debug` on purpose.
+fn content(clipboard: &WaylandClipboard) -> String {
+    match clipboard.read_content().expect("read content") {
+        None => "nothing".to_owned(),
+        Some(ClipboardContent::Files(paths)) => format!("files {paths:?}"),
+        Some(ClipboardContent::Text(text)) => format!("text {text:?}"),
+        Some(ClipboardContent::Image(png)) => format!("image, {} bytes", png.as_bytes().len()),
+    }
 }
 
 async fn next_change(watch: &mut ClipboardWatch) -> ClipboardChange {
@@ -94,6 +106,7 @@ async fn real_clipboard_round_trip_and_watch() {
     let change = next_change(&mut watch).await;
     assert!(change.has_format("text/plain;charset=utf-8"), "{change:?}");
     assert_eq!(clipboard.read_text().expect("read").as_deref(), Some(text));
+    assert_eq!(content(&clipboard), format!("text {text:?}"));
 
     clipboard.write_text("").expect("write empty");
     next_change(&mut watch).await;
@@ -123,51 +136,17 @@ async fn real_clipboard_round_trip_and_watch() {
         ),
         "sensitive text was read"
     );
-
-    // Bigger than a pipe buffer, so it takes many reads. Only the start has to look like a PNG.
-    let mut bytes = PNG_START.to_vec();
-    bytes.extend((0..300_000_u32).map(|i| i.to_le_bytes()[0]));
-    let png = Png::try_from(bytes).expect("starts like a PNG");
-    clipboard.write_image(&png).expect("write image");
-    let change = next_change(&mut watch).await;
-    assert_eq!(change.formats, ["image/png"]);
-    // Byte for byte, or anti-echo would see our own write as a new copy.
-    assert_eq!(
-        clipboard.read_image().expect("read image"),
-        Some(png.clone())
-    );
-    assert_eq!(clipboard.read_text().expect("read text"), None);
-
-    // A browser's "Copy image": the image plus `<img>` markup. The image wins.
-    copy_both("text/html", "<img src=\"x.png\">", &png);
-    next_change(&mut watch).await;
-    assert_eq!(clipboard.read_text().expect("read text"), None);
-    assert!(clipboard.read_image().expect("read image").is_some());
-
-    // Plain text next to an image (a spreadsheet's cells) is still text.
-    copy_both("text/plain;charset=utf-8", "a\tb", &png);
-    next_change(&mut watch).await;
-    assert_eq!(
-        clipboard.read_text().expect("read text").as_deref(),
-        Some("a\tb")
-    );
-
-    // A sensitive marker hides the image too.
-    sensitive
-        .copy(
-            copy::Source::Bytes(png.as_bytes().into()),
-            copy::MimeType::Specific("image/png".to_owned()),
-        )
-        .expect("copy sensitive image");
-    next_change(&mut watch).await;
     assert!(
         matches!(
-            clipboard.read_image(),
-            Err(ClipboardError::Sensitive { .. })
+            clipboard.read_content(),
+            Err(ClipboardError::Sensitive {
+                marker: "x-kde-passwordManagerHint"
+            })
         ),
-        "sensitive image was read"
+        "sensitive content was read"
     );
 
+    images(&clipboard, &mut watch, sensitive).await;
     files_round_trip(&clipboard, &mut watch).await;
 
     drop(watch);
@@ -180,6 +159,68 @@ async fn real_clipboard_round_trip_and_watch() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// Part of the test above: images, alone and next to text. `sensitive` copies with the marker.
+async fn images(
+    clipboard: &WaylandClipboard,
+    watch: &mut ClipboardWatch,
+    sensitive: copy::Options,
+) {
+    // Bigger than a pipe buffer, so it takes many reads. Only the start has to look like a PNG.
+    let mut bytes = PNG_START.to_vec();
+    bytes.extend((0..300_000_u32).map(|i| i.to_le_bytes()[0]));
+    let png = Png::try_from(bytes).expect("starts like a PNG");
+    clipboard.write_image(&png).expect("write image");
+    let change = next_change(watch).await;
+    assert_eq!(change.formats, ["image/png"]);
+    // Byte for byte, or anti-echo would see our own write as a new copy.
+    assert_eq!(
+        clipboard.read_image().expect("read image"),
+        Some(png.clone())
+    );
+    assert_eq!(clipboard.read_text().expect("read text"), None);
+    let image = format!("image, {} bytes", png.as_bytes().len());
+    assert_eq!(content(clipboard), image);
+
+    // A browser's "Copy image": the image plus `<img>` markup. The image wins.
+    copy_both("text/html", "<img src=\"x.png\">", &png);
+    next_change(watch).await;
+    assert_eq!(clipboard.read_text().expect("read text"), None);
+    assert!(clipboard.read_image().expect("read image").is_some());
+    assert_eq!(content(clipboard), image);
+
+    // Plain text next to an image (a spreadsheet's cells) is still text.
+    copy_both("text/plain;charset=utf-8", "a\tb", &png);
+    next_change(watch).await;
+    assert_eq!(
+        clipboard.read_text().expect("read text").as_deref(),
+        Some("a\tb")
+    );
+    assert_eq!(content(clipboard), r#"text "a\tb""#);
+
+    // A sensitive marker hides the image too.
+    sensitive
+        .copy(
+            copy::Source::Bytes(png.as_bytes().into()),
+            copy::MimeType::Specific("image/png".to_owned()),
+        )
+        .expect("copy sensitive image");
+    next_change(watch).await;
+    assert!(
+        matches!(
+            clipboard.read_image(),
+            Err(ClipboardError::Sensitive { .. })
+        ),
+        "sensitive image was read"
+    );
+    assert!(
+        matches!(
+            clipboard.read_content(),
+            Err(ClipboardError::Sensitive { .. })
+        ),
+        "sensitive image was read"
+    );
 }
 
 /// Part of the test above: files written and read back, and a web link that is not files.
@@ -198,7 +239,12 @@ async fn files_round_trip(clipboard: &WaylandClipboard, watch: &mut ClipboardWat
     ] {
         assert!(change.has_format(format), "{format} missing: {change:?}");
     }
-    assert_eq!(clipboard.read_files().expect("read files"), Some(files));
+    assert_eq!(
+        clipboard.read_files().expect("read files"),
+        Some(files.clone())
+    );
+    // The paths are offered as text too, but the files win.
+    assert_eq!(content(clipboard), format!("files {files:?}"));
     let uris = "file:///tmp/clipbroad%20test/%C3%B1and%C3%BA%20%F0%9F%A6%80.txt\nfile:///tmp/b.txt";
     assert_eq!(
         paste_as("x-special/gnome-copied-files"),
@@ -226,4 +272,5 @@ async fn files_round_trip(clipboard: &WaylandClipboard, watch: &mut ClipboardWat
         clipboard.read_text().expect("read text").as_deref(),
         Some("https://example.com/\r\n")
     );
+    assert_eq!(content(clipboard), r#"text "https://example.com/\r\n""#);
 }

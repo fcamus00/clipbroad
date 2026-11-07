@@ -204,6 +204,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::ClipboardContent;
 
     async fn next_change(watch: &mut ClipboardWatch) -> ClipboardChange {
         watch
@@ -384,6 +385,54 @@ mod tests {
         assert!(matches!(
             clipboard.read_files(),
             Err(ClipboardError::Sensitive { .. })
+        ));
+    }
+
+    /// What [`Clipboard::read_content`] returns, as text a test can compare: the content is not
+    /// `Debug` on purpose.
+    fn content(clipboard: &dyn Clipboard) -> String {
+        match clipboard.read_content().expect("read content") {
+            None => "nothing".to_owned(),
+            Some(ClipboardContent::Files(paths)) => format!("files {paths:?}"),
+            Some(ClipboardContent::Text(text)) => format!("text {text:?}"),
+            Some(ClipboardContent::Image(png)) => format!("image, {} bytes", png.as_bytes().len()),
+        }
+    }
+
+    #[test]
+    fn read_content_prefers_files_then_text_then_image() {
+        let clipboard = FakeClipboard::new();
+        assert_eq!(content(&clipboard), "nothing");
+
+        // A file manager's copy also offers the paths as text: the files win.
+        clipboard.simulate_copy_files(vec![PathBuf::from("/tmp/a b.txt")]);
+        assert_eq!(content(&clipboard), r#"files ["/tmp/a b.txt"]"#);
+
+        // A spreadsheet's cells: text and an image, the text wins.
+        clipboard.simulate_copy_text_and_image("a\tb", tiny_png());
+        assert_eq!(content(&clipboard), r#"text "a\tb""#);
+
+        clipboard.simulate_copy_image(tiny_png());
+        assert_eq!(content(&clipboard), "image, 70 bytes");
+    }
+
+    #[test]
+    fn read_content_refuses_sensitive_content() {
+        let clipboard = FakeClipboard::new();
+        clipboard.set(
+            Some("hunter2".to_owned()),
+            Some(tiny_png()),
+            Some(vec![PathBuf::from("/tmp/secret")]),
+            vec![
+                FILES_FORMAT.to_owned(),
+                "x-kde-passwordManagerHint".to_owned(),
+            ],
+        );
+        assert!(matches!(
+            clipboard.read_content(),
+            Err(ClipboardError::Sensitive {
+                marker: "x-kde-passwordManagerHint"
+            })
         ));
     }
 

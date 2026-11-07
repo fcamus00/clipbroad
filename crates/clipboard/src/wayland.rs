@@ -19,11 +19,13 @@
 //!
 //! # Sensitive content
 //!
-//! [`read_text`](Clipboard::read_text), [`read_image`](Clipboard::read_image) and
-//! [`read_files`](Clipboard::read_files) ask the compositor for the current selection and get one data offer with its fixed list of MIME types. They check
-//! that list for sensitive markers and, if there are none, read the content from **that same
-//! offer**. A newer copy brings a new offer, so the checked list and the content always belong to
-//! the same copy.
+//! [`read_content`](Clipboard::read_content), [`read_text`](Clipboard::read_text),
+//! [`read_image`](Clipboard::read_image) and [`read_files`](Clipboard::read_files) ask the
+//! compositor for the current selection and get one data offer with its fixed list of MIME types.
+//! They check that list for sensitive markers and, if there are none, read the content from
+//! **that same offer**. A newer copy brings a new offer, so the checked list and the content
+//! always belong to the same copy. [`read_content`](Clipboard::read_content) picks files, text
+//! or image from one offer, so it costs one compositor connection, not one per kind.
 //!
 //! # Images
 //!
@@ -71,7 +73,9 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 use wl_clipboard_rs::watch::{ClipboardEvent, Offer, Watcher};
 use wl_clipboard_rs::{copy, paste, watch};
 
-use crate::{ChangeSender, Clipboard, ClipboardChange, ClipboardError, ClipboardWatch};
+use crate::{
+    ChangeSender, Clipboard, ClipboardChange, ClipboardContent, ClipboardError, ClipboardWatch,
+};
 
 /// The MIME type we read first and write as the main offer.
 const TEXT_UTF8: &str = "text/plain;charset=utf-8";
@@ -87,6 +91,10 @@ const URI_LIST: &str = "text/uri-list";
 
 /// What GNOME Files pastes from: `copy` (or `cut`), then one URI per line.
 const GNOME_COPIED_FILES: &str = "x-special/gnome-copied-files";
+
+/// How much of a pipe is read at a time: what a Linux pipe holds by default, so one `poll` and
+/// one `read` take everything buffered. Images can be up to 16 MiB.
+const READ_CHUNK: usize = 64 * 1024;
 
 /// Longest wait for the app that owns the clipboard to hand over its content.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -123,25 +131,7 @@ impl WaylandClipboard {
 
 impl Clipboard for WaylandClipboard {
     fn read_text(&self) -> Result<Option<String>, ClipboardError> {
-        read_current(|mime_types, offer| {
-            let mime_type = if mime_types.iter().any(|offered| offered == IMAGE_PNG) {
-                // Markup next to an image describes the image (a browser's "Copy image" offers
-                // `text/html` with an `<img>` tag), so only plain text counts as text then.
-                PLAIN_TEXT
-                    .into_iter()
-                    .find(|plain| mime_types.iter().any(|offered| offered == plain))
-                    .map(str::to_owned)
-            } else {
-                // `MimeType::Text` prefers `text/plain;charset=utf-8`, then `UTF8_STRING`, then
-                // any other text type.
-                paste::select_mime_type(mime_types, paste::MimeType::Text)
-            };
-            let Some(mime_type) = mime_type else {
-                return Ok(None);
-            };
-            let bytes = receive(offer, &mime_type)?;
-            Ok(String::from_utf8(bytes).ok())
-        })
+        read_current(text_of)
     }
 
     fn write_text(&self, text: &str) -> Result<(), ClipboardError> {
@@ -156,17 +146,7 @@ impl Clipboard for WaylandClipboard {
     }
 
     fn read_image(&self) -> Result<Option<Png>, ClipboardError> {
-        read_current(|mime_types, offer| {
-            // Other image types (`image/jpeg`, `image/bmp`, ...) would need transcoding; see
-            // module docs.
-            if !mime_types.iter().any(|offered| offered == IMAGE_PNG) {
-                return Ok(None);
-            }
-            let bytes = receive(offer, IMAGE_PNG)?;
-            Png::try_from(bytes)
-                .map(Some)
-                .map_err(|error| ClipboardError::backend("reading the image/png offer", error))
-        })
+        read_current(image_of)
     }
 
     fn write_image(&self, png: &Png) -> Result<(), ClipboardError> {
@@ -181,13 +161,20 @@ impl Clipboard for WaylandClipboard {
     }
 
     fn read_files(&self) -> Result<Option<Vec<PathBuf>>, ClipboardError> {
+        read_current(files_of)
+    }
+
+    fn read_content(&self) -> Result<Option<ClipboardContent>, ClipboardError> {
+        // One compositor connection and one offer for the three kinds, so they come from the
+        // same copy.
         read_current(|mime_types, offer| {
-            if !mime_types.iter().any(|offered| offered == URI_LIST) {
-                return Ok(None);
+            if let Some(paths) = files_of(mime_types, offer)? {
+                return Ok(Some(ClipboardContent::Files(paths)));
             }
-            let list = receive(offer, URI_LIST)?;
-            let host = rustix::system::uname();
-            Ok(parse_uri_list(&list, host.nodename().to_bytes()))
+            if let Some(text) = text_of(mime_types, offer)? {
+                return Ok(Some(ClipboardContent::Text(text)));
+            }
+            Ok(image_of(mime_types, offer)?.map(ClipboardContent::Image))
         })
     }
 
@@ -286,7 +273,7 @@ fn forward_events(mut watcher: Watcher, changes: ChangeSender) {
 /// Gets the current selection and hands its MIME types and offer to `read`, unless the selection
 /// is empty or marked as sensitive. Both come from the same offer (see module docs).
 fn read_current<T>(
-    read: impl FnOnce(Vec<String>, &mut Offer<'_>) -> Result<Option<T>, ClipboardError>,
+    read: impl FnOnce(&[String], &mut Offer<'_>) -> Result<Option<T>, ClipboardError>,
 ) -> Result<Option<T>, ClipboardError> {
     // A watcher, unlike `paste::get_contents`, hands out the offer together with its MIME types.
     // It reports the current selection first; cancelling up front makes `next_event` return that
@@ -311,7 +298,55 @@ fn read_current<T>(
         return Err(ClipboardError::Sensitive { marker });
     }
     // `offer` borrows `watcher`, which keeps the compositor connection open until `read` ends.
-    read(mime_types, &mut offer)
+    read(&mime_types, &mut offer)
+}
+
+/// The text of `offer`, whose MIME types are `mime_types`, or `None` if it offers no text or it
+/// is not UTF-8.
+fn text_of(mime_types: &[String], offer: &mut Offer<'_>) -> Result<Option<String>, ClipboardError> {
+    let mime_type = if mime_types.iter().any(|offered| offered == IMAGE_PNG) {
+        // Markup next to an image describes the image (a browser's "Copy image" offers
+        // `text/html` with an `<img>` tag), so only plain text counts as text then.
+        PLAIN_TEXT
+            .into_iter()
+            .find(|plain| mime_types.iter().any(|offered| offered == plain))
+            .map(str::to_owned)
+    } else {
+        // `MimeType::Text` prefers `text/plain;charset=utf-8`, then `UTF8_STRING`, then any
+        // other text type.
+        paste::select_mime_type(mime_types.to_vec(), paste::MimeType::Text)
+    };
+    let Some(mime_type) = mime_type else {
+        return Ok(None);
+    };
+    let bytes = receive(offer, &mime_type)?;
+    Ok(String::from_utf8(bytes).ok())
+}
+
+/// The `image/png` of `offer`, byte for byte, or `None` if it offers none.
+fn image_of(mime_types: &[String], offer: &mut Offer<'_>) -> Result<Option<Png>, ClipboardError> {
+    // Other image types (`image/jpeg`, `image/bmp`, ...) would need transcoding; see module docs.
+    if !mime_types.iter().any(|offered| offered == IMAGE_PNG) {
+        return Ok(None);
+    }
+    let bytes = receive(offer, IMAGE_PNG)?;
+    Png::try_from(bytes)
+        .map(Some)
+        .map_err(|error| ClipboardError::backend("reading the image/png offer", error))
+}
+
+/// The local paths in the `text/uri-list` of `offer`, or `None` if it offers none or it holds
+/// anything but local files (see module docs).
+fn files_of(
+    mime_types: &[String],
+    offer: &mut Offer<'_>,
+) -> Result<Option<Vec<PathBuf>>, ClipboardError> {
+    if !mime_types.iter().any(|offered| offered == URI_LIST) {
+        return Ok(None);
+    }
+    let list = receive(offer, URI_LIST)?;
+    let host = rustix::system::uname();
+    Ok(parse_uri_list(&list, host.nodename().to_bytes()))
 }
 
 /// Receives the content of `offer` as `mime_type`, within [`READ_TIMEOUT`].
@@ -329,8 +364,7 @@ fn read_to_end_within(
     timeout: Duration,
 ) -> Result<Vec<u8>, ClipboardError> {
     let deadline = Instant::now() + timeout;
-    let mut data = Vec::new();
-    let mut chunk = [0_u8; 8192];
+    let mut data = Vec::with_capacity(READ_CHUNK);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -356,9 +390,15 @@ fn read_to_end_within(
                 ));
             }
         }
-        match pipe.read(&mut chunk) {
+        // Read straight into `data`, with room for a whole chunk: no copy from a separate
+        // buffer, and the capacity doubles as needed, so a 16 MiB image takes few reallocations.
+        let filled = data.len();
+        data.resize(filled + READ_CHUNK, 0);
+        let read = pipe.read(&mut data[filled..]);
+        data.truncate(filled + read.as_ref().map_or(0, |read| *read));
+        match read {
             Ok(0) => return Ok(data),
-            Ok(read) => data.extend_from_slice(&chunk[..read]),
+            Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(ClipboardError::backend("reading clipboard data", error)),
         }
@@ -478,7 +518,8 @@ mod tests {
     #[test]
     fn reads_everything_the_writer_sends() {
         let (reader, mut writer) = io::pipe().expect("pipe");
-        let payload = "x".repeat(20_000);
+        // Several chunks, the last one partial.
+        let payload = "x".repeat(READ_CHUNK * 3 + 100);
         let sent = payload.clone();
         let writer = thread::spawn(move || io::Write::write_all(&mut writer, sent.as_bytes()));
 

@@ -60,8 +60,8 @@ pub use watch::{ChangeSender, ClipboardChange, ClipboardWatch, WatchClosed};
 /// - Files are local absolute paths. The clipboard only holds references to them, never their
 ///   bytes. File support is optional; see [`read_files`](Self::read_files).
 /// - Sensitive content (password managers) is never read: see [`read_text`](Self::read_text).
-///   The same rule applies to [`read_image`](Self::read_image) and
-///   [`read_files`](Self::read_files).
+///   The same rule applies to [`read_image`](Self::read_image),
+///   [`read_files`](Self::read_files) and [`read_content`](Self::read_content).
 ///   Change events still report the markers in [`ClipboardChange::formats`], so tools like
 ///   `clipbroad watch` can show them.
 ///
@@ -185,6 +185,38 @@ pub trait Clipboard: Send + Sync {
         Err(ClipboardError::Unsupported { content: "files" })
     }
 
+    /// Reads what the current copy holds: its files, else its text, else its image.
+    ///
+    /// Files win: a file manager's copy also offers the paths as text, but the files are what the
+    /// person copied. A copy whose references are not all local files (a copied web link) is not
+    /// files, so it stays text.
+    ///
+    /// Text wins over an image when a copy offers both: apps that offer both for one copy (a
+    /// spreadsheet's cells, an office document) mostly do it so the text can also be pasted as a
+    /// picture, and the text is what the person meant and is much smaller. A browser's "Copy
+    /// image" offers the image with `<img>` markup but no plain text, and markup next to an image
+    /// is not text (see [`read_text`](Self::read_text)), so the image wins there.
+    ///
+    /// Returns what [`read_files`](Self::read_files), [`read_text`](Self::read_text) and
+    /// [`read_image`](Self::read_image) would, in that order, with the same rules: 2-second
+    /// limit, and the sensitive-content check on the formats of the same content before reading
+    /// any of it. The default implementation calls those three in turn. A backend should
+    /// override it to read them all from **one** look at the clipboard: that is cheaper, and a
+    /// copy that lands between two of the calls cannot mix two copies.
+    ///
+    /// # Errors
+    ///
+    /// As for [`read_text`](Self::read_text).
+    fn read_content(&self) -> Result<Option<ClipboardContent>, ClipboardError> {
+        if let Some(paths) = self.read_files()? {
+            return Ok(Some(ClipboardContent::Files(paths)));
+        }
+        if let Some(text) = self.read_text()? {
+            return Ok(Some(ClipboardContent::Text(text)));
+        }
+        Ok(self.read_image()?.map(ClipboardContent::Image))
+    }
+
     /// Starts watching the clipboard and returns the stream of changes.
     ///
     /// Contract for implementations:
@@ -214,8 +246,8 @@ pub trait Clipboard: Send + Sync {
     ///   (next change or next polling tick).
     ///
     /// For consumers: an event says the clipboard *may* have changed and which formats it offers.
-    /// Call [`read_text`](Self::read_text), [`read_image`](Self::read_image) or
-    /// [`read_files`](Self::read_files) if wanted; they
+    /// Call [`read_content`](Self::read_content) (or [`read_text`](Self::read_text),
+    /// [`read_image`](Self::read_image) or [`read_files`](Self::read_files)) if wanted; they
     /// check for sensitive markers themselves, on the content they actually read. The content can
     /// change again between the event and the read; if so, another event follows.
     ///
@@ -224,4 +256,13 @@ pub trait Clipboard: Send + Sync {
     /// [`ClipboardError::Unavailable`] if the platform cannot notify or be polled for changes in
     /// this session, [`ClipboardError::Backend`] if setting up the watcher failed.
     fn watch(&self) -> Result<ClipboardWatch, ClipboardError>;
+}
+
+/// What a copy holds, as [`Clipboard::read_content`] reads it. Not `Debug`, so its content cannot
+/// end up in the logs.
+pub enum ClipboardContent {
+    /// Local paths, as the clipboard lists them. They may be folders or missing files.
+    Files(Vec<PathBuf>),
+    Text(String),
+    Image(Png),
 }
