@@ -12,10 +12,9 @@
 //!   ours (the compositor then cancels our offer and the thread ends) or the process exits. So
 //!   there is at most one such thread per process in steady state, and the clipboard empties when
 //!   the process exits (unlike `wl-copy`, which forks a process that outlives the shell command).
-//! - [`watch`](Clipboard::watch): one thread blocked on the compositor connection, plus one that
-//!   checks every [`STOP_CHECK_INTERVAL`] whether the [`ClipboardWatch`] was dropped and, if so,
-//!   wakes the first one up. Both end shortly after the watch is dropped, even if the clipboard
-//!   never changes again.
+//! - [`watch`](Clipboard::watch): one thread blocked on the compositor connection. Dropping the
+//!   [`ClipboardWatch`] cancels that wait (see [`ClipboardWatch::on_drop`]), so the thread ends
+//!   right after the drop, even if the clipboard never changes again.
 //!
 //! # Sensitive content
 //!
@@ -63,7 +62,6 @@ use std::io::{self, Read};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -98,9 +96,6 @@ const READ_CHUNK: usize = 64 * 1024;
 
 /// Longest wait for the app that owns the clipboard to hand over its content.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// How often a watch checks whether its consumer is gone.
-const STOP_CHECK_INTERVAL: Duration = Duration::from_millis(200);
 
 /// The regular Wayland clipboard (not the primary selection).
 #[derive(Debug)]
@@ -208,39 +203,16 @@ impl Clipboard for WaylandClipboard {
     fn watch(&self) -> Result<ClipboardWatch, ClipboardError> {
         let watcher = Watcher::new(watch::ClipboardType::Regular, paste::Seat::Unspecified)
             .map_err(|error| paste_error("starting the clipboard watcher", error))?;
+        // The watcher thread blocks until the next selection change, so on its own it would only
+        // notice a dropped watch then. Cancelling wakes it up as soon as the consumer is gone. It
+        // writes one byte to a pipe, so it does not block the dropping thread.
         let cancel = watcher.cancel_handle();
         let (changes, clipboard_watch) = ClipboardWatch::channel();
-        let consumer = changes.clone();
-        // Disconnects when the watcher thread ends, which also ends the stop checker.
-        let (watcher_alive, watcher_done) = mpsc::channel::<()>();
-
-        // The watcher thread blocks until the next selection change, so on its own it would only
-        // notice a dropped watch then. This thread wakes it up as soon as the consumer is gone.
-        thread::Builder::new()
-            .name("wl-watch-stop".to_owned())
-            .spawn(move || {
-                while let Err(RecvTimeoutError::Timeout) =
-                    watcher_done.recv_timeout(STOP_CHECK_INTERVAL)
-                {
-                    if consumer.is_closed() {
-                        cancel.cancel();
-                        return;
-                    }
-                }
-            })
-            .map_err(|error| ClipboardError::backend("spawning the watcher stop thread", error))?;
-
-        // If this spawn fails, the closure (and `watcher_alive` in it) is dropped, which ends the
-        // stop checker too.
         thread::Builder::new()
             .name("wl-watch".to_owned())
-            .spawn(move || {
-                let _alive = watcher_alive;
-                forward_events(watcher, changes);
-            })
+            .spawn(move || forward_events(watcher, changes))
             .map_err(|error| ClipboardError::backend("spawning the watcher thread", error))?;
-
-        Ok(clipboard_watch)
+        Ok(clipboard_watch.on_drop(move || cancel.cancel()))
     }
 }
 
@@ -254,7 +226,7 @@ fn forward_events(mut watcher: Watcher, changes: ChangeSender) {
             Ok(Some(ClipboardEvent::Changed { mime_types, .. })) => mime_types,
             // Cleared, or the app that owned the selection exited.
             Ok(Some(ClipboardEvent::Cleared { .. })) => Vec::new(),
-            // Cancelled by the stop checker.
+            // Cancelled: the watch was dropped.
             Ok(None) => return,
             Err(error) => {
                 changes.fail(paste_error("watching the clipboard", error));
