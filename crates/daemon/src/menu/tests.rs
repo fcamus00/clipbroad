@@ -123,7 +123,7 @@ fn shows_the_newest_clip() {
     };
     assert_eq!(
         View::new(&clips, None, false, State::Idle, NOW_MS).activity,
-        "Last received from laptop: text, 120 bytes, 5 s ago"
+        "Last received from laptop: text, 120 bytes, just now"
     );
     let older_received = DaemonStatus {
         last_sent: Some(clip(NOW_MS - 5_000, None)),
@@ -132,7 +132,16 @@ fn shows_the_newest_clip() {
     };
     assert_eq!(
         View::new(&older_received, None, false, State::Idle, NOW_MS).activity,
-        "Last sent: text, 120 bytes, 5 s ago"
+        "Last sent: text, 120 bytes, just now"
+    );
+    // Seconds are not counted: the menu redraws on a heartbeat, so they would be stale.
+    assert_eq!(
+        View::new(&older_received, None, false, State::Idle, NOW_MS + 54_999).activity,
+        "Last sent: text, 120 bytes, just now"
+    );
+    assert_eq!(
+        View::new(&older_received, None, false, State::Idle, NOW_MS + 55_000).activity,
+        "Last sent: text, 120 bytes, 1 min ago"
     );
     assert_eq!(
         View::new(&status(vec![]), None, false, State::Idle, NOW_MS).activity,

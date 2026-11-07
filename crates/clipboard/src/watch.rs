@@ -1,5 +1,7 @@
 //! Change notifications: the channel between a backend's watcher thread and the daemon.
 
+use std::fmt;
+
 use tokio::sync::mpsc;
 
 use crate::ClipboardError;
@@ -72,7 +74,8 @@ impl ChangeSender {
     }
 
     /// Whether the consumer dropped its [`ClipboardWatch`]. Polling backends should check this on
-    /// every tick so they stop even when the clipboard does not change.
+    /// every tick so they stop even when the clipboard does not change. Backends that block
+    /// instead wake up through [`ClipboardWatch::on_drop`].
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.tx.is_closed()
@@ -81,7 +84,8 @@ impl ChangeSender {
 
 /// Consumer side of a watch, returned by [`Clipboard::watch`](crate::Clipboard::watch).
 ///
-/// Dropping it tells the backend to stop watching.
+/// Dropping it tells the backend to stop watching: [`ChangeSender::is_closed`] turns true, and
+/// the hook set with [`on_drop`](Self::on_drop), if any, runs.
 ///
 /// # Why a channel and not a callback
 ///
@@ -95,9 +99,29 @@ impl ChangeSender {
 /// small (a list of format names, never the content), so memory is not a concern, while a bounded
 /// channel would force backends to either block their OS event loop or drop the newest event,
 /// which is the one that matters under "last writer wins".
-#[derive(Debug)]
 pub struct ClipboardWatch {
     rx: mpsc::UnboundedReceiver<Message>,
+    /// Run once on drop, after the channel closes (see [`Self::on_drop`]).
+    on_drop: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl fmt::Debug for ClipboardWatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClipboardWatch")
+            .field("rx", &self.rx)
+            .field("on_drop", &self.on_drop.is_some())
+            .finish()
+    }
+}
+
+impl Drop for ClipboardWatch {
+    fn drop(&mut self) {
+        // Closed first, so a watcher that wakes up sees `is_closed` and `send` fail.
+        self.rx.close();
+        if let Some(stop) = self.on_drop.take() {
+            stop();
+        }
+    }
 }
 
 impl ClipboardWatch {
@@ -107,7 +131,20 @@ impl ClipboardWatch {
     #[must_use]
     pub fn channel() -> (ChangeSender, Self) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (ChangeSender { tx }, Self { rx })
+        (ChangeSender { tx }, Self { rx, on_drop: None })
+    }
+
+    /// Runs `stop` when this watch is dropped, on the dropping thread.
+    ///
+    /// For backends whose watcher thread blocks on an OS event source: `stop` wakes it up (for
+    /// example by cancelling the wait or posting a message to it) so the thread ends right away,
+    /// without polling [`ChangeSender::is_closed`]. `stop` must not block. It runs after the
+    /// channel closed, so the woken thread sees [`WatchClosed`] on its next
+    /// [`send`](ChangeSender::send).
+    #[must_use]
+    pub fn on_drop(mut self, stop: impl FnOnce() + Send + 'static) -> Self {
+        self.on_drop = Some(Box::new(stop));
+        self
     }
 
     /// Waits for the next change.
@@ -177,6 +214,52 @@ mod tests {
         drop(watch);
         assert!(tx.is_closed());
         assert_eq!(tx.send(change(&[])), Err(WatchClosed));
+    }
+
+    #[test]
+    fn on_drop_runs_once_after_the_channel_closes() {
+        let (tx, watch) = ClipboardWatch::channel();
+        let (stopped_tx, stopped) = std::sync::mpsc::channel();
+        let watch = watch.on_drop(move || {
+            stopped_tx
+                .send(tx.is_closed())
+                .expect("test holds the receiver");
+        });
+        assert!(stopped.try_recv().is_err(), "not run before the drop");
+        drop(watch);
+        assert_eq!(
+            stopped.try_recv(),
+            Ok(true),
+            "run once, channel already closed"
+        );
+        assert!(stopped.try_recv().is_err(), "run only once");
+    }
+
+    /// What the Wayland and Windows backends do: a thread blocked on an event source, which the
+    /// drop hook wakes. It ends right after the drop, with no timer in between.
+    #[test]
+    fn on_drop_wakes_a_blocked_watcher_thread() {
+        let (tx, watch) = ClipboardWatch::channel();
+        let (wake, event_source) = std::sync::mpsc::channel::<()>();
+        let watcher = std::thread::spawn(move || {
+            // Stands for the OS wait: it returns once the hook drops `wake`. The timeout only
+            // keeps a broken hook from hanging the test.
+            let woken = event_source.recv_timeout(std::time::Duration::from_secs(5));
+            (woken, tx.send(change(&[])))
+        });
+        let watch = watch.on_drop(move || drop(wake));
+        drop(watch);
+        let (woken, sent) = watcher.join().expect("watcher thread panicked");
+        assert_eq!(
+            woken,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "woken by the hook, not by the timeout"
+        );
+        assert_eq!(
+            sent,
+            Err(WatchClosed),
+            "the woken thread sees the closed watch"
+        );
     }
 
     #[test]

@@ -243,7 +243,8 @@ pub trait Clipboard: Send + Sync {
     /// - Each call starts an independent watch. When the consumer drops its [`ClipboardWatch`],
     ///   [`ChangeSender::send`] starts failing and [`ChangeSender::is_closed`] returns `true`; the
     ///   backend must then stop and release its resources, at the latest when it next wakes up
-    ///   (next change or next polling tick).
+    ///   (next change or next polling tick). A backend whose thread blocks on an OS event source
+    ///   should wake it with [`ClipboardWatch::on_drop`] instead of polling for the drop.
     ///
     /// For consumers: an event says the clipboard *may* have changed and which formats it offers.
     /// Call [`read_content`](Self::read_content) (or [`read_text`](Self::read_text),

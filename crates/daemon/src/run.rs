@@ -24,7 +24,7 @@ use tracing::{debug, info, warn};
 use crate::control::Served;
 use crate::menu::{self, Action, Menu};
 use crate::mesh::{self, Mesh};
-use crate::status::{self, ClipEvent, DaemonStatus};
+use crate::status::{self, ClipEvent, DaemonStatus, StatusFile};
 use crate::update::{self, Installation, Updater, Updates};
 use crate::{backend, control, pair, reset, tray};
 
@@ -177,7 +177,7 @@ pub async fn sync(
         "node started"
     );
     let mut engine = SyncEngine::new(NodeId::from_bytes(*node.id().as_bytes()));
-    let status_file = paths.status_file();
+    let mut status_file = StatusFile::new(paths.status_file());
     // At most one: a newer clip, from here or a peer, replaces what is being downloaded.
     let mut download: Option<Download<'_>> = None;
     // The files of the newest applied clip, to recognize their echo (see [`AppliedFiles`]).
@@ -201,6 +201,7 @@ pub async fn sync(
     let mut new_identity = false;
     let mut shutdown = pin!(shutdown);
     let result = loop {
+        let mut beat = false;
         tokio::select! {
             change = changes.recv() => {
                 let change = match change {
@@ -318,7 +319,7 @@ pub async fn sync(
             }
             // The node holds the sender, so this never ends while it runs.
             Ok(()) = links.changed() => {}
-            _ = heartbeat.tick() => {}
+            _ = heartbeat.tick() => beat = true,
             result = &mut shutdown => {
                 info!("shutting down");
                 break result
@@ -328,7 +329,11 @@ pub async fn sync(
         }
         status.set_peers(&mesh, &links.borrow());
         status.update = self_update.available().map(|version| version.to_string());
-        status.save(&status_file);
+        if beat {
+            status_file.heartbeat(&mut status);
+        } else {
+            status_file.save(&mut status);
+        }
         menu.show(&status, pairing.is_some(), self_update.state(), now_ms());
     };
     // They borrow the node.
@@ -336,7 +341,7 @@ pub async fn sync(
     // Removes the socket, so `clipbroad pair` no longer finds this daemon.
     drop(control);
     node.shutdown().await;
-    status::remove(&status_file);
+    status_file.remove();
     if new_identity {
         // Only now: the node no longer uses the key, and nothing writes the members file.
         let peers = reset::wipe(paths)?;

@@ -93,7 +93,7 @@ async fn real_clipboard_round_trip_and_watch() {
         .write_text("before watching")
         .expect("write before watching");
     let mut watch = clipboard.watch().expect("start watching");
-    assert_eq!(watch_threads().len(), 2, "{:?}", watch_threads());
+    assert_eq!(watch_threads(), ["wl-watch"], "one thread, no stop checker");
 
     let early = tokio::time::timeout(Duration::from_millis(300), watch.recv()).await;
     assert!(

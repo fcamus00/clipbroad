@@ -51,9 +51,10 @@
 //!   block the caller. An operation that times out leaves its
 //!   thread to finish on its own, so a timed-out write may still land later.
 //! - [`watch`](Clipboard::watch): one thread with a message-only window registered with
-//!   `AddClipboardFormatListener`, which receives a `WM_CLIPBOARDUPDATE` per change. A timer wakes
-//!   it every [`STOP_CHECK_INTERVAL`] to check whether the [`ClipboardWatch`] was dropped; if so it
-//!   unregisters and destroys the window and ends, even if the clipboard never changes again.
+//!   `AddClipboardFormatListener`, which receives a `WM_CLIPBOARDUPDATE` per change. Dropping the
+//!   [`ClipboardWatch`] posts [`WM_STOP_WATCH`] to that window (see [`ClipboardWatch::on_drop`]);
+//!   the thread then unregisters and destroys the window and ends, even if the clipboard never
+//!   changes again.
 //!   Windows may notify several times for one copy; each notification is reported.
 
 use std::ffi::{OsString, c_void};
@@ -83,8 +84,8 @@ use windows_sys::Win32::System::Ole::{
     CF_PALETTE, CF_PENDATA, CF_RIFF, CF_SYLK, CF_TEXT, CF_TIFF, CF_UNICODETEXT, CF_WAVE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_MESSAGE, MSG, SetTimer,
-    WM_CLIPBOARDUPDATE, WM_TIMER,
+    CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_MESSAGE, MSG, PostMessageW,
+    WM_APP, WM_CLIPBOARDUPDATE,
 };
 use windows_sys::w;
 
@@ -103,11 +104,9 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(1);
 /// Wait between two attempts to open a busy clipboard.
 const OPEN_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
-/// How often a watch checks whether its consumer is gone.
-const STOP_CHECK_INTERVAL: Duration = Duration::from_millis(200);
-
-/// Id of the watcher's stop-check timer (any non-zero value; the window has only this one).
-const STOP_TIMER_ID: usize = 1;
+/// Tells the watcher thread that its [`ClipboardWatch`] was dropped. In the `WM_APP` range, which
+/// neither Windows nor `tray-icon` uses.
+const WM_STOP_WATCH: u32 = WM_APP;
 
 /// Longest registered format name Windows stores, plus the terminating NUL.
 const FORMAT_NAME_CAPACITY: usize = 256;
@@ -173,8 +172,8 @@ impl Clipboard for WindowsClipboard {
     fn watch(&self) -> Result<ClipboardWatch, ClipboardError> {
         let (changes, clipboard_watch) = ClipboardWatch::channel();
         // The thread ends on its own once the watch is dropped; nobody needs to join it.
-        spawn_watcher(changes)?;
-        Ok(clipboard_watch)
+        let (_thread, stop) = spawn_watcher(changes)?;
+        Ok(clipboard_watch.on_drop(move || stop.post()))
     }
 }
 
@@ -539,15 +538,15 @@ impl Drop for LockedGlobal {
 }
 
 /// Starts the watcher thread and returns once it is listening, so a change made right after
-/// `watch` returns is reported.
-fn spawn_watcher(changes: ChangeSender) -> Result<JoinHandle<()>, ClipboardError> {
+/// `watch` returns is reported. The [`StopWatcher`] ends the thread.
+fn spawn_watcher(changes: ChangeSender) -> Result<(JoinHandle<()>, StopWatcher), ClipboardError> {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let thread = thread::Builder::new()
         .name("win-watch".to_owned())
         .spawn(move || match ListenerWindow::create() {
             // The window lives until the end of this arm, i.e. until watching stops.
-            Ok(_window) => {
-                let _ = ready_tx.send(Ok(()));
+            Ok(window) => {
+                let _ = ready_tx.send(Ok(StopWatcher(window.0.addr())));
                 forward_changes(changes);
             }
             Err(error) => {
@@ -556,7 +555,7 @@ fn spawn_watcher(changes: ChangeSender) -> Result<JoinHandle<()>, ClipboardError
         })
         .map_err(|error| ClipboardError::backend("spawning the watcher thread", error))?;
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(thread),
+        Ok(Ok(stop)) => Ok((thread, stop)),
         Ok(Err(error)) => Err(error),
         Err(mpsc::RecvError) => Err(ClipboardError::Backend {
             message: "the watcher thread ended while starting".to_owned(),
@@ -565,8 +564,23 @@ fn spawn_watcher(changes: ChangeSender) -> Result<JoinHandle<()>, ClipboardError
     }
 }
 
-/// A message-only window that receives `WM_CLIPBOARDUPDATE` and the stop-check `WM_TIMER`.
-/// Dropping it unregisters the listener and destroys the window (which also kills the timer).
+/// Wakes the watcher thread from any thread by posting [`WM_STOP_WATCH`] to its window. It holds
+/// the window handle as an address, because `HWND` is a raw pointer and so not `Send`.
+struct StopWatcher(usize);
+
+impl StopWatcher {
+    #[allow(unsafe_code)] // Win32 FFI.
+    fn post(self) {
+        let hwnd: HWND = ptr::without_provenance_mut(self.0);
+        // SAFETY: `PostMessageW` may be called from any thread. It only queues the message and
+        // checks the handle itself: if the window is already gone (the thread ended on an
+        // error), it fails with `ERROR_INVALID_WINDOW_HANDLE`, and then there is nothing to stop.
+        unsafe { PostMessageW(hwnd, WM_STOP_WATCH, 0, 0) };
+    }
+}
+
+/// A message-only window that receives `WM_CLIPBOARDUPDATE` and [`WM_STOP_WATCH`]. Dropping it
+/// unregisters the listener and destroys the window.
 struct ListenerWindow(HWND);
 
 impl ListenerWindow {
@@ -605,16 +619,6 @@ impl ListenerWindow {
                 io::Error::last_os_error(),
             ));
         }
-        let interval = u32::try_from(STOP_CHECK_INTERVAL.as_millis())
-            .expect("STOP_CHECK_INTERVAL fits in u32 milliseconds");
-        // SAFETY: `hwnd` is a live window owned by this thread; no timer callback, so the timer
-        // posts `WM_TIMER` to the queue.
-        if unsafe { SetTimer(hwnd, STOP_TIMER_ID, interval, None) } == 0 {
-            return Err(ClipboardError::backend(
-                "starting the watcher timer",
-                io::Error::last_os_error(),
-            ));
-        }
         Ok(window)
     }
 }
@@ -632,7 +636,7 @@ impl Drop for ListenerWindow {
     }
 }
 
-/// Runs on the watcher thread: reports clipboard changes until the consumer is gone.
+/// Runs on the watcher thread: reports clipboard changes until the watch is dropped.
 #[allow(unsafe_code)] // Win32 FFI.
 fn forward_changes(changes: ChangeSender) {
     let mut message = MSG::default();
@@ -661,8 +665,7 @@ fn forward_changes(changes: ChangeSender) {
                     return;
                 }
             }
-            WM_TIMER if changes.is_closed() => return,
-            WM_TIMER => {}
+            WM_STOP_WATCH => return,
             // SAFETY: `message` was filled in by `GetMessageW`.
             _ => unsafe {
                 DispatchMessageW(&raw const message);
@@ -1041,8 +1044,9 @@ mod tests {
         clipboard
             .write_text("before watching")
             .expect("write before watching");
-        let (changes, mut watch) = ClipboardWatch::channel();
-        let watcher = spawn_watcher(changes).expect("start watching");
+        let (changes, watch) = ClipboardWatch::channel();
+        let (watcher, stop) = spawn_watcher(changes).expect("start watching");
+        let mut watch = watch.on_drop(move || stop.post());
 
         let early = tokio::time::timeout(Duration::from_millis(500), watch.recv()).await;
         assert!(
@@ -1097,8 +1101,9 @@ mod tests {
         check_images(&clipboard, &mut watch).await;
         check_files(&clipboard, &mut watch).await;
 
+        // Woken by the drop, not by a timer: it ends right away.
         drop(watch);
-        let deadline = Instant::now() + STOP_CHECK_INTERVAL * 5;
+        let deadline = Instant::now() + Duration::from_secs(1);
         while !watcher.is_finished() {
             assert!(Instant::now() < deadline, "watcher thread still running");
             thread::sleep(Duration::from_millis(20));
