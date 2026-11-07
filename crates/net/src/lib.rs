@@ -64,6 +64,7 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex, PoisonError, RwLock},
+    time::Duration,
 };
 
 pub use cache::{Cleaned, FileCache, StoreError};
@@ -97,6 +98,11 @@ pub const ALPN: &[u8] = b"clipbroad/1";
 /// mDNS service each node announces itself under, as `<id>._clipbroad._udp.local` with its
 /// addresses. Its own name keeps clipbroad apart from other iroh apps on the LAN.
 pub const MDNS_SERVICE: &str = "clipbroad";
+
+/// Base interval between mDNS queries (the crate's default is 700 ms). Each query wakes every
+/// node on the LAN, forever, while peers mostly keep their address. A peer that is not cached
+/// yet is found within about 1.2 times this, and a dial that misses it finds it on a redial.
+const MDNS_CADENCE: Duration = Duration::from_secs(10);
 
 /// How many received clips can wait for the daemon before the peers are slowed down.
 const INBOX_CAPACITY: usize = 64;
@@ -467,6 +473,7 @@ fn start_mdns(identity: &IdentityKey) -> Option<MdnsAddressLookup> {
     let id = SecretKey::from_bytes(&identity.to_bytes()).public();
     match MdnsAddressLookup::builder()
         .service_name(MDNS_SERVICE)
+        .discovery_cadence(MDNS_CADENCE)
         .build(id)
     {
         Ok(mdns) => {
