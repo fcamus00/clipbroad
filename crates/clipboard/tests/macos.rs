@@ -15,7 +15,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clipbroad_clipboard::macos::{AccessBehavior, MacosClipboard};
-use clipbroad_clipboard::{Clipboard, ClipboardChange, ClipboardError, ClipboardWatch};
+use clipbroad_clipboard::{
+    Clipboard, ClipboardChange, ClipboardContent, ClipboardError, ClipboardWatch,
+};
 use clipbroad_core::Png;
 use objc2::rc::autoreleasepool;
 use objc2_app_kit::{NSBitmapImageRep, NSPasteboard};
@@ -30,6 +32,27 @@ async fn next_change(watch: &mut ClipboardWatch) -> ClipboardChange {
         .expect("no change event in time")
         .expect("watch ended")
         .expect("watch failed")
+}
+
+/// What `read_content` returns, as text a test can compare: the content is not `Debug` on purpose.
+fn content(clipboard: &dyn Clipboard) -> String {
+    match clipboard.read_content().expect("read content") {
+        None => "nothing".to_owned(),
+        Some(ClipboardContent::Files(paths)) => format!("files {paths:?}"),
+        Some(ClipboardContent::Text(text)) => format!("text {text:?}"),
+        Some(ClipboardContent::Image(png)) => format!("image, {} bytes", png.as_bytes().len()),
+    }
+}
+
+/// `read_content` fails with the concealed marker.
+fn assert_concealed(clipboard: &dyn Clipboard) {
+    assert!(
+        matches!(
+            clipboard.read_content(),
+            Err(ClipboardError::Sensitive { marker: CONCEALED })
+        ),
+        "concealed content was read"
+    );
 }
 
 const CONCEALED: &str = "org.nspasteboard.ConcealedType";
@@ -110,6 +133,7 @@ async fn real_clipboard_round_trip_and_watch() {
     let change = next_change(&mut watch).await;
     assert!(change.has_format("public.utf8-plain-text"), "{change:?}");
     assert_eq!(clipboard.read_text().expect("read").as_deref(), Some(text));
+    assert_eq!(content(&clipboard), format!("text {text:?}"));
 
     clipboard.write_text("").expect("write empty");
     next_change(&mut watch).await;
@@ -128,6 +152,7 @@ async fn real_clipboard_round_trip_and_watch() {
         ),
         "concealed text was read"
     );
+    assert_concealed(&clipboard);
 
     check_images(&clipboard, &mut watch).await;
     check_files(&clipboard, &mut watch).await;
@@ -145,6 +170,8 @@ async fn check_images(clipboard: &MacosClipboard, watch: &mut ClipboardWatch) {
         Some(png.clone())
     );
     assert_eq!(clipboard.read_text().expect("read text"), None);
+    let image = format!("image, {} bytes", png.as_bytes().len());
+    assert_eq!(content(clipboard), image);
 
     // A browser's "Copy image": the image plus `<img>` markup. The image wins.
     copy_types(&[
@@ -157,6 +184,7 @@ async fn check_images(clipboard: &MacosClipboard, watch: &mut ClipboardWatch) {
         clipboard.read_image().expect("read image"),
         Some(png.clone())
     );
+    assert_eq!(content(clipboard), image);
 
     // Plain text next to an image (a spreadsheet's cells) is still text.
     copy_types(&[
@@ -168,6 +196,7 @@ async fn check_images(clipboard: &MacosClipboard, watch: &mut ClipboardWatch) {
         clipboard.read_text().expect("read text").as_deref(),
         Some("a\tb")
     );
+    assert_eq!(content(clipboard), r#"text "a\tb""#);
 
     // TIFF only (some apps, e.g. Preview): converted to PNG.
     copy_types(&[("public.tiff", &tiff_of(&png))]);
@@ -177,6 +206,7 @@ async fn check_images(clipboard: &MacosClipboard, watch: &mut ClipboardWatch) {
         .expect("read TIFF")
         .expect("TIFF read as an image");
     assert_eq!(png_size(&converted), (2, 1));
+    assert!(content(clipboard).starts_with("image, "));
 
     // A sensitive marker hides the image too.
     copy_types(&[("public.png", png.as_bytes()), (CONCEALED, b"")]);
@@ -188,6 +218,7 @@ async fn check_images(clipboard: &MacosClipboard, watch: &mut ClipboardWatch) {
         ),
         "concealed image was read"
     );
+    assert_concealed(clipboard);
 }
 
 /// The file part of the smoke test.
@@ -209,6 +240,7 @@ async fn check_files(clipboard: &MacosClipboard, watch: &mut ClipboardWatch) {
         clipboard.read_files().expect("read files"),
         Some(files.clone())
     );
+    assert_eq!(content(clipboard), format!("files {files:?}"));
 
     // Finder may write a file reference URL, which names the file by id; it reads as the path.
     let reference = autoreleasepool(|_| {
@@ -240,6 +272,7 @@ async fn check_files(clipboard: &MacosClipboard, watch: &mut ClipboardWatch) {
         clipboard.read_text().expect("read text").as_deref(),
         Some(url)
     );
+    assert_eq!(content(clipboard), format!("text {url:?}"));
     copy_types(&[("public.file-url", url.as_bytes())]);
     next_change(watch).await;
     assert_eq!(clipboard.read_files().expect("read files"), None);
@@ -254,4 +287,5 @@ async fn check_files(clipboard: &MacosClipboard, watch: &mut ClipboardWatch) {
         ),
         "concealed files were read"
     );
+    assert_concealed(clipboard);
 }

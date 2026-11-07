@@ -10,10 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clipbroad_clipboard::fake::{self, FakeClipboard, TEXT_FORMAT};
-use clipbroad_clipboard::{Clipboard, ClipboardError};
+use clipbroad_clipboard::{Clipboard, ClipboardContent, ClipboardError};
 
 use crate::backend;
-use crate::run::{Copied, read_content};
 
 /// Text previews are cut to this many characters.
 const PREVIEW_CHARS: usize = 80;
@@ -90,9 +89,9 @@ async fn watch(
             "(clipboard empty)".to_owned()
         } else {
             let clipboard = Arc::clone(&clipboard);
-            // Reads may block (up to 2 s each by contract), and so may looking up file sizes:
+            // Reads may block (up to 2 s by contract), and so may looking up file sizes:
             // keep them off the async thread.
-            tokio::task::spawn_blocking(move || describe(read_content(&*clipboard))).await?
+            tokio::task::spawn_blocking(move || describe(clipboard.read_content())).await?
         };
         writeln!(
             out,
@@ -104,11 +103,13 @@ async fn watch(
 }
 
 /// What a change holds, for its output line.
-fn describe(content: Result<Option<Copied>, ClipboardError>) -> String {
+fn describe(content: Result<Option<ClipboardContent>, ClipboardError>) -> String {
     match content {
-        Ok(Some(Copied::Files(paths))) => describe_files(&paths),
-        Ok(Some(Copied::Text(text))) => preview(&text),
-        Ok(Some(Copied::Image(png))) => format!("(image/png, {} bytes)", png.as_bytes().len()),
+        Ok(Some(ClipboardContent::Files(paths))) => describe_files(&paths),
+        Ok(Some(ClipboardContent::Text(text))) => preview(&text),
+        Ok(Some(ClipboardContent::Image(png))) => {
+            format!("(image/png, {} bytes)", png.as_bytes().len())
+        }
         Ok(None) => "(no files, text or PNG image)".to_owned(),
         Err(ClipboardError::Sensitive { marker }) => {
             format!("(sensitive: {marker}, not read or synced)")

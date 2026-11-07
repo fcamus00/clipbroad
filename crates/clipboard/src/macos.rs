@@ -7,9 +7,9 @@
 //!
 //! # Threads
 //!
-//! - [`read_text`](Clipboard::read_text), [`read_image`](Clipboard::read_image) and
-//!   [`read_files`](Clipboard::read_files): run on a short-lived thread so the caller can give up
-//!   after [`READ_TIMEOUT`]. The app that copied may provide its data lazily, and a frozen app
+//! - [`read_content`](Clipboard::read_content), [`read_text`](Clipboard::read_text),
+//!   [`read_image`](Clipboard::read_image) and [`read_files`](Clipboard::read_files): each call
+//!   runs on one short-lived thread so the caller can give up after [`READ_TIMEOUT`]. The app that copied may provide its data lazily, and a frozen app
 //!   would otherwise block the caller. A read that times out leaves its thread to finish on its
 //!   own.
 //! - [`watch`](Clipboard::watch): macOS has no change notification, so one thread polls
@@ -20,21 +20,22 @@
 //!
 //! macOS can alert the user when an app reads the pasteboard programmatically. To stay clear of
 //! that, the watcher only reads metadata (`changeCount` and the offered `types`). The content
-//! itself is read only in [`read_text`](Clipboard::read_text),
-//! [`read_image`](Clipboard::read_image) and [`read_files`](Clipboard::read_files), and only after
-//! checking that the pasteboard offers that kind of content. [`MacosClipboard::access_behavior`]
-//! reports what the user allowed.
+//! itself is read only in the reads ([`read_content`](Clipboard::read_content),
+//! [`read_text`](Clipboard::read_text), [`read_image`](Clipboard::read_image) and
+//! [`read_files`](Clipboard::read_files)), and only after checking that the pasteboard offers
+//! that kind of content: [`read_content`](Clipboard::read_content) requests the text only when
+//! there are no files, and the image only when there is no text either.
+//! [`MacosClipboard::access_behavior`] reports what the user allowed.
 //!
 //! # Sensitive content
 //!
-//! `NSPasteboard` has no way to list the types and read the content in one step. So
-//! [`read_text`](Clipboard::read_text), [`read_image`](Clipboard::read_image) and
-//! [`read_files`](Clipboard::read_files) read `changeCount`, list the types, check them for
-//! sensitive markers, read the content, and then check `changeCount` and the types again. If the
-//! count moved, another copy happened in between: it starts over, up to [`READ_ATTEMPTS`] times,
-//! and then gives up with an error. The second look at the types catches an app that adds its
-//! marker type after the content within the same copy (writing types one by one does not bump
-//! `changeCount`). An app that adds the marker even later, after that second look, is not caught;
+//! `NSPasteboard` has no way to list the types and read the content in one step. So each read
+//! reads `changeCount`, lists the types, checks them for sensitive markers, reads the content
+//! (for [`read_content`](Clipboard::read_content): files, text and image, as needed), and then
+//! checks `changeCount` and the types again. If the count moved, another copy happened in
+//! between: it starts over, up to [`READ_ATTEMPTS`] times, and then gives up with an error. The
+//! second look at the types catches an app that adds its marker type after the content within
+//! the same copy (writing types one by one does not bump `changeCount`). An app that adds the marker even later, after that second look, is not caught;
 //! password managers that follow nspasteboard.org declare all types before writing any data.
 //!
 //! # Images
@@ -72,7 +73,9 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSArray, NSData, NSDictionary, NSInteger, NSString, NSURL, ns_string};
 
-use crate::{ChangeSender, Clipboard, ClipboardChange, ClipboardError, ClipboardWatch};
+use crate::{
+    ChangeSender, Clipboard, ClipboardChange, ClipboardContent, ClipboardError, ClipboardWatch,
+};
 
 /// The text type we read and write: `NSPasteboardTypeString`.
 const TEXT_UTF8: &str = "public.utf8-plain-text";
@@ -162,6 +165,10 @@ impl Clipboard for MacosClipboard {
 
     fn read_files(&self) -> Result<Option<Vec<PathBuf>>, ClipboardError> {
         read_with_timeout(read_files_once)
+    }
+
+    fn read_content(&self) -> Result<Option<ClipboardContent>, ClipboardError> {
+        read_with_timeout(read_content_once)
     }
 
     fn write_files(&self, paths: &[PathBuf]) -> Result<(), ClipboardError> {
@@ -286,6 +293,20 @@ fn check_not_sensitive(pasteboard: &NSPasteboard) -> Result<(), ClipboardError> 
         Some(marker) => Err(ClipboardError::Sensitive { marker }),
         None => Ok(()),
     }
+}
+
+/// Files, else text, else image (see [`Clipboard::read_content`]), each requested only if the
+/// pasteboard offers it.
+fn read_content_once(
+    pasteboard: &NSPasteboard,
+) -> Result<Option<ClipboardContent>, ClipboardError> {
+    if let Some(paths) = read_files_once(pasteboard)? {
+        return Ok(Some(ClipboardContent::Files(paths)));
+    }
+    if let Some(text) = read_string_once(pasteboard)? {
+        return Ok(Some(ClipboardContent::Text(text)));
+    }
+    Ok(read_png_once(pasteboard)?.map(ClipboardContent::Image))
 }
 
 /// Requests the text only if the pasteboard offers it, so an image or a file copy is never read.

@@ -372,8 +372,16 @@ Trait contract (full detail in the doc comments of `crates/clipboard`):
   optional: by default `read_image` returns `Ok(None)` and `write_image` returns
   `ClipboardError::Unsupported`, so a backend without images still compiles.
 - `read_files` / `write_files` follow the same rules with local file paths (see "Files
-  on the clipboard"). They are also optional, with the same defaults: today only Wayland
-  implements them.
+  on the clipboard"). They are also optional, with the same defaults; Wayland, macOS and
+  Windows implement them.
+- `read_content` returns what a copy holds (`ClipboardContent`: files, else text, else image)
+  and is what the daemon and `clipbroad watch` call on every change. Its default calls
+  `read_files`, `read_text` and `read_image` in turn. The three real backends override it to read
+  all three from one look at the clipboard: one compositor connection on Wayland, one read thread
+  and one `changeCount` check on macOS, one `OpenClipboard` on Windows. That is cheaper (this read
+  runs on every local copy and on the echo of every clip the daemon writes), and a copy that lands
+  in the middle cannot mix the files of one copy with the text of the next. `ClipboardContent`
+  is not `Debug`, so its content cannot end up in the logs.
 - No read or write blocks for more than 2 seconds: if the app that owns the content does not respond, the
   backend returns an error. The backend sets the limit because the daemon cannot cancel a blocked thread.
 - `watch` returns a **channel** (not a callback): the backend pushes events from its own OS thread
@@ -381,7 +389,7 @@ Trait contract (full detail in the doc comments of `crates/clipboard`):
   unbounded because the events are small and arrive at human speed.
 - An event does not carry the content, only the **offered formats** with their native name (MIME on Linux,
   UTI on macOS, format name on Windows).
-- `read_text`, `read_image` and `read_files` never read sensitive content: they check the markers on the same
+- `read_text`, `read_image`, `read_files` and `read_content` never read sensitive content: they check the markers on the same
   content they read and return `ClipboardError::Sensitive` without reading the data (see "Sensitive
   content").
 - **All** changes are reported, including the ones the daemon itself causes when writing; anti-echo
@@ -487,9 +495,8 @@ the size threshold. Code in `crates/core/src/content.rs` (`Png`) and `protocol.r
   as a new copy and resends it. Two machines that re-encode could resend the image to each other endlessly.
   Because of that, a backend must return the same PNG bytes it wrote, for example by writing the PNG type
   and reading it first when it is there.
-- **Text and image in the same copy: text wins.** The daemon calls `read_text` and, only if there is no
-  text, `read_image` (`read_content` in `crates/daemon/src/run.rs`; before both it looks for
-  files, see "Files on the clipboard"). Apps that offer both in
+- **Text and image in the same copy: text wins.** `read_content` takes the text and, only if
+  there is no text, the image (before both it looks for files, see "Files on the clipboard"). Apps that offer both in
   one copy (spreadsheet cells, an office document) do it mostly so the text can
   also be pasted as a drawing; what the person meant to copy is the text, which is also much
   smaller. A clip carries a single content, so both cannot be sent.
@@ -500,7 +507,8 @@ the size threshold. Code in `crates/core/src/content.rs` (`Png`) and `protocol.r
   - **Known limit:** Firefox, when copying an image, also offers the URL as plain text. There
     the URL wins. Fixing it would require sending several formats in one clip.
 - **Wayland:** reads and writes only `image/png`, byte for byte, from the same offer whose MIME list
-  it checked (same as text). A copy that only offers other types (`image/jpeg`, `image/bmp`)
+  it checked (same as text). It reads pipes 64 KiB at a time (what a Linux pipe holds), straight
+  into the result buffer. A copy that only offers other types (`image/jpeg`, `image/bmp`)
   counts as having no image: converting it would require a codec. Screenshot tools (`grim`) and
   browsers offer `image/png`.
 - **macOS:** reads `public.png` byte for byte. If there is only `public.tiff` (some apps, like Preview),
@@ -688,7 +696,7 @@ Code in `crates/clipboard` (`read_files`, `write_files`) and `crates/daemon/src/
 - **Which one wins if a copy carries several: files, then text, then image.** A file manager
   also offers the paths as text, but what the person copied are the files. Between text and
   image the rules of "Images" apply (plain text wins, except the browser's "Copy image").
-  `read_content` calls `read_files`, `read_text` and `read_image` in that order.
+  `read_content` (in the `Clipboard` trait) applies that order.
 - **Wayland, reading.** Reads `text/uri-list` (RFC 2483) from the same offer whose MIME list it checked.
   Only `file://` URIs with an empty host, `localhost` or this machine's name count, and the
   `%XX` sequences are decoded. If a single URI is of another kind (a copied web link), the copy is not
