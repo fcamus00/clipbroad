@@ -1,8 +1,9 @@
 //! `clipbroad run`: the sync daemon. Wires the clipboard, the sync engine and the network together.
 
+use std::fs;
 use std::future::{self, Future};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -179,6 +180,8 @@ pub async fn sync(
     let status_file = paths.status_file();
     // At most one: a newer clip, from here or a peer, replaces what is being downloaded.
     let mut download: Option<Download<'_>> = None;
+    // The files of the newest applied clip, to recognize their echo (see [`AppliedFiles`]).
+    let mut applied: Option<AppliedFiles> = None;
     // Written only once the node is up: a second daemon on the same config fails before this,
     // and must not take over the first one's file.
     let mut status = DaemonStatus::new(&node, config);
@@ -210,7 +213,7 @@ pub async fn sync(
                 if change.formats.is_empty() || status.paused {
                     continue;
                 }
-                match local_change(&clipboard, &mut engine, &node, config).await {
+                match local_change(&clipboard, &mut engine, &node, config, &mut applied).await {
                     Ok(Some(sent)) => {
                         // The local copy is newer than whatever was downloading.
                         download = None;
@@ -227,7 +230,9 @@ pub async fn sync(
                     continue;
                 }
                 status.last_received = Some(received_event(&received));
-                let remote = remote_clip(&clipboard, &mut engine, &node, &cache, received, &mut download);
+                let remote = remote_clip(
+                    &clipboard, &mut engine, &node, &cache, received, &mut download, &mut applied,
+                );
                 if let Err(error) = remote.await {
                     warn!("{error:#}");
                 }
@@ -270,6 +275,7 @@ pub async fn sync(
                     if status.paused {
                         // It would land on the clipboard during the pause.
                         download = None;
+                        applied = None;
                     }
                 }
                 Action::Pair | Action::PairCopied => {
@@ -305,8 +311,9 @@ pub async fn sync(
             _ = update_timer.tick(), if config.update_check => self_update.check_on_schedule(),
             downloaded = finished(&mut download) => {
                 download = None;
-                if let Err(error) = apply_files(&clipboard, downloaded).await {
-                    warn!("{error:#}");
+                match apply_files(&clipboard, downloaded).await {
+                    Ok(files) => applied = files,
+                    Err(error) => warn!("{error:#}"),
                 }
             }
             // The node holds the sender, so this never ends while it runs.
@@ -480,12 +487,13 @@ fn received_event(received: &Received) -> ClipEvent {
 }
 
 /// Reads the local clipboard after a change and sends it to the peers if it is new. Returns what
-/// was sent, if anything.
+/// was sent, if anything. `applied` is forgotten once something is sent.
 async fn local_change(
     clipboard: &Arc<dyn Clipboard>,
     engine: &mut SyncEngine,
     node: &Node,
     config: &Config,
+    applied: &mut Option<AppliedFiles>,
 ) -> Result<Option<ClipEvent>> {
     let clipboard = Arc::clone(clipboard);
     // Reads may block (up to 2 s by contract), so keep them off the async thread.
@@ -507,6 +515,17 @@ async fn local_change(
     };
     let (content, offer) = match copied {
         ClipboardContent::Files(paths) => {
+            // One `stat` per file, in the local cache: cheap enough for the async thread.
+            if applied
+                .as_ref()
+                .is_some_and(|applied| applied.matches(&paths))
+            {
+                debug!(
+                    files = paths.len(),
+                    "clipboard holds the files just applied, not hashed again"
+                );
+                return Ok(None);
+            }
             let config = config.clone();
             // Hashes every file, so it takes a while for big ones.
             let offer = tokio::task::spawn_blocking(move || Offer::read(&paths, &config))
@@ -548,6 +567,8 @@ async fn local_change(
         debug!(size, "clipboard already synced, nothing to send");
         return Ok(None);
     };
+    // The engine moved on to this clip, so the applied files are no longer its current content.
+    *applied = None;
     let hash = short_hash(clip.hash);
     match offer {
         Some(offer) => node.broadcast_files(clip, offer),
@@ -567,7 +588,7 @@ async fn local_change(
 
 /// Applies a clip from a peer to the local clipboard if it is newer than what this node has.
 /// Text and images are written right away. Files are fetched first: the clip replaces
-/// `download`, and [`apply_files`] writes their paths once it ends.
+/// `download`, and [`apply_files`] writes their paths once it ends. Applying forgets `applied`.
 async fn remote_clip<'d>(
     clipboard: &Arc<dyn Clipboard>,
     engine: &mut SyncEngine,
@@ -575,6 +596,7 @@ async fn remote_clip<'d>(
     cache: &'d FileCache,
     received: Received,
     download: &mut Option<Download<'d>>,
+    applied: &mut Option<AppliedFiles>,
 ) -> Result<()> {
     let from = received.from;
     let (kind, size) = (received.clip.kind, received.clip.size);
@@ -594,8 +616,9 @@ async fn remote_clip<'d>(
             return Ok(());
         }
     };
-    // Whatever was downloading is older than this clip.
+    // Whatever was downloading or applied before is older than this clip.
     *download = None;
+    *applied = None;
     let clipboard = Arc::clone(clipboard);
     let written = match content {
         ClipContent::Text(text) => {
@@ -622,8 +645,12 @@ async fn remote_clip<'d>(
 }
 
 /// Puts the files of a finished download on the clipboard. Only called for the newest clip: a
-/// newer one drops the download before it ends.
-async fn apply_files(clipboard: &Arc<dyn Clipboard>, downloaded: Downloaded) -> Result<()> {
+/// newer one drops the download before it ends. Returns the files written, to recognize their
+/// echo, or `None` if they were not written.
+async fn apply_files(
+    clipboard: &Arc<dyn Clipboard>,
+    downloaded: Downloaded,
+) -> Result<Option<AppliedFiles>> {
     let Downloaded {
         from,
         size,
@@ -637,8 +664,70 @@ async fn apply_files(clipboard: &Arc<dyn Clipboard>, downloaded: Downloaded) -> 
         )
     })?;
     let clipboard = Arc::clone(clipboard);
-    let written = tokio::task::spawn_blocking(move || clipboard.write_files(&paths)).await?;
-    report_write(written, from, ContentKind::Files, size, &hash)
+    let (written, applied) = tokio::task::spawn_blocking(move || {
+        let written = clipboard.write_files(&paths);
+        // Stamped after the fetch, which refreshed the mtimes of files that were cached already.
+        let applied = written.is_ok().then(|| AppliedFiles::stamp(paths));
+        (written, applied)
+    })
+    .await?;
+    report_write(written, from, ContentKind::Files, size, &hash)?;
+    // Without stamps, the echo is hashed as before.
+    Ok(applied.and_then(|stamped| {
+        stamped
+            .inspect_err(|error| debug!(%error, "cannot stamp the applied files"))
+            .ok()
+    }))
+}
+
+/// The cache paths of the newest applied files clip, as written to the clipboard, with each
+/// file's size and modification time read right after the write.
+///
+/// Writing them fires a local event, and reading them back would hash every file again only to
+/// learn that the engine already has this clip. While the same paths still have the same size and
+/// mtime, the daemon skips that. It gives the same result as hashing, because the daemon forgets
+/// these files as soon as the engine moves on (any clip applied or sent, or a pause), so until
+/// then the engine's current clip is this one and would answer "already synced":
+/// - a cached file edited in place changes its size or mtime, so it is hashed and sent as usual;
+/// - a person copying the same cache files again while nothing else happened gets "already
+///   synced" today too.
+///
+/// Only a rewrite that keeps the size and sets the old mtime back goes unnoticed.
+#[derive(Debug)]
+struct AppliedFiles(Vec<(PathBuf, FileStamp)>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    size: u64,
+    modified: SystemTime,
+}
+
+impl FileStamp {
+    fn of(path: &Path) -> io::Result<Self> {
+        let meta = fs::metadata(path)?;
+        Ok(Self {
+            size: meta.len(),
+            modified: meta.modified()?,
+        })
+    }
+}
+
+impl AppliedFiles {
+    fn stamp(paths: Vec<PathBuf>) -> io::Result<Self> {
+        paths
+            .into_iter()
+            .map(|path| FileStamp::of(&path).map(|stamp| (path, stamp)))
+            .collect::<io::Result<_>>()
+            .map(Self)
+    }
+
+    /// Whether `paths` are these files, in the same order, unchanged since they were applied.
+    fn matches(&self, paths: &[PathBuf]) -> bool {
+        self.0.len() == paths.len()
+            && self.0.iter().zip(paths).all(|((applied, stamp), path)| {
+                applied == path && FileStamp::of(path).is_ok_and(|now| now == *stamp)
+            })
+    }
 }
 
 /// Logs the outcome of writing a clip from `from` to the clipboard.

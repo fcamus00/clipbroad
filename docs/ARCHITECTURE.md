@@ -717,10 +717,17 @@ Code in `crates/clipboard` (`read_files`, `write_files`) and `crates/daemon/src/
   download"). When it finishes, it is still the newest one by construction, and the daemon writes the
   cache paths with `write_files`. It is not a separate tokio task because it would have to share
   the `Node`, and canceling it and waiting for it to release the node on shutdown is more code.
-- **Anti-echo.** Writing the cache paths fires a local event. The daemon reads them, and
-  `Offer::read` computes the same list hash as the received clip: the hash depends only on the name,
-  size and hash of each file, not on where they are. The engine returns `Unchanged` and nothing is resent.
-  It costs reading the files again (about 17 ms per 100 MB).
+- **Anti-echo.** Writing the cache paths fires a local event. Right after the write, the daemon
+  remembers those paths with each file's size and modification time (`AppliedFiles` in `run.rs`).
+  If the local event holds exactly those paths and every size and mtime still match, it is the echo:
+  the daemon sends nothing and does not read the files (300 MiB took 78 ms to hash again, warm
+  cache; the check takes microseconds). The daemon forgets that list when the engine moves on: any
+  clip applied or sent, or a pause. Until then the engine's current clip is that one, so hashing
+  would give `Unchanged` anyway. A cached file edited in place changes its size or mtime and goes
+  through the normal path: `Offer::read` hashes the files, and the list hash matches the received
+  clip only if the content did not change (the hash depends on the name, size and hash of each
+  file, not on where they are). Only a rewrite that keeps the size and sets the old mtime back
+  goes unnoticed.
 - **macOS, reading.** Finder puts one item per file on the pasteboard, each with a
   `public.file-url` (`NSPasteboardTypeFileURL`). The one from each item is read and `NSURL` turns it into a path;
   that way reference URLs (`file:///.file/id=...`, which name the file

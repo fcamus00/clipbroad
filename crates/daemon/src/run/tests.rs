@@ -7,7 +7,7 @@ use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::num::{NonZeroU16, NonZeroU64};
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use clipbroad_clipboard::fake::{TEXT_FORMAT, tiny_png};
 use clipbroad_config::Peer;
@@ -423,6 +423,135 @@ async fn files_land_in_the_peers_cache_and_clipboard_once() {
     for daemon in daemons {
         daemon.stop().await;
     }
+}
+
+/// Two connected daemons, each also peered with the observer.
+async fn two_daemons() -> (Observer, [Daemon; 2]) {
+    let specs = [Spec::new(), Spec::new()];
+    let observer_spec = Spec::new();
+    let observer = Observer::start(&observer_spec, &specs).await;
+    let daemons = specs.each_ref().map(|spec| {
+        let other = specs.iter().filter(|other| other.port != spec.port);
+        let peers = other.chain([&observer_spec]);
+        Daemon::start(
+            spec,
+            spec.config(peers, Config::DEFAULT_INLINE_MAX_BYTES.get()),
+        )
+    });
+    connect_all(&daemons, &observer).await;
+    (observer, daemons)
+}
+
+/// Copies two new files on `from` and waits until `to` has them on its clipboard and has handled
+/// the echo of that write (it sent nothing). Returns their cache paths on `to`.
+async fn receive_files(from: &Daemon, to: &Daemon, observer: &Observer, tag: &str) -> Vec<PathBuf> {
+    let source = tempfile::tempdir().expect("temp dir");
+    let copied = [("a.txt", 3), ("b.bin", 200_000)].map(|(name, len)| {
+        let path = source.path().join(name);
+        fs::write(&path, format!("{tag} ").repeat(len)).expect("write a file to copy");
+        path
+    });
+    let list = file_list(&copied);
+    from.clipboard.simulate_copy_files(copied.to_vec());
+    let landed = || {
+        to.files().is_some_and(|paths| {
+            paths.len() == 2 && paths.iter().all(|path| path.starts_with(&to.cache_dir))
+        }) && file_list(&to.files().unwrap_or_default()) == list
+    };
+    assert!(eventually(TIMEOUT, landed).await);
+    time::sleep(QUIET).await;
+    assert_eq!(
+        observer.senders(ClipContent::Files(list)),
+        HashSet::from([from.id])
+    );
+    to.files().expect("files on the clipboard")
+}
+
+/// Replaces the bytes of `path` with as many other bytes and sets its mtime to `modified`.
+fn rewrite_same_size(path: &Path, modified: SystemTime) {
+    let len = fs::metadata(path).expect("cached file").len();
+    let len = usize::try_from(len).expect("a small test file");
+    fs::write(path, vec![b'!'; len]).expect("rewrite the cached file");
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(modified))
+        .expect("set the mtime");
+}
+
+fn modified(path: &Path) -> SystemTime {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .expect("cached file has an mtime")
+}
+
+#[tokio::test]
+async fn the_echo_of_received_files_is_not_hashed_again() {
+    let (observer, [a, b]) = two_daemons().await;
+    let paths = receive_files(&a, &b, &observer, "echo").await;
+
+    // New bytes with the size and mtime it had when applied: only hashing would notice. Copying
+    // the same paths again is the event the echo is, so B must skip it without reading them.
+    rewrite_same_size(&paths[0], modified(&paths[0]));
+    b.clipboard.simulate_copy_files(paths.clone());
+    time::sleep(QUIET).await;
+    let rewritten = ClipContent::Files(file_list(&paths));
+    assert_eq!(observer.senders(rewritten), HashSet::new());
+
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test]
+async fn changed_or_other_received_files_are_hashed_and_sent() {
+    let (observer, [a, b]) = two_daemons().await;
+    let (seen, b_id) = (&observer, b.id);
+    let sent_by_b = |paths: &[PathBuf]| {
+        let list = ClipContent::Files(file_list(paths));
+        move || seen.senders(list.clone()).contains(&b_id)
+    };
+
+    // A cached file that grew.
+    let paths = receive_files(&a, &b, &observer, "grown").await;
+    let mut file = fs::File::options()
+        .append(true)
+        .open(&paths[0])
+        .expect("open the cached file");
+    std::io::Write::write_all(&mut file, b"more").expect("append to the cached file");
+    drop(file);
+    b.clipboard.simulate_copy_files(paths.clone());
+    assert!(eventually(TIMEOUT, sent_by_b(&paths)).await, "grown file");
+
+    // Same size, newer mtime.
+    let paths = receive_files(&a, &b, &observer, "touched").await;
+    rewrite_same_size(&paths[0], modified(&paths[0]) + Duration::from_secs(2));
+    b.clipboard.simulate_copy_files(paths.clone());
+    assert!(eventually(TIMEOUT, sent_by_b(&paths)).await, "touched file");
+
+    // Part of the applied files: another list.
+    let paths = receive_files(&a, &b, &observer, "part").await;
+    b.clipboard.simulate_copy_files(paths[..1].to_vec());
+    assert!(
+        eventually(TIMEOUT, sent_by_b(&paths[..1])).await,
+        "part of the list"
+    );
+
+    // The same files after B sent something else: they are no longer the current clip.
+    let paths = receive_files(&a, &b, &observer, "after a copy").await;
+    b.clipboard.simulate_copy_text("copied on b");
+    assert!(eventually(TIMEOUT, || a.text().as_deref() == Some("copied on b")).await);
+    b.clipboard.simulate_copy_files(paths.clone());
+    assert!(eventually(TIMEOUT, sent_by_b(&paths)).await, "after a copy");
+
+    // The same files after B applied something else.
+    let paths = receive_files(&a, &b, &observer, "after a clip").await;
+    a.clipboard.simulate_copy_text("copied on a");
+    assert!(eventually(TIMEOUT, || b.text().as_deref() == Some("copied on a")).await);
+    b.clipboard.simulate_copy_files(paths.clone());
+    assert!(eventually(TIMEOUT, sent_by_b(&paths)).await, "after a clip");
+
+    a.stop().await;
+    b.stop().await;
 }
 
 /// An iroh endpoint with `spec`'s identity that is not a clipbroad node: it speaks the protocol
