@@ -61,6 +61,13 @@ Static addresses are still useful for what mDNS does not reach, such as Tailscal
 - **Integration:** it is registered as the endpoint's *address lookup* (the `Minimal` preset has
   none). When dialing a peer, iroh asks mDNS for the peer's current addresses and
   tries them along with the static ones. Because of that, with mDNS on, the node also dials peers without `addrs`.
+- **Query every 10 s** instead of the crate's 700 ms: each query wakes every node on the LAN,
+  forever, while peers mostly keep their address. The cost is in finding a peer that is not
+  cached yet (one that just started, or changed its address): 10 to 13 s with a few machines,
+  instead of about 1 s. A dial gives up after 5 s, but the lookup keeps running in iroh for up to 17 s
+  (1.2 times the cadence plus 5 s) and caches what it finds, so the next redial (backoff of
+  0.5 s, then 1 s, 2 s, ...) connects at once. A peer that restarts on the same address and port
+  reconnects as before, without waiting for mDNS.
 - **Custom service name:** `clipbroad` (records `<id>._clipbroad._udp.local`) instead of the
   default `irohv1`, so it does not mix with other iroh apps on the same network. All nodes
   must use the same one.
@@ -299,11 +306,13 @@ The daemon writes its status to a TOML file, `status.toml`, in the same folder a
   the status instantly, but it needs a server inside the daemon and different code on Windows.
   The daemon now has a socket for pairing (see "Control channel"), but the status stays a file:
   a dead daemon still shows in it, and `status` works the same with or without the socket.
-- **When it is written:** after each event (a peer connects or leaves, a clip sent or
-  received) and every 5 s. It is written to a temporary file and renamed, so a reader never sees a
-  half-written file. When it stops, the daemon deletes it. It is only written once the node is up:
+- **When it is written:** after an event (a peer connects or leaves, a clip sent or
+  received) that changed what it shows, and every 30 s as a heartbeat. The heartbeat also
+  refreshes the macOS paste access. An idle daemon touches the disk once per heartbeat. It is
+  written to a temporary file and renamed, so a reader never sees a half-written file. When it stops, the daemon deletes it. It is only written once the node is up:
   a second daemon with the same config fails earlier (the port is taken) and does not overwrite the file.
-- **Alive or not:** with no file, the daemon is not running. If the file is more than 15 s old, the daemon
+- **Alive or not:** with no file, the daemon is not running. If the file is more than 90 s old
+  (three heartbeats), the daemon
   died without deleting it (`kill -9`, a crash, a power outage) and `status` shows it as stopped. The
   PID is not checked: that would need per-OS code and the age is enough.
 - **Location:** next to the identity, so two instances with their own `--config` (and therefore
@@ -386,7 +395,10 @@ Trait contract (full detail in the doc comments of `crates/clipboard`):
   backend returns an error. The backend sets the limit because the daemon cannot cancel a blocked thread.
 - `watch` returns a **channel** (not a callback): the backend pushes events from its own OS thread
   (Wayland, Windows) or from a polling thread (macOS), with a non-blocking `send`. The channel is
-  unbounded because the events are small and arrive at human speed.
+  unbounded because the events are small and arrive at human speed. Dropping the watch stops the
+  thread: Wayland cancels the compositor wait and Windows posts a message to the listener window
+  (`ClipboardWatch::on_drop`), so neither wakes up on a timer to look for the drop. macOS notices
+  it on its next poll.
 - An event does not carry the content, only the **offered formats** with their native name (MIME on Linux,
   UTI on macOS, format name on Windows).
 - `read_text`, `read_image`, `read_files` and `read_content` never read sensitive content: they check the markers on the same
@@ -818,7 +830,7 @@ single process and the menu needs no IPC to reach the daemon. The main thread ru
 loop (macOS requires the main thread) and the daemon runs on a second thread with its own tokio
 runtime (`crates/daemon/src/tray.rs`):
 - Linux: no GUI events. `tray-icon` serves the D-Bus item from its own thread and the main thread
-  only polls for updates.
+  waits for the next view and draws it.
 - macOS: an `NSApplication` with the `Accessory` activation policy (no Dock icon), set at run time
   because there is no bundle for `LSUIElement`. The main thread pumps its events by hand, because
   `NSApplication::run` can only be stopped from the main thread.
@@ -827,7 +839,8 @@ runtime (`crates/daemon/src/tray.rs`):
 **The menu.** The GUI only draws, and the logic stays where tests reach it (`crates/daemon/src/menu.rs`).
 A click sends an `Action` down a channel to the daemon's loop, which handles it like any other event.
 After each event the loop sends a `View`, the texts and flags to show, if it changed. GUI objects must
-stay on their thread, so the main thread looks for new views every 300 ms. A wake-up per view would be
+stay on their thread. On Linux that thread does nothing else, so it waits on the channel. On macOS and
+Windows it also runs the GUI loop, so it looks for new views every 300 ms. A wake-up per view would be
 one mechanism per OS, and on Windows it would get lost: an open menu runs its own loop, which discards
 thread messages. The menu shows nothing live while it is open on Windows and macOS, for the same
 reason.
@@ -835,6 +848,9 @@ reason.
 - Items: the peers connected and the last clip (disabled, they only show text), "Pair a machine",
   "Pair with the copied ticket", "Pause sync", "Remove a machine", "Reset identity", the update item (see "Updates"), "Quit clipbroad". The icon is a blue circle while
   clips flow and a grey ring otherwise, different in shape so color is not needed to tell them apart.
+- The last clip's age is redrawn on each event and on the status heartbeat (30 s), so it reads
+  "just now" under a minute and then counts minutes, hours or days. A count of seconds would mostly
+  be stale. For the same reason a note can stay up to 30 s longer than its 5 minutes.
 - Pairing uses the same functions and the same slot as `clipbroad pair`, so there is one pairing at a
   time from either place, and its items stay disabled meanwhile. The ticket goes through the clipboard
   so the feature needs no window to show text. A note in place of the last clip says how it went, and
