@@ -10,16 +10,20 @@
 //!
 //! Those loops only draw. What the menu does is the daemon's job (see [`crate::menu`]): each click
 //! becomes an [`Action`], and a [`View`] comes back whenever the menu should change. GUI objects
-//! must stay on the thread that made them, so each loop looks for new views every
-//! [`POLL_INTERVAL`] on that thread, and stops when the daemon is gone.
+//! must stay on the thread that made them, so each loop draws the views on that thread, and stops
+//! when the daemon is gone. On Linux the main thread has nothing else to do and waits for the next
+//! view. On macOS and Windows it also handles GUI events, so it looks for new views every
+//! `POLL_INTERVAL`.
 //!
 //! If the icon cannot be shown, the daemon keeps running without it and the log says why.
 
 use std::cell::{Cell, RefCell};
 use std::panic;
+#[cfg(not(target_os = "linux"))]
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
+#[cfg(not(target_os = "linux"))]
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -38,7 +42,9 @@ use crate::menu::{self, Action, Gui, MemberItem, Menu, View};
 #[cfg_attr(windows, path = "tray/windows.rs")]
 mod platform;
 
-/// How long a change waits at most to reach the menu, and an ended daemon to end the process.
+/// On macOS and Windows, how long a change waits at most to reach the menu, and an ended daemon
+/// to end the process.
+#[cfg(not(target_os = "linux"))]
 const POLL_INTERVAL: Duration = Duration::from_millis(300);
 
 /// Shows the tray icon and runs `daemon` on a new thread until it returns.
@@ -63,7 +69,7 @@ where
         .spawn(move || daemon(menu))
         .context("cannot start the daemon thread")?;
     if let Some(tray) = &tray {
-        event_loop.run(|| tray.update(&views));
+        event_loop.run(&views, |view| tray.draw(view));
     }
     let result = daemon.join();
     // Removes the icon before the process ends: on Windows, an icon left behind stays in the
@@ -173,17 +179,6 @@ impl Tray {
         })
     }
 
-    /// Draws the views that arrived. Returns false once the daemon has ended.
-    fn update(&self, views: &Receiver<View>) -> bool {
-        loop {
-            match views.try_recv() {
-                Ok(view) => self.draw(&view),
-                Err(TryRecvError::Empty) => return true,
-                Err(TryRecvError::Disconnected) => return false,
-            }
-        }
-    }
-
     fn draw(&self, view: &View) {
         self.status.set_text(&view.status);
         self.activity.set_text(&view.activity);
@@ -227,6 +222,18 @@ impl Tray {
         self.remove.set_enabled(!removals.is_empty());
         *lock(&self.removals) = removals;
         *self.members.borrow_mut() = members.to_vec();
+    }
+}
+
+/// Draws the views that already arrived, without waiting. Returns false once the daemon has ended.
+#[cfg(not(target_os = "linux"))]
+fn draw_arrived(views: &Receiver<View>, draw: &mut impl FnMut(&View)) -> bool {
+    loop {
+        match views.try_recv() {
+            Ok(view) => draw(&view),
+            Err(TryRecvError::Empty) => return true,
+            Err(TryRecvError::Disconnected) => return false,
+        }
     }
 }
 
