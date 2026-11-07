@@ -108,6 +108,24 @@ fn shows_how_many_files_and_their_size() {
 }
 
 #[test]
+fn a_file_three_heartbeats_old_is_stale() {
+    assert_eq!(STALE_AFTER, Duration::from_secs(90));
+    assert_eq!(STALE_AFTER, HEARTBEAT * 3);
+    let stale_after_ms = u64::try_from(STALE_AFTER.as_millis()).expect("fits");
+    let aged = |age_ms| DaemonStatus {
+        updated_ms: NOW_MS - age_ms,
+        ..sample()
+    };
+    // A heartbeat that is a bit late still shows a running daemon.
+    let late = u64::try_from((HEARTBEAT * 2).as_millis()).expect("fits");
+    assert!(render(Some(&aged(late)), NOW_MS).starts_with("daemon         running"));
+    assert!(render(Some(&aged(stale_after_ms)), NOW_MS).starts_with("daemon         running"));
+    assert!(
+        render(Some(&aged(stale_after_ms + 1)), NOW_MS).starts_with("daemon         not running")
+    );
+}
+
+#[test]
 fn a_missing_or_stale_file_means_not_running() {
     assert!(render(None, NOW_MS).starts_with("daemon         not running\n"));
     let stale = DaemonStatus {
@@ -170,16 +188,45 @@ fn save_replaces_the_file_and_remove_deletes_it() {
     let path = dir.path().join("status.toml");
     assert_eq!(read(&path).expect("no file is fine"), None);
 
+    let mut file = StatusFile::new(path.clone());
     let mut status = sample();
-    status.save(&path);
-    assert!(status.updated_ms >= NOW_MS, "save sets the time");
+    file.save(&mut status);
+    assert!(status.updated_ms >= NOW_MS, "the first save sets the time");
     assert_eq!(read(&path).expect("readable"), Some(status.clone()));
     status.last_received = status.last_sent.clone();
-    status.save(&path);
+    file.save(&mut status);
     assert_eq!(read(&path).expect("readable"), Some(status));
 
-    remove(&path);
+    file.remove();
     assert_eq!(read(&path).expect("no file is fine"), None);
+}
+
+/// Deleting the file shows whether a call wrote it again.
+#[test]
+fn save_writes_only_what_changed_and_the_heartbeat_always_writes() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("status.toml");
+    let mut file = StatusFile::new(path.clone());
+    let mut status = sample();
+    file.save(&mut status);
+    assert!(path.exists(), "the first save writes");
+
+    fs::remove_file(&path).expect("remove");
+    file.save(&mut status);
+    assert!(!path.exists(), "nothing changed, nothing written");
+
+    status.paused = true;
+    file.save(&mut status);
+    assert_eq!(read(&path).expect("readable"), Some(status.clone()));
+
+    fs::remove_file(&path).expect("remove");
+    status.updated_ms = 0;
+    file.heartbeat(&mut status);
+    assert!(
+        status.updated_ms >= NOW_MS,
+        "the heartbeat refreshes the time"
+    );
+    assert_eq!(read(&path).expect("readable"), Some(status.clone()));
 }
 
 #[test]

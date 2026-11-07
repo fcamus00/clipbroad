@@ -1,9 +1,10 @@
 //! `clipbroad status`: what the running daemon is doing, read from the status file it keeps.
 //!
 //! `clipbroad run` writes a small TOML file (`status.toml` beside the identity, see
-//! [`Paths::status_file`]) whenever something changes and every [`HEARTBEAT`], and removes it when
-//! it stops. A file instead of the control channel's socket (see [`crate::control`]): the code is
-//! the same on every OS, and a daemon that died shows up as a file that stopped being updated.
+//! [`Paths::status_file`]) whenever something changes and every [`HEARTBEAT`] (see
+//! [`StatusFile`]), and removes it when it stops. A file instead of the control channel's socket
+//! (see [`crate::control`]): the code is the same on every OS, and a daemon that died shows up as
+//! a file that stopped being updated.
 //! The file is replaced atomically (written aside, then renamed), so a reader never sees half of
 //! it.
 
@@ -27,11 +28,12 @@ use crate::mesh::Mesh;
 use crate::run::now_ms;
 use crate::watch::{files_summary, utc_time};
 
-/// How often the daemon rewrites the file when nothing changes.
-pub const HEARTBEAT: Duration = Duration::from_secs(5);
+/// How often the daemon rewrites the file when nothing changes, to show it is alive. It also
+/// refreshes the macOS paste access then.
+pub const HEARTBEAT: Duration = Duration::from_secs(30);
 /// A file older than this was left by a daemon that did not stop cleanly (killed, crashed, or
-/// the machine lost power).
-const STALE_AFTER: Duration = Duration::from_secs(15);
+/// the machine lost power). Three heartbeats, so a slow one does not look like a dead daemon.
+const STALE_AFTER: Duration = HEARTBEAT.saturating_mul(3);
 /// Width of the label column in the output.
 const LABEL_WIDTH: usize = 15;
 
@@ -175,35 +177,82 @@ impl DaemonStatus {
             Some(id) => format!("Last received from {}", self.peer_label(id)),
             None => "Last sent".to_owned(),
         };
-        let (what, ago) = (clip_summary(event), ago(event.at_ms, now_ms));
-        Some(format!("{label}: {what}, {ago} ago"))
+        Some(format!(
+            "{label}: {}, {}",
+            clip_summary(event),
+            menu_ago(event.at_ms, now_ms)
+        ))
     }
 
     fn peer_label(&self, id: EndpointId) -> &str {
         let peer = self.peers.iter().find(|peer| peer.id == id);
         peer.map_or("an unknown peer", peer_name)
     }
+}
 
-    /// Refreshes the time and the macOS pasteboard access, then replaces the file at `path`. A
-    /// failure is logged: the daemon keeps syncing without it.
-    pub fn save(&mut self, path: &Path) {
-        self.updated_ms = now_ms();
-        self.paste_access = backend::paste_access();
-        if let Err(error) = self.try_save(path) {
-            warn!("cannot update the status file: {error:#}");
+/// The status file of a running daemon. It is written only when the status changed, or on a
+/// heartbeat, so an idle daemon touches the disk once per [`HEARTBEAT`].
+#[derive(Debug)]
+pub struct StatusFile {
+    path: PathBuf,
+    /// What the file holds, or `None` before the first write.
+    written: Option<DaemonStatus>,
+}
+
+impl StatusFile {
+    /// Nothing is written until [`Self::save`] or [`Self::heartbeat`].
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            written: None,
         }
     }
 
-    fn try_save(&self, path: &Path) -> Result<()> {
-        let text = toml::to_string(self)?;
-        let temp = path.with_extension("toml.tmp");
-        fs::write(&temp, text).with_context(|| format!("cannot write {}", temp.display()))?;
-        fs::rename(&temp, path).with_context(|| format!("cannot replace {}", path.display()))
+    /// Writes `status` if it differs from what the file holds. Only this type sets
+    /// `updated_ms` and `paste_access`, so they never count as a change. The first write is a
+    /// [`Self::heartbeat`].
+    pub fn save(&mut self, status: &mut DaemonStatus) {
+        match &self.written {
+            None => self.heartbeat(status),
+            Some(written) if written == status => {}
+            Some(_) => {
+                status.updated_ms = now_ms();
+                self.write(status);
+            }
+        }
+    }
+
+    /// Refreshes the time and the macOS pasteboard access in `status`, then writes it.
+    pub fn heartbeat(&mut self, status: &mut DaemonStatus) {
+        status.updated_ms = now_ms();
+        status.paste_access = backend::paste_access();
+        self.write(status);
+    }
+
+    /// Removes the file when the daemon stops.
+    pub fn remove(&self) {
+        remove(&self.path);
+    }
+
+    /// Replaces the file. A failure is logged and the daemon keeps syncing without it. It counts
+    /// as written anyway: retrying on every pass would not help, and the next heartbeat retries.
+    fn write(&mut self, status: &DaemonStatus) {
+        if let Err(error) = try_write(&self.path, status) {
+            warn!("cannot update the status file: {error:#}");
+        }
+        self.written = Some(status.clone());
     }
 }
 
-/// Removes the status file when the daemon stops.
-pub fn remove(path: &Path) {
+fn try_write(path: &Path, status: &DaemonStatus) -> Result<()> {
+    let text = toml::to_string(status)?;
+    let temp = path.with_extension("toml.tmp");
+    fs::write(&temp, text).with_context(|| format!("cannot write {}", temp.display()))?;
+    fs::rename(&temp, path).with_context(|| format!("cannot replace {}", path.display()))
+}
+
+/// Removes the status file at `path`, if any.
+fn remove(path: &Path) {
     match fs::remove_file(path) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => {
             warn!("cannot remove {}: {error}", path.display());
@@ -355,6 +404,16 @@ fn clip_summary(event: &ClipEvent) -> String {
 fn time(at_ms: u64, now_ms: u64) -> String {
     let at = UNIX_EPOCH + Duration::from_millis(at_ms);
     format!("{} ({} ago)", utc_time(at), ago(at_ms, now_ms))
+}
+
+/// `just now`, `5 min ago`, `5 h ago`. The menu redraws on each event or [`HEARTBEAT`], so a count
+/// of seconds would mostly be stale.
+fn menu_ago(at_ms: u64, now_ms: u64) -> String {
+    if now_ms.saturating_sub(at_ms) < 60_000 {
+        "just now".to_owned()
+    } else {
+        format!("{} ago", ago(at_ms, now_ms))
+    }
 }
 
 /// `5 s`, `5 min`, `5 h`, `5 days`.
