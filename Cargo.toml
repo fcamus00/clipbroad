@@ -15,6 +15,8 @@ clipbroad-net = { path = "crates/net" }
 clipbroad-config = { path = "crates/config" }
 anyhow = "1.0"
 blake3 = "1.8"
+# iroh already brings it; frames use it to share one buffer without a copy.
+bytes = "1.12.1"
 clap = { version = "4.6", features = ["derive"] }
 data-encoding = "2.11"
 getrandom = "0.4"
@@ -32,6 +34,7 @@ reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no
 rustls = { version = "0.23.46", default-features = false, features = ["ring"] }
 rustix = "1.1"
 serde = { version = "1.0", features = ["derive"] }
+serde_bytes = "0.11.19"
 sha2 = "0.11"
 subtle = "2.6"
 tempfile = "3.27"
@@ -42,7 +45,7 @@ toml_edit = "0.25"
 # Default features pull GTK and libappindicator on Linux; the daemon turns on `ksni` there instead.
 tray-icon = { version = "0.26.1", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "fmt"] }
 windows-sys = "0.61.2"
 wl-clipboard-rs = "0.9.5"
 zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
