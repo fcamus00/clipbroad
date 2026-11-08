@@ -318,11 +318,19 @@ The daemon writes its status to a TOML file, `status.toml`, in the same folder a
 - **Location:** next to the identity, so two instances with their own `--config` (and therefore
   their own `secret.key`) never share the file. `status --config <file>` reads the one for that
   instance.
-- **What it shows:** whether the daemon is running (and its PID), its `EndpointId`, the port, whether mDNS is on,
+- **What it shows:** whether the daemon is running (and its PID), its version, its `EndpointId`, the port, whether mDNS is on,
   each peer with its name, short id and whether it is connected (and through which address), and the last clip
   sent and received with time, size and short hash. Never the content. On macOS 15.4 or newer,
   also the pasteboard `accessBehavior` as the daemon sees it, with instructions if it is not
   set to "Allow".
+- **Version of the running daemon:** the daemon writes its own version in the file. Replacing the
+  binary outside `clipbroad update` (for example `brew upgrade`, or copying a new binary) does not
+  restart the daemon, so it can run an old version for days while `clipbroad --version` shows the new
+  one. `status` compares the daemon's version with its own: if the daemon is older, it says so and
+  suggests `clipbroad service install`, which restarts the service on all three OSes. If the daemon
+  is newer, the `clipbroad` that runs `status` is the old one, so it suggests checking the `PATH`. A
+  file from a daemon older than the field has no version: it still parses, and `status` treats that
+  daemon as older. Older `clipbroad` binaries ignore the new field.
 
 ### Control channel
 

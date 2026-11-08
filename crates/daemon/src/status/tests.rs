@@ -14,6 +14,7 @@ fn id(seed: u8) -> EndpointId {
 fn sample() -> DaemonStatus {
     DaemonStatus {
         pid: 4242,
+        version: Some(VERSION.to_owned()),
         updated_ms: NOW_MS - 2_000,
         node_id: id(1),
         port: 4747,
@@ -55,6 +56,7 @@ fn shows_a_running_daemon_aligned() {
     let expected = format!(
         "\
 daemon         running (pid 4242)
+version        {VERSION}
 node id        {node}
 port           UDP 4747
 LAN discovery  on (mDNS)
@@ -236,4 +238,61 @@ fn shows_a_new_version_only_when_there_is_one() {
     assert!(!render(Some(&status), now).contains("update"));
     status.update = Some("9.9.9".to_owned());
     assert!(render(Some(&status), now).contains("9.9.9 is available, run `clipbroad update`"));
+}
+
+#[test]
+fn compares_the_daemon_version_with_this_binary() {
+    assert_eq!(compare_version(Some(VERSION)), DaemonVersion::Same);
+    assert_eq!(compare_version(Some("0.0.1")), DaemonVersion::Older);
+    assert_eq!(compare_version(Some("999.0.0")), DaemonVersion::Newer);
+    // A daemon from before the `version` field, or a local build with a suffix.
+    assert_eq!(compare_version(None), DaemonVersion::Older);
+    assert_eq!(compare_version(Some("999.0.0-dev")), DaemonVersion::Older);
+}
+
+#[test]
+fn tells_to_restart_a_daemon_on_an_old_binary() {
+    let restart =
+        "The daemon still runs an old binary. Restart it with `clipbroad service install`.";
+    let with = |version: Option<&str>| {
+        let status = DaemonStatus {
+            version: version.map(str::to_owned),
+            ..sample()
+        };
+        render(Some(&status), NOW_MS)
+    };
+    assert!(!with(Some(VERSION)).contains(restart));
+    let old = with(Some("0.0.1"));
+    assert!(
+        old.contains(&format!(
+            "version        0.0.1, older than this clipbroad ({VERSION})\n               {restart}\n"
+        )),
+        "{old}"
+    );
+    let unknown = with(None);
+    assert!(
+        unknown.contains(&format!(
+            "version        older than this clipbroad ({VERSION})\n               {restart}\n"
+        )),
+        "{unknown}"
+    );
+    let newer = with(Some("999.0.0"));
+    assert!(!newer.contains(restart), "{newer}");
+    assert!(
+        newer.contains("999.0.0, newer than this clipbroad") && newer.contains("PATH"),
+        "{newer}"
+    );
+}
+
+/// The file an older daemon (0.4.3) writes, without `version`.
+#[test]
+fn reads_a_file_from_a_daemon_without_a_version() {
+    let mut status = sample();
+    status.version = None;
+    let text = toml::to_string(&status).expect("serializes");
+    assert!(!text.contains("version"), "{text}");
+    assert_eq!(
+        toml::from_str::<DaemonStatus>(&text).expect("parses"),
+        status
+    );
 }

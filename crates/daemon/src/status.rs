@@ -26,6 +26,7 @@ use tracing::warn;
 use crate::backend;
 use crate::mesh::Mesh;
 use crate::run::now_ms;
+use crate::update::{VERSION, Version};
 use crate::watch::{files_summary, utc_time};
 
 /// How often the daemon rewrites the file when nothing changes, to show it is alive. It also
@@ -58,6 +59,9 @@ pub fn run(args: Args) -> Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub pid: u32,
+    /// The daemon's own version. `None` in a file from a daemon older than this field.
+    #[serde(default)]
+    pub version: Option<String>,
     /// When the daemon last wrote the file, in milliseconds since the Unix epoch.
     pub updated_ms: u64,
     pub node_id: EndpointId,
@@ -137,6 +141,7 @@ impl DaemonStatus {
         };
         Self {
             pid: process::id(),
+            version: Some(VERSION.to_owned()),
             updated_ms: 0,
             node_id: node.id(),
             port: config.listen_port.get(),
@@ -297,6 +302,11 @@ pub fn render(status: Option<&DaemonStatus>, now_ms: u64) -> String {
     };
 
     line("daemon", &format!("running (pid {})", status.pid));
+    let (version, hint) = version_lines(status.version.as_deref());
+    line("version", &version);
+    if let Some(hint) = hint {
+        line("", hint);
+    }
     line("node id", &status.node_id.to_string());
     line("port", &format!("UDP {}", status.port));
     line(
@@ -355,13 +365,7 @@ pub fn render(status: Option<&DaemonStatus>, now_ms: u64) -> String {
     line("last sent", &clip(status.last_sent.as_ref()));
     line("last received", &clip(status.last_received.as_ref()));
     if let Some(access) = status.paste_access {
-        let (state, needs_fix) = match access {
-            PasteAccess::AlwaysAllow => ("allowed".to_owned(), false),
-            PasteAccess::Ask => ("macOS asks before each read".to_owned(), true),
-            PasteAccess::Default => ("macOS will ask on the first read".to_owned(), true),
-            PasteAccess::AlwaysDeny => ("denied: copies here are not synced".to_owned(), true),
-            PasteAccess::Other(value) => (format!("unknown macOS setting ({value})"), true),
-        };
+        let (state, needs_fix) = paste_access_state(access);
         line("paste access", &state);
         if needs_fix {
             line(
@@ -372,6 +376,59 @@ pub fn render(status: Option<&DaemonStatus>, now_ms: u64) -> String {
         }
     }
     out
+}
+
+/// The paste access as `status` shows it, and whether it needs the System Settings fix.
+fn paste_access_state(access: PasteAccess) -> (String, bool) {
+    match access {
+        PasteAccess::AlwaysAllow => ("allowed".to_owned(), false),
+        PasteAccess::Ask => ("macOS asks before each read".to_owned(), true),
+        PasteAccess::Default => ("macOS will ask on the first read".to_owned(), true),
+        PasteAccess::AlwaysDeny => ("denied: copies here are not synced".to_owned(), true),
+        PasteAccess::Other(value) => (format!("unknown macOS setting ({value})"), true),
+    }
+}
+
+/// How the running daemon's version compares with this binary's.
+#[derive(Debug, PartialEq, Eq)]
+enum DaemonVersion {
+    Same,
+    /// Older, or unknown: only a daemon from before the `version` field leaves it out. A version
+    /// that does not parse (a local build with a suffix) also counts as older, so the hint is to
+    /// restart it on this binary.
+    Older,
+    Newer,
+}
+
+fn compare_version(daemon: Option<&str>) -> DaemonVersion {
+    let Some(daemon) = daemon else {
+        return DaemonVersion::Older;
+    };
+    if daemon == VERSION {
+        return DaemonVersion::Same;
+    }
+    match (daemon.parse::<Version>(), VERSION.parse::<Version>()) {
+        (Ok(daemon), Ok(this)) if daemon > this => DaemonVersion::Newer,
+        _ => DaemonVersion::Older,
+    }
+}
+
+/// The daemon's version as `status` shows it, and a hint when it is not this binary's.
+fn version_lines(daemon: Option<&str>) -> (String, Option<&'static str>) {
+    let shown = daemon.map_or(String::new(), |version| format!("{version}, "));
+    match compare_version(daemon) {
+        DaemonVersion::Same => (VERSION.to_owned(), None),
+        DaemonVersion::Older => (
+            format!("{shown}older than this clipbroad ({VERSION})"),
+            Some(
+                "The daemon still runs an old binary. Restart it with `clipbroad service install`.",
+            ),
+        ),
+        DaemonVersion::Newer => (
+            format!("{shown}newer than this clipbroad ({VERSION})"),
+            Some("This clipbroad is an old binary. Check which one is first in your PATH."),
+        ),
+    }
 }
 
 /// `connected via 192.168.1.20:42420`, `not connected, added by laptop`.

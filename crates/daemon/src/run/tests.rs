@@ -744,6 +744,7 @@ async fn status_file_follows_peers_and_clips() {
     let shown = status::render(daemon_a.status().as_ref(), now_ms());
     let expected = [
         "daemon         running (pid ".to_owned(),
+        format!("version        {}\n", crate::update::VERSION),
         format!("node id        {}\n", a.id()),
         "peers          1 of 1 connected\n".to_owned(),
         format!("connected via 127.0.0.1:{}\n", b.port),
