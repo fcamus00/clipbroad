@@ -12,11 +12,19 @@ mod tray;
 mod update;
 mod watch;
 
-use std::io::{self, IsTerminal};
+use std::{
+    env,
+    io::{self, IsTerminal},
+};
 
 use clap::{ArgAction, Parser, Subcommand};
 use tracing::level_filters::LevelFilter;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{
+    filter::{ParseError, Targets},
+    fmt,
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+};
 
 /// Share the clipboard between your own machines.
 #[derive(Debug, Parser)]
@@ -143,12 +151,61 @@ fn init_logging(default_level: LevelFilter, verbose: u8) {
         .position(|&level| level == default_level)
         .unwrap_or(0);
     let level = LEVELS[(start + usize::from(verbose)).min(LEVELS.len() - 1)];
-    let filter = EnvFilter::builder()
-        .with_default_directive(level.into())
-        .from_env_lossy();
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
+    let rust_log = env::var("RUST_LOG").ok();
+    let (filter, invalid) = match rust_log.as_deref().and_then(parse_rust_log) {
+        Some(Ok(targets)) => (targets, None),
+        Some(Err(error)) => (Targets::new().with_default(level), Some(error)),
+        None => (Targets::new().with_default(level), None),
+    };
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            fmt::layer()
+                .with_writer(io::stderr)
+                .with_ansi(io::stderr().is_terminal()),
+        )
         .init();
+    if let Some(error) = invalid {
+        tracing::warn!(%error, "ignoring RUST_LOG, using the -v level");
+    }
+}
+
+/// Parses `RUST_LOG` as `target=level` and bare `level` directives, comma separated. Empty
+/// directives are skipped, so a trailing comma does not turn into a match-all target. `None` if
+/// nothing is left.
+fn parse_rust_log(value: &str) -> Option<Result<Targets, ParseError>> {
+    let directives: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|directive| !directive.is_empty())
+        .collect();
+    (!directives.is_empty()).then(|| directives.join(",").parse())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rust_log_sets_levels_per_target() {
+        let targets = parse_rust_log("info, iroh=debug,")
+            .expect("not blank")
+            .expect("valid");
+        assert_eq!(targets.default_level(), Some(LevelFilter::INFO));
+        assert_eq!(
+            targets.iter().collect::<Vec<_>>(),
+            [("iroh", LevelFilter::DEBUG)]
+        );
+    }
+
+    #[test]
+    fn blank_rust_log_is_ignored() {
+        assert!(parse_rust_log("").is_none());
+        assert!(parse_rust_log(" , ,").is_none());
+    }
+
+    #[test]
+    fn invalid_rust_log_is_an_error() {
+        assert!(matches!(parse_rust_log("iroh=loud"), Some(Err(_))));
+    }
 }
