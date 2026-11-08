@@ -315,7 +315,10 @@ impl Clip {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Payload {
     /// The content bytes travel inside the message (text and images).
-    Inline(Vec<u8>),
+    ///
+    /// `serde_bytes` makes postcard copy the bytes in one block instead of one element at a time.
+    /// The wire format is the same either way: a varint length and the raw bytes.
+    Inline(#[serde(with = "serde_bytes")] Vec<u8>),
     /// Files announced by name, size and hash. Their bytes are fetched on bidirectional streams
     /// (see the module docs).
     Files(Vec<FileEntry>),
@@ -490,6 +493,27 @@ mod tests {
         // Length 2, variant 0 (Hello), version 4. Older and newer peers depend on these bytes.
         let frame = encode(&Message::Hello(Hello::CURRENT)).expect("encode");
         assert_eq!(frame, [0, 0, 0, 2, 0, 4]);
+    }
+
+    #[test]
+    fn inline_payload_wire_format_is_the_same_as_a_plain_vec() {
+        // `Payload` as it was before `serde_bytes`: older peers encode and decode this shape.
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        enum PlainPayload {
+            Inline(Vec<u8>),
+            Files(Vec<FileEntry>),
+        }
+
+        // 300 bytes, so the length takes a two-byte varint, with every byte value in it.
+        let bytes: Vec<u8> = (0..=255).chain(0..44).collect();
+        let ours = postcard::to_stdvec(&Payload::Inline(bytes.clone())).expect("encode");
+        let plain = postcard::to_stdvec(&PlainPayload::Inline(bytes.clone())).expect("encode");
+        assert_eq!(ours, plain);
+        assert_eq!(ours[..3], [0, 0xac, 0x02]);
+        assert_eq!(
+            postcard::from_bytes::<Payload>(&plain).expect("decode"),
+            Payload::Inline(bytes)
+        );
     }
 
     #[test]

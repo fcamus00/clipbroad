@@ -9,7 +9,12 @@ publish.workspace = true
 blake3.workspace = true
 postcard.workspace = true
 serde.workspace = true
+serde_bytes.workspace = true
 thiserror.workspace = true
 
 [lints]
 workspace = true
+
+# Used only through `#[serde(with = "serde_bytes")]`, which machete cannot see.
+[package.metadata.cargo-machete]
+ignored = ["serde_bytes"]

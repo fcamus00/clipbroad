@@ -123,8 +123,9 @@ mod close {
     pub const REMOVED: VarInt = VarInt::from_u32(4);
 }
 
-/// An encoded frame, shared by every connection that sends it.
-type Frame = Arc<[u8]>;
+/// An encoded frame, shared by every connection that sends it. `Bytes::from(Vec)` takes over the
+/// buffer, where `Arc<[u8]>` would copy it (up to 16 MiB per clip).
+type Frame = bytes::Bytes;
 
 /// A clip received from a peer.
 #[derive(Debug)]
