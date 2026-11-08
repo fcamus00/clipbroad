@@ -129,6 +129,9 @@ or run `clipbroad update`. The daemon then restarts on the new version, by itsel
 - Any other install downloads the release, checks a signature made outside GitHub and the
   checksum, and replaces the binary.
 - A pause does not survive a restart, so the menu asks you to resume sync first.
+- Replacing the binary another way, such as `brew upgrade` or copying a new binary, does not
+  restart the daemon. `clipbroad status` shows the daemon's version and says when it is older than
+  the `clipbroad` you ran. Restart it with `clipbroad service install`.
 - If a new version changes the protocol, machines on different versions stop syncing until all of
   them are updated.
 

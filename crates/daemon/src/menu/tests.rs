@@ -24,6 +24,7 @@ fn peer(byte: u8, name: &str, connected: bool) -> PeerStatus {
 fn status(peers: Vec<PeerStatus>) -> DaemonStatus {
     DaemonStatus {
         pid: 1,
+        version: Some(VERSION.to_owned()),
         updated_ms: NOW_MS,
         node_id: id(1),
         port: 4747,
